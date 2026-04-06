@@ -10,7 +10,8 @@ const usage_text =
     \\
     \\Commands:
     \\  init              Create gitstore directory structure
-    \\  adopt <path>      Migrate a repo into gitstore
+    \\  init <path>       Init git+jj repo and adopt into gitstore in one shot
+    \\  adopt <path>      Migrate an existing repo into gitstore
     \\  adopt --all       Migrate all repos under ghq root
     \\  verify <path>     Check pointer/symlink integrity
     \\  verify --all      Check all repos under ghq root
@@ -69,11 +70,21 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "init")) {
         const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
         defer gpa.free(gitstore_root);
-        try gitstore.init(io, gitstore_root);
-        var buf: [4096]u8 = undefined;
-        var w = File.stdout().writer(io, &buf);
-        try w.interface.print("gitstore initialized at {s}\n", .{gitstore_root});
-        try w.flush();
+
+        // init with a path: create git+jj repo and adopt in one shot
+        const path_arg = args_iter.next();
+        if (path_arg) |p| {
+            const ghq_root = try getGhqRoot(gpa, io);
+            defer gpa.free(ghq_root);
+            try gitstore.initRepo(gpa, io, p, ghq_root, gitstore_root);
+        } else {
+            // No path: just ensure gitstore root directory exists
+            try gitstore.init(io, gitstore_root);
+            var buf: [4096]u8 = undefined;
+            var w = File.stdout().writerStreaming(io, &buf);
+            try w.interface.print("gitstore initialized at {s}\n", .{gitstore_root});
+            try w.flush();
+        }
         return;
     }
 
@@ -177,21 +188,21 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage(io: Io) !void {
     var buf: [4096]u8 = undefined;
-    var w = File.stderr().writer(io, &buf);
+    var w = File.stderr().writerStreaming(io, &buf);
     try w.interface.print("{s}", .{usage_text});
     try w.flush();
 }
 
 fn printOut(io: Io, text: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = File.stdout().writer(io, &buf);
+    var w = File.stdout().writerStreaming(io, &buf);
     try w.interface.print("{s}\n", .{text});
     try w.flush();
 }
 
 fn printErr(io: Io, text: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = File.stderr().writer(io, &buf);
+    var w = File.stderr().writerStreaming(io, &buf);
     try w.interface.print("{s}", .{text});
     try w.flush();
 }
