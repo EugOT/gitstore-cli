@@ -147,7 +147,9 @@ pub fn rewriteJjGitTarget(
     Dir.cwd().writeFile(io, .{
         .sub_path = git_target_path,
         .data = new_content,
-    }) catch {};
+    }) catch {
+        warn(io, "warn: could not rewrite jj git_target at {s}\n", .{git_target_path});
+    };
 }
 
 /// Adopt a single repository: move .git and .jj into gitstore.
