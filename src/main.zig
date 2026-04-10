@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "hook")) {
         const flag = args_iter.next() orelse {
-            try printErr(io, "error: hook requires --zsh or --nu\n");
+            try printErr(io, "error: hook requires --zsh, --bash, or --nu\n");
             return;
         };
         if (std.mem.eql(u8, flag, "--zsh")) {

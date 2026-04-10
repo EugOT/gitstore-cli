@@ -31,13 +31,17 @@ pub fn logOperation(
     destination: []const u8,
     status: []const u8,
 ) !void {
+    // Build timestamp in a stack buffer (no static mutable)
+    var ts_buf: [30]u8 = undefined;
+    const ts_str = timestamp(io, &ts_buf);
+
     // Build the JSONL line in a stack buffer
     var line_buf: [4096]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf,
         \\{{"timestamp":"{s}","action":"{s}","source":"{s}","destination":"{s}","status":"{s}"}}
         ++ "\n",
         .{
-            timestamp(io),
+            ts_str,
             action.toString(),
             source,
             destination,
@@ -58,10 +62,8 @@ pub fn logOperation(
     try file.writePositionalAll(io, line, offset);
 }
 
-fn timestamp(io: Io) []const u8 {
-    const S = struct {
-        var ts_buf: [30]u8 = undefined;
-    };
+/// Write ISO 8601 timestamp into caller-owned buffer. Returns the written slice.
+pub fn timestamp(io: Io, buf: *[30]u8) []const u8 {
     const ts = Io.Clock.real.now(io);
     const ns = ts.nanoseconds;
     const secs: u64 = @intCast(@divTrunc(ns, std.time.ns_per_s));
@@ -70,7 +72,7 @@ fn timestamp(io: Io) []const u8 {
     const year_day = es.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
 
-    const written = std.fmt.bufPrint(&S.ts_buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    const written = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         year_day.year,
         month_day.month.numeric(),
         month_day.day_index + 1,
@@ -195,7 +197,8 @@ test "logOperation with special characters in paths" {
 
 test "timestamp returns ISO 8601 format" {
     const io = testing.io;
-    const ts = timestamp(io);
+    var ts_b: [30]u8 = undefined;
+    const ts = timestamp(io, &ts_b);
     // Format: YYYY-MM-DDTHH:MM:SSZ
     try testing.expectEqual(@as(usize, 20), ts.len);
     try testing.expect(ts[4] == '-');
@@ -208,7 +211,8 @@ test "timestamp returns ISO 8601 format" {
 
 test "timestamp year is reasonable" {
     const io = testing.io;
-    const ts = timestamp(io);
+    var ts_b: [30]u8 = undefined;
+    const ts = timestamp(io, &ts_b);
     // Year should be 2020-2099 range
     const year_str = ts[0..4];
     const year = std.fmt.parseInt(u32, year_str, 10) catch 0;
