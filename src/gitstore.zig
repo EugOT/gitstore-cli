@@ -89,7 +89,10 @@ pub fn initRepo(
     gitstore_root: []const u8,
 ) !void {
     try init(io, gitstore_root);
-    Dir.cwd().createDirPath(io, repo_path) catch {};
+    Dir.cwd().createDirPath(io, repo_path) catch |err| {
+        warn(io, "error: cannot create directory {s}: {s}\n", .{ repo_path, @errorName(err) });
+        return err;
+    };
 
     if (isAdopted(io, repo_path, gpa)) {
         info(io, "skip: {s} (already adopted)\n", .{repo_path});
@@ -167,10 +170,18 @@ pub fn adopt(
     const git_src = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
     defer gpa.free(git_src);
     {
-        _ = Dir.cwd().statFile(io, git_src, .{}) catch {
-            warn(io, "error: {s} has no .git directory\n", .{repo_path});
-            return error.NotAGitRepo;
+        // Verify .git is a directory. openDir fails with NotDir if it's a file.
+        var dir = Dir.openDirAbsolute(io, git_src, .{}) catch |err| switch (err) {
+            error.NotDir => {
+                warn(io, "error: {s}/.git is a file but not a valid gitdir pointer\n", .{repo_path});
+                return error.NotAGitRepo;
+            },
+            else => {
+                warn(io, "error: {s} has no .git directory\n", .{repo_path});
+                return error.NotAGitRepo;
+            },
         };
+        dir.close(io);
     }
 
     const git_dest = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ gitstore_root, rel_path });
@@ -245,7 +256,19 @@ pub fn adopt(
 
     const pointer_content = try std.fmt.allocPrint(gpa, "gitdir: {s}\n", .{git_dest});
     defer gpa.free(pointer_content);
-    try Dir.cwd().writeFile(io, .{ .sub_path = git_src, .data = pointer_content });
+    Dir.cwd().writeFile(io, .{ .sub_path = git_src, .data = pointer_content }) catch |err| {
+        // Critical: .git deleted but pointer write failed. Restore from gitstore copy.
+        warn(io, "error: pointer write failed, restoring .git from gitstore copy\n", .{});
+        const restore = ex.exec(gpa, io, &.{ "cp", "-a", git_dest, git_src }, null) catch {
+            warn(io, "CRITICAL: restore also failed — .git at {s}, pointer missing\n", .{git_dest});
+            return err;
+        };
+        gpa.free(restore.stdout);
+        gpa.free(restore.stderr);
+        // Remove the gitstore copy since we restored the original
+        Dir.cwd().deleteTree(io, git_dest) catch {};
+        return err;
+    };
     try oplog.logOperation(io, log_path, .write_pointer, git_src, git_dest, "ok");
     info(io, "pointer: {s} -> {s}\n", .{ git_src, git_dest });
 

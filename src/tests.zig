@@ -81,7 +81,7 @@ const TestEnv = struct {
         self.gpa.free(r1c.stdout);
         self.gpa.free(r1c.stderr);
 
-        const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--allow-empty", "-m", "init" }, repo_path);
+        const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo_path);
         self.gpa.free(r2.stdout);
         self.gpa.free(r2.stderr);
 
