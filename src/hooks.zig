@@ -51,10 +51,14 @@ pub const zsh_hook =
     \\    done <<< "$new_repos"
     \\  fi
     \\
-    \\  # Also adopt updated repos (ghq get -u) that aren't yet adopted
-    \\  # -u updates existing repos; their .git may still be a directory
-    \\  if [[ "$*" == *"-u"* ]]; then
-    \\    local repo_arg="${@: -1}"
+    \\  # Handle -u (update) — adopt if repo exists but not yet adopted
+    \\  # Extract repo arg by skipping flags (handles any flag position)
+    \\  local repo_arg=""
+    \\  local a
+    \\  for a in "${@:2}"; do
+    \\    [[ "$a" != -* ]] && repo_arg="$a"
+    \\  done
+    \\  if [[ -n "$repo_arg" ]]; then
     \\    local repo_path
     \\    repo_path="$(command ghq list --full-path | grep -F "$repo_arg" | tail -1)"
     \\    if [[ -n "$repo_path" && -d "$repo_path/.git" ]]; then
@@ -115,12 +119,13 @@ pub const nu_hook =
     \\  # Handle -u (update) — adopt if not yet adopted
     \\  if ("-u" in $args) {
     \\    let repo_arg = ($args | last)
-    \\    let repo_path = (
+    \\    let matches = (
     \\      ^ghq list --full-path
     \\      | lines
     \\      | where { |it| $it | str contains $repo_arg }
-    \\      | last
     \\    )
+    \\    if ($matches | is-empty) { return }
+    \\    let repo_path = ($matches | last)
     \\    if ($repo_path | is-not-empty) {
     \\      let git_path = ($repo_path | path join ".git")
     \\      if ($git_path | path type) == "dir" {
@@ -301,9 +306,14 @@ pub const bash_hook =
     \\    done <<< "$new_repos"
     \\  fi
     \\
-    \\  # Handle -u (update) — adopt if not yet adopted
-    \\  if [[ "$*" == *"-u"* ]]; then
-    \\    local repo_arg="${@: -1}"
+    \\  # Handle -u (update) — adopt if repo exists but not yet adopted
+    \\  # Extract repo arg by skipping flags (handles any flag position)
+    \\  local repo_arg=""
+    \\  local a
+    \\  for a in "${@:2}"; do
+    \\    [[ "$a" != -* ]] && repo_arg="$a"
+    \\  done
+    \\  if [[ -n "$repo_arg" ]]; then
     \\    local repo_path
     \\    repo_path="$(command ghq list --full-path | grep -F "$repo_arg" | tail -1)"
     \\    if [[ -n "$repo_path" && -d "$repo_path/.git" ]]; then
@@ -360,8 +370,9 @@ test "zsh hook uses ghq list for path resolution" {
     try testing.expect(mem.indexOf(u8, zsh_hook, "ghq list --full-path") != null);
 }
 
-test "zsh hook handles -u update flag" {
-    try testing.expect(mem.indexOf(u8, zsh_hook, "\"-u\"") != null);
+test "zsh hook handles -u update flag by extracting repo arg" {
+    try testing.expect(mem.indexOf(u8, zsh_hook, "# Handle -u") != null);
+    try testing.expect(mem.indexOf(u8, zsh_hook, "\"$a\" != -*") != null);
 }
 
 test "zsh hook adopts in loop for multiple repos" {
@@ -399,8 +410,9 @@ test "bash hook checks .git is directory before adopting" {
     try testing.expect(mem.indexOf(u8, bash_hook, "-d \"$repo_path/.git\"") != null);
 }
 
-test "bash hook handles -u update flag" {
-    try testing.expect(mem.indexOf(u8, bash_hook, "\"-u\"") != null);
+test "bash hook handles -u update flag by extracting repo arg" {
+    try testing.expect(mem.indexOf(u8, bash_hook, "# Handle -u") != null);
+    try testing.expect(mem.indexOf(u8, bash_hook, "\"$a\" != -*") != null);
 }
 
 test "bash hook preserves exit code" {
@@ -509,8 +521,9 @@ test "nu hook checks path type for .git directory" {
     try testing.expect(mem.indexOf(u8, nu_hook, "\"dir\"") != null);
 }
 
-test "nu hook handles -u update flag" {
+test "nu hook handles -u update flag with empty guard" {
     try testing.expect(mem.indexOf(u8, nu_hook, "\"-u\" in $args") != null);
+    try testing.expect(mem.indexOf(u8, nu_hook, "is-empty") != null);
 }
 
 test "nu hook uses error make for error handling" {
