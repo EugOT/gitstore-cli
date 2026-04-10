@@ -103,11 +103,13 @@ pub fn initRepo(
     defer gpa.free(git_path);
 
     const has_git = blk: {
-        _ = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch |err| switch (err) {
-            error.IsDir => break :blk true,
+        var dir = Dir.openDirAbsolute(io, git_path, .{}) catch |err| switch (err) {
+            error.NotDir => break :blk false, // .git is a file, not a directory
+            error.FileNotFound => break :blk false,
             else => break :blk false,
         };
-        break :blk false;
+        dir.close(io);
+        break :blk true;
     };
 
     if (!has_git) {
@@ -364,7 +366,8 @@ pub fn adoptAll(
             continue;
         }
 
-        adopt(gpa, io, line, ghq_root, gitstore_root, dry_run) catch {
+        adopt(gpa, io, line, ghq_root, gitstore_root, dry_run) catch |err| {
+            warn(io, "error: failed to adopt {s}: {s}\n", .{ line, @errorName(err) });
             failed += 1;
             continue;
         };
@@ -569,6 +572,9 @@ pub fn sync(
 ) !void {
     const hooks = @import("hooks.zig");
 
+    // Ensure gitstore root exists
+    try init(io, gitstore_root);
+
     // Write filter file
     const filter_path = try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
     defer gpa.free(filter_path);
@@ -591,6 +597,10 @@ pub fn sync(
         defer {
             gpa.free(result.stdout);
             gpa.free(result.stderr);
+        }
+        if (!result.succeeded()) {
+            warn(io, "error: rclone dry-run failed\n{s}\n", .{result.stderr});
+            return error.ProcessFailed;
         }
         info(io, "{s}", .{result.stdout});
         if (result.stderr.len > 0) info(io, "{s}", .{result.stderr});

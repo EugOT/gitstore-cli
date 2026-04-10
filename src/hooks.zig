@@ -96,7 +96,7 @@ pub const nu_hook =
     \\    if ($result.stderr | str length) > 0 {
     \\      print -e $result.stderr
     \\    }
-    \\    return
+    \\    error make { msg: $"ghq get failed with exit code ($result.exit_code)" }
     \\  }
     \\
     \\  # Diff repo list to find new repos
@@ -153,7 +153,9 @@ pub const rclone_filter =
     \\# Use with: rclone sync --filter-from <this-file>
     \\
     \\# === VCS internals (should already be separated, belt-and-suspenders) ===
+    \\- .git
     \\- .git/**
+    \\- .jj
     \\- .jj/**
     \\- .hg/**
     \\- .svn/**
@@ -166,7 +168,6 @@ pub const rclone_filter =
     \\
     \\# Rust
     \\- target/**
-    \\- Cargo.lock
     \\
     \\# Node / Bun / Deno
     \\- node_modules/**
@@ -177,7 +178,6 @@ pub const rclone_filter =
     \\- .turbo/**
     \\- .vercel/**
     \\- .svelte-kit/**
-    \\- bun.lockb
     \\
     \\# Python
     \\- __pycache__/**
@@ -413,11 +413,13 @@ test "rclone filter is non-empty" {
     try testing.expect(rclone_filter.len > 0);
 }
 
-test "rclone filter excludes .git" {
+test "rclone filter excludes .git entry and contents" {
+    try testing.expect(mem.indexOf(u8, rclone_filter, "- .git\n") != null);
     try testing.expect(mem.indexOf(u8, rclone_filter, ".git/**") != null);
 }
 
-test "rclone filter excludes .jj" {
+test "rclone filter excludes .jj entry and contents" {
+    try testing.expect(mem.indexOf(u8, rclone_filter, "- .jj\n") != null);
     try testing.expect(mem.indexOf(u8, rclone_filter, ".jj/**") != null);
 }
 
@@ -481,7 +483,11 @@ test "nu hook exports gitstore-status command" {
 
 test "nu hook passes through non-get subcommands" {
     try testing.expect(mem.indexOf(u8, nu_hook, "!= \"get\"") != null);
-    try testing.expect(mem.indexOf(u8, nu_hook, "^ghq ...$args") != null);
+}
+
+test "nu hook propagates ghq get failure" {
+    try testing.expect(mem.indexOf(u8, nu_hook, "error make") != null);
+    try testing.expect(mem.indexOf(u8, nu_hook, "ghq get failed") != null);
 }
 
 test "nu hook uses complete for capturing output" {
