@@ -534,3 +534,60 @@ pub fn status(
         }
     }
 }
+
+/// Write the rclone filter file to gitstore root and run rclone sync.
+pub fn sync(
+    gpa: Allocator,
+    io: Io,
+    ghq_root: []const u8,
+    gitstore_root: []const u8,
+    remote: []const u8,
+    dry_run: bool,
+) !void {
+    const hooks = @import("hooks.zig");
+
+    // Write filter file
+    const filter_path = try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
+    defer gpa.free(filter_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = filter_path,
+        .data = hooks.rclone_filter,
+    });
+    info(io, "filter: {s}\n", .{filter_path});
+
+    // Build rclone command
+    if (dry_run) {
+        info(io, "dry-run: rclone sync {s} {s} --filter-from {s} --dry-run\n", .{ ghq_root, remote, filter_path });
+        const result = try ex.exec(gpa, io, &.{
+            "rclone", "sync",
+            ghq_root, remote,
+            "--filter-from", filter_path,
+            "--dry-run",
+            "-v",
+        }, null);
+        defer {
+            gpa.free(result.stdout);
+            gpa.free(result.stderr);
+        }
+        info(io, "{s}", .{result.stdout});
+        if (result.stderr.len > 0) info(io, "{s}", .{result.stderr});
+    } else {
+        info(io, "sync: {s} -> {s}\n", .{ ghq_root, remote });
+        const result = try ex.exec(gpa, io, &.{
+            "rclone", "sync",
+            ghq_root, remote,
+            "--filter-from", filter_path,
+            "-v",
+            "--stats-one-line",
+        }, null);
+        defer {
+            gpa.free(result.stdout);
+            gpa.free(result.stderr);
+        }
+        if (!result.succeeded()) {
+            warn(io, "error: rclone sync failed\n{s}\n", .{result.stderr});
+            return error.ProcessFailed;
+        }
+        info(io, "{s}", .{result.stderr}); // rclone stats go to stderr
+    }
+}

@@ -1,7 +1,7 @@
 {
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd ~/ghq/github.com/EugOT/gitstore-cli && git status && echo \\\"---\\\" && git log --oneline -1 2>&1\",\"description\":\"Check git state of gitstore-cli\"}",
-  "error": "Exit code 128\nOn branch main\n\nNo commits yet\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\t.gitignore\n\t.omc/\n\tbuild.zig\n\tsrc/\n\nnothing added to commit but untracked files present (use \"git add\" to track)\n---\nfatal: your current branch 'main' does not have any commits yet",
-  "timestamp": "2026-04-06T21:35:09.618Z",
-  "retry_count": 2
+  "tool_name": "Grep",
+  "tool_input_preview": "{\"pattern\":\"\\\\\\\"gitstore\\\\\\\"|\\\\\\\"rclone\\\\\\\"\\\"\",\"path\":\"/Users/etretiakov/.local/share/chezmoi/dot_config/nix/darwin-configuration.nix.tmpl\",\"output_mode\":\"content\",\"context\":2,\"-n\":true}",
+  "error": "ENOENT: no such file or directory, posix_spawn 'rg'",
+  "timestamp": "2026-04-09T02:58:22.049Z",
+  "retry_count": 1
 }
