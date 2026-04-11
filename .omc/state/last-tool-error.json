@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd ~/ghq/github.com/EugOT/gitstore-cli && zig test --test-filter \\\"e2e adopt git-only\\\" src/tests.zig 2>&1\",\"timeout\":120000,\"description\":\"Run single failing test with full output\"}",
-  "error": "Exit code 1\n1/1 tests.test.e2e adopt git-only repo...FAIL (TestUnexpectedResult)\n/nix/store/9nk2id0q69zc8911bw1vxgivnhw7j99k-zig-0.16.0-dev.3133+5ec8e45f3/lib/std/testing.zig:615:14: 0x10076af77 in expect (test)\n    if (!ok) return error.TestUnexpectedResult;\n             ^\n/Users/etretiakov/ghq/github.com/EugOT/gitstore-cli/src/tests.zig:311:5: 0x10076b8db in test.e2e adopt git-only repo (test)\n    try testing.expect(git_r.succeeded());\n    ^\n0 passed; 0 skipped; 1 failed.\nerror: the following ...",
-  "timestamp": "2026-04-10T18:40:24.093Z",
+  "tool_input_preview": "{\"command\":\"cd ~/ghq/github.com/EugOT/gitstore-cli && coderabbit review --plain --base main~1 2>&1\",\"timeout\":300000,\"description\":\"Run CodeRabbit review against parent of main\"}",
+  "error": "Exit code 1\nStarting CodeRabbit review in plain text mode...\n\nReview directory: /Users/etretiakov/ghq/github.com/EugOT/gitstore-cli\n\n[2026-04-11T02:55:10.687Z] ❌ REVIEW ERROR: Review failed: Failed to get file changes: Command failed with exit code 128: git diff --name-status 'main~1...HEAD'\n\nfatal: main~1...HEAD: no merge base\nFailed to start review: Review failed\n[error] stopping cli",
+  "timestamp": "2026-04-11T02:55:11.444Z",
   "retry_count": 1
 }
