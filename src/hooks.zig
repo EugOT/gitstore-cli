@@ -46,7 +46,7 @@ pub const zsh_hook =
     \\    while IFS= read -r repo_path; do
     \\      if [[ -d "$repo_path/.git" ]]; then
     \\        echo "gitstore: adopting $repo_path" >&2
-    \\        command gitstore adopt "$repo_path"
+    \\        command gitstore adopt "$repo_path" || return $?
     \\      fi
     \\    done <<< "$new_repos"
     \\  fi
@@ -63,7 +63,7 @@ pub const zsh_hook =
     \\    repo_path="$(command ghq list --full-path | grep -F "$repo_arg" | tail -1)"
     \\    if [[ -n "$repo_path" && -d "$repo_path/.git" ]]; then
     \\      echo "gitstore: adopting $repo_path" >&2
-    \\      command gitstore adopt "$repo_path"
+    \\      command gitstore adopt "$repo_path" || return $?
     \\    fi
     \\  fi
     \\
@@ -245,8 +245,17 @@ pub const rclone_filter =
     \\- .env.*
     \\- *.pem
     \\- *.key
+    \\- *.p12
+    \\- *.ppk
+    \\- id_rsa
+    \\- id_ed25519
+    \\- secret*/
+    \\- secrets/
+    \\- secret.*
     \\- credentials.json
     \\- service-account*.json
+    \\- .aws/credentials
+    \\- .gcp/credentials.json
     \\
     \\# === Miscellaneous caches & logs ===
     \\- .cache/**
@@ -303,7 +312,7 @@ pub const bash_hook =
     \\    while IFS= read -r repo_path; do
     \\      if [[ -d "$repo_path/.git" ]]; then
     \\        echo "gitstore: adopting $repo_path" >&2
-    \\        command gitstore adopt "$repo_path"
+    \\        command gitstore adopt "$repo_path" || return $?
     \\      fi
     \\    done <<< "$new_repos"
     \\  fi
@@ -320,7 +329,7 @@ pub const bash_hook =
     \\    repo_path="$(command ghq list --full-path | grep -F "$repo_arg" | tail -1)"
     \\    if [[ -n "$repo_path" && -d "$repo_path/.git" ]]; then
     \\      echo "gitstore: adopting $repo_path" >&2
-    \\      command gitstore adopt "$repo_path"
+    \\      command gitstore adopt "$repo_path" || return $?
     \\    fi
     \\  fi
     \\
