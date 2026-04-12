@@ -42,14 +42,16 @@ pub const zsh_hook =
     \\  new_repos="$(comm -13 <(echo "$before" | sort) <(echo "$after" | sort))"
     \\
     \\  # Adopt any new repos
+    \\  local _adopt_rc=0
     \\  if [[ -n "$new_repos" ]]; then
     \\    while IFS= read -r repo_path; do
     \\      if [[ -d "$repo_path/.git" ]]; then
     \\        echo "gitstore: adopting $repo_path" >&2
-    \\        command gitstore adopt "$repo_path"
+    \\        command gitstore adopt "$repo_path" || { echo "gitstore: adopt failed for $repo_path (exit $?)" >&2; _adopt_rc=1; }
     \\      fi
     \\    done <<< "$new_repos"
     \\  fi
+    \\  [[ $_adopt_rc -eq 0 ]] || return $_adopt_rc
     \\
     \\  # Handle -u (update) — adopt if repo exists but not yet adopted
     \\  # Extract repo arg by skipping flags (handles any flag position)
@@ -63,7 +65,7 @@ pub const zsh_hook =
     \\    repo_path="$(command ghq list --full-path | grep -F "$repo_arg" | tail -1)"
     \\    if [[ -n "$repo_path" && -d "$repo_path/.git" ]]; then
     \\      echo "gitstore: adopting $repo_path" >&2
-    \\      command gitstore adopt "$repo_path"
+    \\      command gitstore adopt "$repo_path" || return $?
     \\    fi
     \\  fi
     \\
@@ -118,7 +120,7 @@ pub const nu_hook =
     \\
     \\  # Handle -u (update) — adopt if not yet adopted
     \\  if ("-u" in $args) {
-    \\    let non_flags = ($args | where { |it| not ($it | str starts-with "-") })
+    \\    let non_flags = ($args | skip 1 | where { |it| not ($it | str starts-with "-") })
     \\    if ($non_flags | is-empty) { return }
     \\    let repo_arg = ($non_flags | last)
     \\    let matches = (
@@ -245,8 +247,17 @@ pub const rclone_filter =
     \\- .env.*
     \\- *.pem
     \\- *.key
+    \\- *.p12
+    \\- *.ppk
+    \\- id_rsa
+    \\- id_ed25519
+    \\- secret*/
+    \\- secrets/
+    \\- secret.*
     \\- credentials.json
     \\- service-account*.json
+    \\- .aws/credentials
+    \\- .gcp/credentials.json
     \\
     \\# === Miscellaneous caches & logs ===
     \\- .cache/**
@@ -299,14 +310,16 @@ pub const bash_hook =
     \\  new_repos="$(comm -13 <(echo "$before" | sort) <(echo "$after" | sort))"
     \\
     \\  # Adopt any new repos
+    \\  local _adopt_rc=0
     \\  if [[ -n "$new_repos" ]]; then
     \\    while IFS= read -r repo_path; do
     \\      if [[ -d "$repo_path/.git" ]]; then
     \\        echo "gitstore: adopting $repo_path" >&2
-    \\        command gitstore adopt "$repo_path"
+    \\        command gitstore adopt "$repo_path" || { echo "gitstore: adopt failed for $repo_path (exit $?)" >&2; _adopt_rc=1; }
     \\      fi
     \\    done <<< "$new_repos"
     \\  fi
+    \\  [[ $_adopt_rc -eq 0 ]] || return $_adopt_rc
     \\
     \\  # Handle -u (update) — adopt if repo exists but not yet adopted
     \\  # Extract repo arg by skipping flags (handles any flag position)
@@ -320,7 +333,7 @@ pub const bash_hook =
     \\    repo_path="$(command ghq list --full-path | grep -F "$repo_arg" | tail -1)"
     \\    if [[ -n "$repo_path" && -d "$repo_path/.git" ]]; then
     \\      echo "gitstore: adopting $repo_path" >&2
-    \\      command gitstore adopt "$repo_path"
+    \\      command gitstore adopt "$repo_path" || return $?
     \\    fi
     \\  fi
     \\
