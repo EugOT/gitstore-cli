@@ -42,14 +42,16 @@ pub const zsh_hook =
     \\  new_repos="$(comm -13 <(echo "$before" | sort) <(echo "$after" | sort))"
     \\
     \\  # Adopt any new repos
+    \\  local _adopt_rc=0
     \\  if [[ -n "$new_repos" ]]; then
     \\    while IFS= read -r repo_path; do
     \\      if [[ -d "$repo_path/.git" ]]; then
     \\        echo "gitstore: adopting $repo_path" >&2
-    \\        command gitstore adopt "$repo_path" || return $?
+    \\        command gitstore adopt "$repo_path" || { echo "gitstore: adopt failed for $repo_path (exit $?)" >&2; _adopt_rc=1; }
     \\      fi
     \\    done <<< "$new_repos"
     \\  fi
+    \\  [[ $_adopt_rc -eq 0 ]] || return $_adopt_rc
     \\
     \\  # Handle -u (update) — adopt if repo exists but not yet adopted
     \\  # Extract repo arg by skipping flags (handles any flag position)
@@ -308,14 +310,16 @@ pub const bash_hook =
     \\  new_repos="$(comm -13 <(echo "$before" | sort) <(echo "$after" | sort))"
     \\
     \\  # Adopt any new repos
+    \\  local _adopt_rc=0
     \\  if [[ -n "$new_repos" ]]; then
     \\    while IFS= read -r repo_path; do
     \\      if [[ -d "$repo_path/.git" ]]; then
     \\        echo "gitstore: adopting $repo_path" >&2
-    \\        command gitstore adopt "$repo_path" || return $?
+    \\        command gitstore adopt "$repo_path" || { echo "gitstore: adopt failed for $repo_path (exit $?)" >&2; _adopt_rc=1; }
     \\      fi
     \\    done <<< "$new_repos"
     \\  fi
+    \\  [[ $_adopt_rc -eq 0 ]] || return $_adopt_rc
     \\
     \\  # Handle -u (update) — adopt if repo exists but not yet adopted
     \\  # Extract repo arg by skipping flags (handles any flag position)
