@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd ~/ghq/github.com/EugOT/gitstore-cli && coderabbit review --plain --base main~1 2>&1\",\"timeout\":300000,\"description\":\"Run CodeRabbit review against parent of main\"}",
-  "error": "Exit code 1\nStarting CodeRabbit review in plain text mode...\n\nReview directory: /Users/etretiakov/ghq/github.com/EugOT/gitstore-cli\n\n[2026-04-11T02:55:10.687Z] ❌ REVIEW ERROR: Review failed: Failed to get file changes: Command failed with exit code 128: git diff --name-status 'main~1...HEAD'\n\nfatal: main~1...HEAD: no merge base\nFailed to start review: Review failed\n[error] stopping cli",
-  "timestamp": "2026-04-11T02:55:11.444Z",
-  "retry_count": 1
-}
