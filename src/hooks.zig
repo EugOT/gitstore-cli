@@ -118,7 +118,7 @@ pub const nu_hook =
     \\
     \\  # Handle -u (update) — adopt if not yet adopted
     \\  if ("-u" in $args) {
-    \\    let non_flags = ($args | where { |it| not ($it | str starts-with "-") })
+    \\    let non_flags = ($args | skip 1 | where { |it| not ($it | str starts-with "-") })
     \\    if ($non_flags | is-empty) { return }
     \\    let repo_arg = ($non_flags | last)
     \\    let matches = (
