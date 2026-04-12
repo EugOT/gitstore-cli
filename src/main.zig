@@ -10,12 +10,16 @@ const usage_text =
     \\
     \\Commands:
     \\  init              Create gitstore directory structure
-    \\  adopt <path>      Migrate a repo into gitstore
+    \\  init <path>       Init git+jj repo and adopt into gitstore in one shot
+    \\  adopt <path>      Migrate an existing repo into gitstore
     \\  adopt --all       Migrate all repos under ghq root
     \\  verify <path>     Check pointer/symlink integrity
     \\  verify --all      Check all repos under ghq root
     \\  status            Show gitstore disk usage and repo count
+    \\  sync <remote>     Sync ghq working trees to rclone remote
+    \\  filter            Print rclone filter rules to stdout
     \\  hook --zsh        Print the zsh hook function
+    \\  hook --bash       Print the bash hook function
     \\  hook --nu         Print the nushell hook module
     \\
     \\Options:
@@ -69,25 +73,37 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "init")) {
         const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
         defer gpa.free(gitstore_root);
-        try gitstore.init(io, gitstore_root);
-        var buf: [4096]u8 = undefined;
-        var w = File.stdout().writer(io, &buf);
-        try w.interface.print("gitstore initialized at {s}\n", .{gitstore_root});
-        try w.flush();
+
+        // init with a path: create git+jj repo and adopt in one shot
+        const path_arg = args_iter.next();
+        if (path_arg) |p| {
+            const ghq_root = try getGhqRoot(gpa, io);
+            defer gpa.free(ghq_root);
+            try gitstore.initRepo(gpa, io, p, ghq_root, gitstore_root);
+        } else {
+            // No path: just ensure gitstore root directory exists
+            try gitstore.init(io, gitstore_root);
+            var buf: [4096]u8 = undefined;
+            var w = File.stdout().writerStreaming(io, &buf);
+            try w.interface.print("gitstore initialized at {s}\n", .{gitstore_root});
+            try w.flush();
+        }
         return;
     }
 
     if (std.mem.eql(u8, command, "hook")) {
         const flag = args_iter.next() orelse {
-            try printErr(io, "error: hook requires --zsh or --nu\n");
+            try printErr(io, "error: hook requires --zsh, --bash, or --nu\n");
             return;
         };
         if (std.mem.eql(u8, flag, "--zsh")) {
             try printOut(io, hooks.zsh_hook);
+        } else if (std.mem.eql(u8, flag, "--bash")) {
+            try printOut(io, hooks.bash_hook);
         } else if (std.mem.eql(u8, flag, "--nu")) {
             try printOut(io, hooks.nu_hook);
         } else {
-            try printErr(io, "error: hook requires --zsh or --nu\n");
+            try printErr(io, "error: hook requires --zsh, --bash, or --nu\n");
         }
         return;
     }
@@ -169,6 +185,35 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "sync")) {
+        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        defer gpa.free(gitstore_root);
+        const ghq_root = try getGhqRoot(gpa, io);
+        defer gpa.free(ghq_root);
+
+        var dry_run = false;
+        var remote: ?[]const u8 = null;
+        while (args_iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--dry-run")) {
+                dry_run = true;
+            } else if (arg[0] != '-') {
+                remote = arg;
+            }
+        }
+
+        if (remote) |r| {
+            try gitstore.sync(gpa, io, ghq_root, gitstore_root, r, dry_run);
+        } else {
+            try printErr(io, "error: sync requires <remote>, e.g. 'gdrive:ghq'\n");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "filter")) {
+        try printOut(io, hooks.rclone_filter);
+        return;
+    }
+
     try printErr(io, "error: unknown command '");
     try printErr(io, command);
     try printErr(io, "'\n");
@@ -177,21 +222,21 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage(io: Io) !void {
     var buf: [4096]u8 = undefined;
-    var w = File.stderr().writer(io, &buf);
+    var w = File.stderr().writerStreaming(io, &buf);
     try w.interface.print("{s}", .{usage_text});
     try w.flush();
 }
 
 fn printOut(io: Io, text: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = File.stdout().writer(io, &buf);
+    var w = File.stdout().writerStreaming(io, &buf);
     try w.interface.print("{s}\n", .{text});
     try w.flush();
 }
 
 fn printErr(io: Io, text: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = File.stderr().writer(io, &buf);
+    var w = File.stderr().writerStreaming(io, &buf);
     try w.interface.print("{s}", .{text});
     try w.flush();
 }

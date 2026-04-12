@@ -20,6 +20,16 @@ comptime {
 
 // ===== Test helpers =====
 
+/// Suppress stdout output from gitstore functions during tests
+/// to prevent interleaving with the test runner.
+fn suppressOutput() void {
+    gitstore.quiet = true;
+}
+
+fn restoreOutput() void {
+    gitstore.quiet = false;
+}
+
 const TestEnv = struct {
     base: []const u8,
     ghq_root: []const u8,
@@ -28,11 +38,12 @@ const TestEnv = struct {
     io: Io,
 
     fn setup(gpa: Allocator, io: Io) !TestEnv {
+        suppressOutput();
+
         const base = "/tmp/gitstore_test_env";
         const ghq = "/tmp/gitstore_test_env/ghq";
         const store = "/tmp/gitstore_test_env/gitstore";
 
-        // Clean from prior runs
         Dir.cwd().deleteTree(io, base) catch {};
 
         try Dir.cwd().createDirPath(io, ghq);
@@ -49,6 +60,7 @@ const TestEnv = struct {
 
     fn teardown(self: *const TestEnv) void {
         Dir.cwd().deleteTree(self.io, self.base) catch {};
+        restoreOutput();
     }
 
     /// Create a git repo at ghq_root/org/name with an initial commit.
@@ -69,7 +81,7 @@ const TestEnv = struct {
         self.gpa.free(r1c.stdout);
         self.gpa.free(r1c.stderr);
 
-        const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--allow-empty", "-m", "init" }, repo_path);
+        const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo_path);
         self.gpa.free(r2.stdout);
         self.gpa.free(r2.stderr);
 
@@ -566,6 +578,101 @@ test "e2e adopt writes operations log" {
 
 // =========================================================
 // E2E: status reports correct counts
+// =========================================================
+
+// =========================================================
+// E2E: initRepo on empty directory
+// =========================================================
+
+test "e2e initRepo creates git+jj and adopts" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try std.fmt.allocPrint(gpa, "{s}/testorg/fresh", .{env.ghq_root});
+    defer gpa.free(repo);
+
+    try gitstore.initRepo(gpa, io, repo, env.ghq_root, env.gitstore_root);
+
+    // .git should be a pointer file
+    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(git_path);
+    const content = try Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited);
+    defer gpa.free(content);
+    try testing.expect(std.mem.startsWith(u8, content, "gitdir: "));
+
+    // .jj should be a symlink
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const link_len = try Dir.readLinkAbsolute(io, jj_path, &link_buf);
+    try testing.expect(link_len > 0);
+
+    // jj should work
+    const jj_r = try ex.exec(gpa, io, &.{ "jj", "status", "-R", repo }, null);
+    defer {
+        gpa.free(jj_r.stdout);
+        gpa.free(jj_r.stderr);
+    }
+    try testing.expect(jj_r.succeeded());
+}
+
+// =========================================================
+// E2E: initRepo on existing repo just adopts
+// =========================================================
+
+test "e2e initRepo on existing repo adopts without re-init" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    // Create a repo with an actual commit
+    const repo = try env.createRepo("testorg", "existing");
+    defer gpa.free(repo);
+
+    try gitstore.initRepo(gpa, io, repo, env.ghq_root, env.gitstore_root);
+
+    // Verify commit is preserved
+    const git_r = try ex.exec(gpa, io, &.{ "git", "-C", repo, "log", "--oneline" }, null);
+    defer {
+        gpa.free(git_r.stdout);
+        gpa.free(git_r.stderr);
+    }
+    try testing.expect(git_r.succeeded());
+    try testing.expect(std.mem.indexOf(u8, git_r.stdout, "init") != null);
+}
+
+// =========================================================
+// E2E: initRepo is idempotent
+// =========================================================
+
+test "e2e initRepo idempotent on already adopted" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try std.fmt.allocPrint(gpa, "{s}/testorg/idem", .{env.ghq_root});
+    defer gpa.free(repo);
+
+    try gitstore.initRepo(gpa, io, repo, env.ghq_root, env.gitstore_root);
+
+    // Second call should skip
+    try gitstore.initRepo(gpa, io, repo, env.ghq_root, env.gitstore_root);
+
+    // Still works
+    const jj_r = try ex.exec(gpa, io, &.{ "jj", "status", "-R", repo }, null);
+    defer {
+        gpa.free(jj_r.stdout);
+        gpa.free(jj_r.stderr);
+    }
+    try testing.expect(jj_r.succeeded());
+}
+
+// =========================================================
+// E2E: status
 // =========================================================
 
 test "e2e status with empty gitstore" {
