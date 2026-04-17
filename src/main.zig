@@ -13,8 +13,10 @@ const usage_text =
     \\  init <path>       Init git+jj repo and adopt into gitstore in one shot
     \\  adopt <path>      Migrate an existing repo into gitstore
     \\  adopt --all       Migrate all repos under ghq root
+    \\  detach <path>     Restore an adopted repo (reverse of adopt)
+    \\  detach --all      Restore all adopted repos
     \\  verify <path>     Check pointer/symlink integrity
-    \\  verify --all      Check all repos under ghq root
+    \\  verify --all      Check all adopted repos
     \\  status            Show gitstore disk usage and repo count
     \\  sync <remote>     Sync ghq working trees to rclone remote
     \\  filter            Print rclone filter rules to stdout
@@ -24,6 +26,7 @@ const usage_text =
     \\
     \\Options:
     \\  --dry-run         Print planned actions without modifying anything
+    \\  --keep-backup     Preserve gitstore entry when detaching (renames it)
     \\  --json            Output status in JSON format
     \\  --help            Show this help message
     \\
@@ -141,6 +144,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "verify")) {
+        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        defer gpa.free(gitstore_root);
         const ghq_root = try getGhqRoot(gpa, io);
         defer gpa.free(ghq_root);
 
@@ -156,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (all) {
-            try gitstore.verifyAll(gpa, io, ghq_root);
+            try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
         } else if (path) |p| {
             const ok = try gitstore.verify(gpa, io, p);
             if (!ok) {
@@ -164,6 +169,38 @@ pub fn main(init: std.process.Init) !void {
             }
         } else {
             try printErr(io, "error: verify requires <path> or --all\n");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "detach")) {
+        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        defer gpa.free(gitstore_root);
+        const ghq_root = try getGhqRoot(gpa, io);
+        defer gpa.free(ghq_root);
+
+        var dry_run = false;
+        var all = false;
+        var keep_backup = false;
+        var path: ?[]const u8 = null;
+        while (args_iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--dry-run")) {
+                dry_run = true;
+            } else if (std.mem.eql(u8, arg, "--all")) {
+                all = true;
+            } else if (std.mem.eql(u8, arg, "--keep-backup")) {
+                keep_backup = true;
+            } else if (arg[0] != '-') {
+                path = arg;
+            }
+        }
+
+        if (all) {
+            try gitstore.detachAll(gpa, io, ghq_root, gitstore_root, dry_run, keep_backup);
+        } else if (path) |p| {
+            try gitstore.detach(gpa, io, p, ghq_root, gitstore_root, dry_run, keep_backup);
+        } else {
+            try printErr(io, "error: detach requires <path> or --all\n");
         }
         return;
     }
