@@ -37,9 +37,10 @@ pub fn logOperation(
 
     // Build the JSONL line in a stack buffer
     var line_buf: [4096]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf,
+    const line = std.fmt.bufPrint(
+        &line_buf,
         \\{{"timestamp":"{s}","action":"{s}","source":"{s}","destination":"{s}","status":"{s}"}}
-        ++ "\n",
+    ++ "\n",
         .{
             ts_str,
             action.toString(),
