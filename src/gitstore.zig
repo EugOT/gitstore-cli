@@ -10,6 +10,7 @@ pub const Error = error{
     ProcessFailed,
     NotAGitRepo,
     AlreadyAdopted,
+    NotAdopted,
     InvalidGhqRoot,
     VerifyFailed,
 } || Allocator.Error || ex.ExecError || Dir.WriteFileError || Dir.SymLinkError ||
@@ -43,7 +44,8 @@ pub fn init(io: Io, gitstore_root: []const u8) !void {
     };
 }
 
-/// Determine the gitstore subpath for a repo given its absolute path and ghq root.
+/// Determine the gitstore subpath for a repo relative to ghq root.
+/// Returns null if repo is not under ghq root.
 pub fn repoRelativePath(repo_path: []const u8, ghq_root: []const u8) ?[]const u8 {
     if (ghq_root.len == 0) return null;
     var root = ghq_root;
@@ -65,8 +67,18 @@ pub fn repoRelativePath(repo_path: []const u8, ghq_root: []const u8) ?[]const u8
     return null;
 }
 
-/// Check if a repo is already adopted (has .git as a file, not directory).
-pub fn isAdopted(io: Io, repo_path: []const u8, gpa: Allocator) bool {
+/// Determine gitstore storage path for any absolute repo path.
+/// - If under ghq_root, returns the ghq-relative path (e.g. "github.com/Org/repo").
+/// - Otherwise returns the absolute path with leading "/" stripped (e.g. "Users/x/dabest_neuropeptides").
+/// Returns null only if repo_path is not absolute.
+pub fn repoStoragePath(repo_path: []const u8, ghq_root: []const u8) ?[]const u8 {
+    if (repoRelativePath(repo_path, ghq_root)) |rel| return rel;
+    if (repo_path.len > 1 and repo_path[0] == '/') return repo_path[1..];
+    return null;
+}
+
+/// Check if a repo is already adopted: .git is a pointer file with gitdir target inside gitstore_root.
+pub fn isAdopted(io: Io, repo_path: []const u8, gitstore_root: []const u8, gpa: Allocator) bool {
     const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path}) catch return false;
     defer gpa.free(git_path);
 
@@ -75,7 +87,19 @@ pub fn isAdopted(io: Io, repo_path: []const u8, gpa: Allocator) bool {
         else => return false,
     };
     defer gpa.free(content);
-    return std.mem.startsWith(u8, content, "gitdir:");
+    if (!std.mem.startsWith(u8, content, "gitdir:")) return false;
+    // Must be a gitstore pointer, not a normal linked worktree pointer.
+    // Enforce path-boundary match: "/a/store-old" must not match root "/a/store".
+    const trimmed = ex.trimTrailingNewline(content);
+    const prefix = "gitdir: ";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return false;
+    const gitdir = trimmed[prefix.len..];
+    // Strip trailing slashes from the root for comparison
+    var root = gitstore_root;
+    while (root.len > 1 and root[root.len - 1] == '/') root = root[0 .. root.len - 1];
+    if (!std.mem.startsWith(u8, gitdir, root)) return false;
+    // Require exactly-equal or next char must be '/'
+    return gitdir.len == root.len or gitdir[root.len] == '/';
 }
 
 /// Initialize a directory as a gitstore-managed repo in one shot.
@@ -94,7 +118,7 @@ pub fn initRepo(
         return err;
     };
 
-    if (isAdopted(io, repo_path, gpa)) {
+    if (isAdopted(io, repo_path, gitstore_root, gpa)) {
         info(io, "skip: {s} (already adopted)\n", .{repo_path});
         return;
     }
@@ -102,9 +126,11 @@ pub fn initRepo(
     const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
     defer gpa.free(git_path);
 
+    // Treat .git as "present" whether it's a directory OR a pointer file
+    // (a linked worktree or submodule has .git as a file — still a real repo).
     const has_git = blk: {
         var dir = Dir.openDirAbsolute(io, git_path, .{}) catch |err| switch (err) {
-            error.NotDir => break :blk false, // .git is a file, not a directory
+            error.NotDir => break :blk true, // .git is a pointer file — a real repo
             error.FileNotFound => break :blk false,
             else => break :blk false,
         };
@@ -152,6 +178,91 @@ pub fn rewriteJjGitTarget(
     };
 }
 
+/// Rewrite .jj/repo/store/git_target back to the relative path used by a colocated
+/// jj repo when .jj lives next to .git in the working tree.
+pub fn rewriteJjGitTargetRelative(gpa: Allocator, io: Io, jj_dir: []const u8) !void {
+    const git_target_path = try std.fmt.allocPrint(gpa, "{s}/repo/store/git_target", .{jj_dir});
+    defer gpa.free(git_target_path);
+    Dir.cwd().writeFile(io, .{
+        .sub_path = git_target_path,
+        .data = "../../../.git",
+    }) catch {
+        warn(io, "warn: could not rewrite jj git_target at {s}\n", .{git_target_path});
+    };
+}
+
+/// Enumerate linked worktrees of a repo by calling `git worktree list --porcelain`.
+/// Returns heap-allocated slice of absolute paths of LINKED worktrees only (excludes the main).
+/// Caller frees each path and the outer slice via `freeWorktreePaths`.
+pub fn enumerateLinkedWorktrees(gpa: Allocator, io: Io, repo_path: []const u8) ![][]u8 {
+    const result = try ex.exec(gpa, io, &.{ "git", "-C", repo_path, "worktree", "list", "--porcelain" }, null);
+    defer {
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
+    }
+    if (!result.succeeded()) return error.ProcessFailed;
+
+    var list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (list.items) |p| gpa.free(p);
+        list.deinit(gpa);
+    }
+
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "worktree ")) continue;
+        const path = line["worktree ".len..];
+        if (first) {
+            first = false; // skip main worktree
+            continue;
+        }
+        const owned = try gpa.dupe(u8, path);
+        try list.append(gpa, owned);
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+pub fn freeWorktreePaths(gpa: Allocator, paths: [][]u8) void {
+    for (paths) |p| gpa.free(p);
+    gpa.free(paths);
+}
+
+/// Rewrite a linked worktree's .git pointer file to use a new main-.git location.
+/// Extracts the worktree name from the existing pointer, so this works for any
+/// target main-.git path (gitstore or original).
+fn rewriteLinkedWorktreePointer(
+    gpa: Allocator,
+    io: Io,
+    linked_wt_path: []const u8,
+    new_main_git: []const u8,
+) !void {
+    const wt_git_file = try std.fmt.allocPrint(gpa, "{s}/.git", .{linked_wt_path});
+    defer gpa.free(wt_git_file);
+
+    const content = Dir.cwd().readFileAlloc(io, wt_git_file, gpa, .unlimited) catch |err| {
+        warn(io, "warn: cannot read {s}: {s}\n", .{ wt_git_file, @errorName(err) });
+        return err;
+    };
+    defer gpa.free(content);
+
+    const trimmed = ex.trimTrailingNewline(content);
+    const prefix = "gitdir: ";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) {
+        warn(io, "warn: {s} is not a gitdir pointer\n", .{wt_git_file});
+        return error.NotAGitRepo;
+    }
+    const old_target = trimmed[prefix.len..];
+    // Extract worktree name (last path component)
+    var name_start: usize = old_target.len;
+    while (name_start > 0 and old_target[name_start - 1] != '/') name_start -= 1;
+    const name = old_target[name_start..];
+
+    const new_pointer = try std.fmt.allocPrint(gpa, "gitdir: {s}/worktrees/{s}\n", .{ new_main_git, name });
+    defer gpa.free(new_pointer);
+    try Dir.cwd().writeFile(io, .{ .sub_path = wt_git_file, .data = new_pointer });
+}
+
 /// Adopt a single repository: move .git and .jj into gitstore.
 pub fn adopt(
     gpa: Allocator,
@@ -161,12 +272,12 @@ pub fn adopt(
     gitstore_root: []const u8,
     dry_run: bool,
 ) !void {
-    const rel_path = repoRelativePath(repo_path, ghq_root) orelse {
-        warn(io, "error: {s} is not under ghq root {s}\n", .{ repo_path, ghq_root });
+    const rel_path = repoStoragePath(repo_path, ghq_root) orelse {
+        warn(io, "error: {s} is not an absolute path\n", .{repo_path});
         return error.InvalidGhqRoot;
     };
 
-    if (isAdopted(io, repo_path, gpa)) {
+    if (isAdopted(io, repo_path, gitstore_root, gpa)) {
         info(io, "skip: {s} (already adopted)\n", .{repo_path});
         return;
     }
@@ -177,7 +288,7 @@ pub fn adopt(
         // Verify .git is a directory. openDir fails with NotDir if it's a file.
         var dir = Dir.openDirAbsolute(io, git_src, .{}) catch |err| switch (err) {
             error.NotDir => {
-                warn(io, "error: {s}/.git is a file but not a valid gitdir pointer\n", .{repo_path});
+                warn(io, "error: {s}/.git is a file (likely a linked worktree or submodule); adopt the main repo instead\n", .{repo_path});
                 return error.NotAGitRepo;
             },
             else => {
@@ -213,6 +324,16 @@ pub fn adopt(
             info(io, "  init jj colocated in {s}\n", .{repo_path});
         }
         return;
+    }
+
+    // --- Step 0: Enumerate linked worktrees BEFORE moving .git/ ---
+    const worktrees: [][]u8 = enumerateLinkedWorktrees(gpa, io, repo_path) catch |err| blk: {
+        warn(io, "warn: could not enumerate worktrees ({s})\n", .{@errorName(err)});
+        break :blk try gpa.alloc([]u8, 0);
+    };
+    defer freeWorktreePaths(gpa, worktrees);
+    if (worktrees.len > 0) {
+        info(io, "found {d} linked worktree(s)\n", .{worktrees.len});
     }
 
     // --- Step 1: Create gitstore directory structure ---
@@ -264,17 +385,34 @@ pub fn adopt(
         // Critical: .git deleted but pointer write failed. Restore from gitstore copy.
         warn(io, "error: pointer write failed, restoring .git from gitstore copy\n", .{});
         const restore = ex.exec(gpa, io, &.{ "cp", "-a", git_dest, git_src }, null) catch {
-            warn(io, "CRITICAL: restore also failed — .git at {s}, pointer missing\n", .{git_dest});
+            warn(io, "CRITICAL: restore exec failed — .git at {s}, pointer missing\n", .{git_dest});
             return err;
         };
-        gpa.free(restore.stdout);
-        gpa.free(restore.stderr);
+        defer {
+            gpa.free(restore.stdout);
+            gpa.free(restore.stderr);
+        }
+        if (!restore.succeeded()) {
+            warn(io, "CRITICAL: restore cp exited non-zero — .git at {s}, pointer missing: {s}\n", .{ git_dest, restore.stderr });
+            return err;
+        }
         // Remove the gitstore copy since we restored the original
         Dir.cwd().deleteTree(io, git_dest) catch {};
         return err;
     };
     try oplog.logOperation(io, log_path, .write_pointer, git_src, git_dest, "ok");
     info(io, "pointer: {s} -> {s}\n", .{ git_src, git_dest });
+
+    // --- Step 4b: Rewrite linked worktree .git pointers ---
+    for (worktrees) |wt| {
+        rewriteLinkedWorktreePointer(gpa, io, wt, git_dest) catch |err| {
+            warn(io, "warn: could not rewrite worktree pointer at {s}: {s}\n", .{ wt, @errorName(err) });
+            try oplog.logOperation(io, log_path, .write_pointer, wt, git_dest, "error: worktree rewrite failed");
+            continue;
+        };
+        try oplog.logOperation(io, log_path, .write_pointer, wt, git_dest, "ok: worktree");
+        info(io, "worktree: {s}/.git -> {s}/worktrees/...\n", .{ wt, git_dest });
+    }
 
     // --- Step 5: Handle .jj ---
     const jj_src = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo_path});
@@ -363,7 +501,7 @@ pub fn adoptAll(
     while (lines.next()) |line| {
         if (line.len == 0) continue;
 
-        if (isAdopted(io, line, gpa)) {
+        if (isAdopted(io, line, gitstore_root, gpa)) {
             skipped += 1;
             continue;
         }
@@ -468,11 +606,12 @@ pub fn verify(
     return ok;
 }
 
-/// Verify all repos under ghq root.
+/// Verify all adopted repos under ghq root.
 pub fn verifyAll(
     gpa: Allocator,
     io: Io,
     ghq_root: []const u8,
+    gitstore_root: []const u8,
 ) !void {
     _ = ghq_root;
     var ok_count: usize = 0;
@@ -488,7 +627,7 @@ pub fn verifyAll(
     var lines = std.mem.splitScalar(u8, ex.trimTrailingNewline(list_result.stdout), '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        if (!isAdopted(io, line, gpa)) continue;
+        if (!isAdopted(io, line, gitstore_root, gpa)) continue;
 
         const is_ok = try verify(gpa, io, line);
         if (is_ok) ok_count += 1 else fail_count += 1;
@@ -531,7 +670,7 @@ pub fn status(
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             total_repos += 1;
-            if (isAdopted(io, line, gpa)) {
+            if (isAdopted(io, line, gitstore_root, gpa)) {
                 adopted_count += 1;
                 const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{line}) catch continue;
                 defer gpa.free(git_path);
@@ -551,7 +690,7 @@ pub fn status(
     if (json_mode) {
         info(io,
             \\{{"disk_usage":"{s}","gitstore_root":"{s}","total_repos":{d},"adopted":{d},"broken":{d}}}
-            ++ "\n", .{ disk_usage, gitstore_root, total_repos, adopted_count, broken_count });
+        ++ "\n", .{ disk_usage, gitstore_root, total_repos, adopted_count, broken_count });
     } else {
         info(io, "gitstore: {s}\n", .{gitstore_root});
         info(io, "disk usage: {s}\n", .{disk_usage});
@@ -577,24 +716,29 @@ pub fn sync(
     // Ensure gitstore root exists
     try init(io, gitstore_root);
 
-    // Write filter file
-    const filter_path = try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
+    // Write filter file (for non-dry-run; for dry-run use a temp file to not pollute gitstore)
+    const filter_path = if (dry_run)
+        try std.fmt.allocPrint(gpa, "/tmp/gitstore-rclone-filter.dryrun.txt", .{})
+    else
+        try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
     defer gpa.free(filter_path);
     try Dir.cwd().writeFile(io, .{
         .sub_path = filter_path,
         .data = hooks.rclone_filter,
     });
     info(io, "filter: {s}\n", .{filter_path});
+    defer if (dry_run) {
+        Dir.cwd().deleteFile(io, filter_path) catch {};
+    };
 
     // Build rclone command
     if (dry_run) {
         info(io, "dry-run: rclone sync {s} {s} --filter-from {s} --dry-run\n", .{ ghq_root, remote, filter_path });
         const result = try ex.exec(gpa, io, &.{
-            "rclone", "sync",
-            ghq_root, remote,
+            "rclone",        "sync",
+            ghq_root,        remote,
             "--filter-from", filter_path,
-            "--dry-run",
-            "-v",
+            "--dry-run",     "-v",
         }, null);
         defer {
             gpa.free(result.stdout);
@@ -609,11 +753,10 @@ pub fn sync(
     } else {
         info(io, "sync: {s} -> {s}\n", .{ ghq_root, remote });
         const result = try ex.exec(gpa, io, &.{
-            "rclone", "sync",
-            ghq_root, remote,
+            "rclone",        "sync",
+            ghq_root,        remote,
             "--filter-from", filter_path,
-            "-v",
-            "--stats-one-line",
+            "-v",            "--stats-one-line",
         }, null);
         defer {
             gpa.free(result.stdout);
@@ -624,5 +767,228 @@ pub fn sync(
             return error.ProcessFailed;
         }
         info(io, "{s}", .{result.stderr}); // rclone stats go to stderr
+    }
+}
+
+/// Detach an adopted repo: restore .git/.jj from gitstore to working tree,
+/// rewrite linked worktree pointers back, optionally archive the gitstore entry.
+/// `ghq_root` is kept for API symmetry with adopt() but is not needed for detach
+/// (the gitstore location is encoded in the pointer file).
+pub fn detach(
+    gpa: Allocator,
+    io: Io,
+    repo_path: []const u8,
+    ghq_root: []const u8,
+    gitstore_root: []const u8,
+    dry_run: bool,
+    keep_backup: bool,
+) !void {
+    _ = ghq_root;
+
+    if (!isAdopted(io, repo_path, gitstore_root, gpa)) {
+        warn(io, "error: {s} is not adopted into {s}\n", .{ repo_path, gitstore_root });
+        return error.NotAdopted;
+    }
+
+    const git_pointer_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
+    defer gpa.free(git_pointer_path);
+
+    // Read the pointer to discover the gitstore location
+    const pointer_content = try Dir.cwd().readFileAlloc(io, git_pointer_path, gpa, .unlimited);
+    defer gpa.free(pointer_content);
+    const trimmed = ex.trimTrailingNewline(pointer_content);
+    const prefix = "gitdir: ";
+    const git_src = trimmed[prefix.len..]; // e.g. /gitstore/.../git
+
+    // Derive jj_src and repo_store_dir by taking parent of git_src, then appending /jj
+    var parent_end = git_src.len;
+    while (parent_end > 0 and git_src[parent_end - 1] != '/') parent_end -= 1;
+    const repo_store_dir = git_src[0..if (parent_end > 0) parent_end - 1 else 0];
+    const jj_src = try std.fmt.allocPrint(gpa, "{s}/jj", .{repo_store_dir});
+    defer gpa.free(jj_src);
+
+    const log_path = try std.fmt.allocPrint(gpa, "{s}/operations.log", .{gitstore_root});
+    defer gpa.free(log_path);
+
+    const jj_pointer_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo_path});
+    defer gpa.free(jj_pointer_path);
+    const has_jj_link = blk: {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        _ = Dir.readLinkAbsolute(io, jj_pointer_path, &buf) catch break :blk false;
+        break :blk true;
+    };
+
+    // Enumerate linked worktrees from the gitstore git_src perspective
+    const worktrees: [][]u8 = enumerateLinkedWorktrees(gpa, io, repo_path) catch |err| blk: {
+        warn(io, "warn: could not enumerate worktrees ({s})\n", .{@errorName(err)});
+        break :blk try gpa.alloc([]u8, 0);
+    };
+    defer freeWorktreePaths(gpa, worktrees);
+
+    if (dry_run) {
+        info(io, "dry-run: would detach {s}\n", .{repo_path});
+        info(io, "  restore {s} -> {s}/.git\n", .{ git_src, repo_path });
+        if (has_jj_link) info(io, "  restore {s} -> {s}/.jj\n", .{ jj_src, repo_path });
+        for (worktrees) |wt| info(io, "  rewrite worktree pointer {s}/.git -> {s}/.git/worktrees/...\n", .{ wt, repo_path });
+        if (keep_backup) {
+            info(io, "  rename gitstore entry {s} -> {s}.detached-<ts>\n", .{ repo_store_dir, repo_store_dir });
+        } else {
+            info(io, "  remove gitstore entry {s}\n", .{repo_store_dir});
+        }
+        return;
+    }
+
+    // --- Step 1: Stage-copy .git back ---
+    const git_new = try std.fmt.allocPrint(gpa, "{s}/.git.gs-new", .{repo_path});
+    defer gpa.free(git_new);
+    Dir.cwd().deleteTree(io, git_new) catch {};
+    info(io, "copy: {s} -> {s}\n", .{ git_src, git_new });
+    const cp = try ex.exec(gpa, io, &.{ "cp", "-a", git_src, git_new }, null);
+    defer {
+        gpa.free(cp.stdout);
+        gpa.free(cp.stderr);
+    }
+    if (!cp.succeeded()) {
+        warn(io, "error: cp failed: {s}\n", .{cp.stderr});
+        try oplog.logOperation(io, log_path, .copy, git_src, git_new, "error: cp failed (detach)");
+        Dir.cwd().deleteTree(io, git_new) catch {};
+        return error.ProcessFailed;
+    }
+    try oplog.logOperation(io, log_path, .copy, git_src, git_new, "ok: detach stage");
+
+    // --- Step 2: Verify staged copy ---
+    const vr = try ex.exec(gpa, io, &.{ "git", "--git-dir", git_new, "rev-parse", "--git-dir" }, null);
+    defer {
+        gpa.free(vr.stdout);
+        gpa.free(vr.stderr);
+    }
+    if (!vr.succeeded()) {
+        warn(io, "error: staged .git verify failed\n", .{});
+        Dir.cwd().deleteTree(io, git_new) catch {};
+        try oplog.logOperation(io, log_path, .copy, git_src, git_new, "error: verify failed");
+        return error.VerifyFailed;
+    }
+
+    // --- Step 3: Swap — delete pointer file, rename staged dir ---
+    try Dir.cwd().deleteFile(io, git_pointer_path);
+    try oplog.logOperation(io, log_path, .remove, git_pointer_path, "", "ok: detach pointer");
+    try Dir.rename(Dir.cwd(), git_new, Dir.cwd(), git_pointer_path, io);
+    try oplog.logOperation(io, log_path, .write_pointer, git_src, git_pointer_path, "ok: detach restore .git");
+    info(io, "restored: {s}/.git\n", .{repo_path});
+
+    // --- Step 4: Handle .jj ---
+    if (has_jj_link) {
+        const jj_new = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-new", .{repo_path});
+        defer gpa.free(jj_new);
+        Dir.cwd().deleteTree(io, jj_new) catch {};
+        info(io, "copy: {s} -> {s}\n", .{ jj_src, jj_new });
+        const jcp = try ex.exec(gpa, io, &.{ "cp", "-aL", jj_src, jj_new }, null);
+        gpa.free(jcp.stdout);
+        gpa.free(jcp.stderr);
+        if (jcp.succeeded()) {
+            // Rename the symlink aside first — do NOT delete it until the new .jj is in place.
+            const jj_backup = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-old", .{repo_path});
+            defer gpa.free(jj_backup);
+            Dir.rename(Dir.cwd(), jj_pointer_path, Dir.cwd(), jj_backup, io) catch |err| {
+                warn(io, "warn: could not rename .jj symlink ({s}); leaving symlink in place\n", .{@errorName(err)});
+                Dir.cwd().deleteTree(io, jj_new) catch {};
+                return;
+            };
+            // Now rename staged copy into place. On failure restore the symlink.
+            Dir.rename(Dir.cwd(), jj_new, Dir.cwd(), jj_pointer_path, io) catch |err| {
+                warn(io, "error: rename staged .jj failed ({s}); restoring symlink\n", .{@errorName(err)});
+                Dir.rename(Dir.cwd(), jj_backup, Dir.cwd(), jj_pointer_path, io) catch {};
+                Dir.cwd().deleteTree(io, jj_new) catch {};
+                return err;
+            };
+            // Success — delete the old symlink backup.
+            Dir.cwd().deleteFile(io, jj_backup) catch {};
+            try rewriteJjGitTargetRelative(gpa, io, jj_pointer_path);
+            try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_pointer_path, "ok: detach restore .jj");
+            info(io, "restored: {s}/.jj\n", .{repo_path});
+        } else {
+            warn(io, "warn: cp .jj failed; leaving symlink in place\n", .{});
+            Dir.cwd().deleteTree(io, jj_new) catch {};
+        }
+    }
+
+    // --- Step 5: Rewrite linked worktree pointers back ---
+    const restored_git = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
+    defer gpa.free(restored_git);
+    for (worktrees) |wt| {
+        rewriteLinkedWorktreePointer(gpa, io, wt, restored_git) catch |err| {
+            warn(io, "warn: could not rewrite worktree pointer {s}: {s}\n", .{ wt, @errorName(err) });
+            continue;
+        };
+        try oplog.logOperation(io, log_path, .write_pointer, wt, restored_git, "ok: detach worktree");
+        info(io, "worktree: {s}/.git -> {s}/worktrees/...\n", .{ wt, restored_git });
+    }
+
+    // --- Step 6: Archive or remove gitstore entry ---
+    if (keep_backup) {
+        var ts_buf: [30]u8 = undefined;
+        const ts = oplog.timestamp(io, &ts_buf);
+        // Use nanosecond clock for uniqueness — archives in the same second never collide
+        const ns_raw = Io.Clock.real.now(io).nanoseconds;
+        const ns_sub: u64 = @intCast(@mod(ns_raw, 1_000_000_000));
+        const archived = try std.fmt.allocPrint(
+            gpa,
+            "{s}.detached-{s}-{d:0>9}",
+            .{ repo_store_dir, ts, ns_sub },
+        );
+        defer gpa.free(archived);
+        Dir.rename(Dir.cwd(), repo_store_dir, Dir.cwd(), archived, io) catch |err| {
+            warn(io, "warn: could not archive gitstore entry ({s}); left in place\n", .{@errorName(err)});
+        };
+        try oplog.logOperation(io, log_path, .remove, repo_store_dir, archived, "ok: detach archived");
+        info(io, "archived: {s} -> {s}\n", .{ repo_store_dir, archived });
+    } else {
+        Dir.cwd().deleteTree(io, repo_store_dir) catch |err| {
+            warn(io, "warn: could not remove gitstore entry ({s})\n", .{@errorName(err)});
+        };
+        try oplog.logOperation(io, log_path, .remove, repo_store_dir, "", "ok: detach removed");
+        info(io, "removed gitstore entry: {s}\n", .{repo_store_dir});
+    }
+}
+
+/// Detach all adopted repos under ghq root.
+pub fn detachAll(
+    gpa: Allocator,
+    io: Io,
+    ghq_root: []const u8,
+    gitstore_root: []const u8,
+    dry_run: bool,
+    keep_backup: bool,
+) !void {
+    var detached: usize = 0;
+    var skipped: usize = 0;
+    var failed: usize = 0;
+
+    const list_result = try ex.exec(gpa, io, &.{ "ghq", "list", "--full-path" }, null);
+    defer {
+        gpa.free(list_result.stdout);
+        gpa.free(list_result.stderr);
+    }
+    if (!list_result.succeeded()) return error.ProcessFailed;
+
+    var lines = std.mem.splitScalar(u8, ex.trimTrailingNewline(list_result.stdout), '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (!isAdopted(io, line, gitstore_root, gpa)) {
+            skipped += 1;
+            continue;
+        }
+        detach(gpa, io, line, ghq_root, gitstore_root, dry_run, keep_backup) catch |err| {
+            warn(io, "error: failed to detach {s}: {s}\n", .{ line, @errorName(err) });
+            failed += 1;
+            continue;
+        };
+        detached += 1;
+    }
+
+    if (dry_run) {
+        info(io, "\ndry-run detach summary: {d} would detach, {d} not adopted, {d} failed\n", .{ detached, skipped, failed });
+    } else {
+        info(io, "\ndetach summary: {d} detached, {d} not adopted, {d} failed\n", .{ detached, skipped, failed });
     }
 }

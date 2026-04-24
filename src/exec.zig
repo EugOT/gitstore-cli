@@ -96,7 +96,7 @@ test "exec nonexistent command returns FileNotFound" {
 test "exec with cwd" {
     const gpa = testing.allocator;
     const io = testing.io;
-    var result = try exec(gpa, io, &.{ "pwd" }, "/tmp");
+    var result = try exec(gpa, io, &.{"pwd"}, "/tmp");
     defer result.deinit(gpa);
     try testing.expect(result.succeeded());
     const trimmed = trimTrailingNewline(result.stdout);
@@ -107,7 +107,7 @@ test "exec with cwd" {
 test "exec with null cwd inherits current dir" {
     const gpa = testing.allocator;
     const io = testing.io;
-    var result = try exec(gpa, io, &.{ "pwd" }, null);
+    var result = try exec(gpa, io, &.{"pwd"}, null);
     defer result.deinit(gpa);
     try testing.expect(result.succeeded());
     try testing.expect(result.stdout.len > 0);
@@ -125,7 +125,7 @@ test "exec multi-arg command" {
 test "exec empty stdout" {
     const gpa = testing.allocator;
     const io = testing.io;
-    var result = try exec(gpa, io, &.{ "true" }, null);
+    var result = try exec(gpa, io, &.{"true"}, null);
     defer result.deinit(gpa);
     try testing.expect(result.succeeded());
     try testing.expectEqualStrings("", result.stdout);
@@ -134,7 +134,7 @@ test "exec empty stdout" {
 test "exec exit code preserved" {
     const gpa = testing.allocator;
     const io = testing.io;
-    var result = try exec(gpa, io, &.{ "false" }, null);
+    var result = try exec(gpa, io, &.{"false"}, null);
     defer result.deinit(gpa);
     try testing.expect(!result.succeeded());
     try testing.expect(result.term == .exited);
@@ -183,7 +183,7 @@ test "execCheck returns stdout on success" {
 test "execCheck returns error on failure" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const result = execCheck(gpa, io, &.{ "false" }, null);
+    const result = execCheck(gpa, io, &.{"false"}, null);
     try testing.expectError(error.ProcessFailed, result);
 }
 

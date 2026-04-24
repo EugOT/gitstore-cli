@@ -16,9 +16,17 @@ comptime {
     _ = @import("exec.zig");
     _ = @import("log.zig");
     _ = @import("hooks.zig");
+    _ = @import("url.zig");
+    _ = @import("config.zig");
+    _ = @import("list.zig");
+    _ = @import("cache.zig");
+    _ = @import("clone.zig");
 }
 
+const config = @import("config.zig");
+
 // ===== Test helpers =====
+var test_env_counter = std.atomic.Value(u64).init(0);
 
 /// Suppress stdout output from gitstore functions during tests
 /// to prevent interleaving with the test runner.
@@ -40,9 +48,14 @@ const TestEnv = struct {
     fn setup(gpa: Allocator, io: Io) !TestEnv {
         suppressOutput();
 
-        const base = "/tmp/gitstore_test_env";
-        const ghq = "/tmp/gitstore_test_env/ghq";
-        const store = "/tmp/gitstore_test_env/gitstore";
+        const seq = test_env_counter.fetchAdd(1, .monotonic);
+        const ns = Io.Clock.real.now(io).nanoseconds;
+        const base = try std.fmt.allocPrint(gpa, "/tmp/gitstore_test_env_{d}_{d}", .{ ns, seq });
+        errdefer gpa.free(base);
+        const ghq = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
+        errdefer gpa.free(ghq);
+        const store = try std.fmt.allocPrint(gpa, "{s}/gitstore", .{base});
+        errdefer gpa.free(store);
 
         Dir.cwd().deleteTree(io, base) catch {};
 
@@ -60,6 +73,9 @@ const TestEnv = struct {
 
     fn teardown(self: *const TestEnv) void {
         Dir.cwd().deleteTree(self.io, self.base) catch {};
+        self.gpa.free(self.base);
+        self.gpa.free(self.ghq_root);
+        self.gpa.free(self.gitstore_root);
         restoreOutput();
     }
 
@@ -168,10 +184,10 @@ test "repoRelativePath empty root returns null" {
 test "isAdopted returns false for nonexistent path" {
     const io = testing.io;
     const gpa = testing.allocator;
-    try testing.expect(!gitstore.isAdopted(io, "/tmp/gitstore_test_no_such_path_12345", gpa));
+    try testing.expect(!gitstore.isAdopted(io, "/tmp/gitstore_test_no_such_path_12345", "/any", gpa));
 }
 
-test "isAdopted returns true for pointer file" {
+test "isAdopted returns true when pointer targets gitstore_root" {
     const io = testing.io;
     const gpa = testing.allocator;
     const dir = "/tmp/gitstore_test_adopted";
@@ -180,10 +196,26 @@ test "isAdopted returns true for pointer file" {
 
     try Dir.cwd().writeFile(io, .{
         .sub_path = "/tmp/gitstore_test_adopted/.git",
-        .data = "gitdir: /some/path/to/git\n",
+        .data = "gitdir: /tmp/mygitstore/github.com/a/b/git\n",
     });
 
-    try testing.expect(gitstore.isAdopted(io, dir, gpa));
+    try testing.expect(gitstore.isAdopted(io, dir, "/tmp/mygitstore", gpa));
+}
+
+test "isAdopted returns false when pointer targets non-gitstore path (linked worktree)" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const dir = "/tmp/gitstore_test_linked_wt";
+    Dir.cwd().createDirPath(io, dir) catch {};
+    defer Dir.cwd().deleteTree(io, dir) catch {};
+
+    // A normal linked worktree points into the main repo's .git/worktrees/
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/gitstore_test_linked_wt/.git",
+        .data = "gitdir: /tmp/some_repo/.git/worktrees/mybranch\n",
+    });
+
+    try testing.expect(!gitstore.isAdopted(io, dir, "/tmp/mygitstore", gpa));
 }
 
 test "isAdopted returns false for .git directory" {
@@ -195,7 +227,7 @@ test "isAdopted returns false for .git directory" {
     try Dir.cwd().createDirPath(io, "/tmp/gitstore_test_not_adopted/.git");
     defer Dir.cwd().deleteTree(io, dir) catch {};
 
-    try testing.expect(!gitstore.isAdopted(io, dir, gpa));
+    try testing.expect(!gitstore.isAdopted(io, dir, "/tmp/mygitstore", gpa));
 }
 
 test "isAdopted returns false for non-gitdir file content" {
@@ -210,7 +242,21 @@ test "isAdopted returns false for non-gitdir file content" {
         .data = "not a gitdir pointer\n",
     });
 
-    try testing.expect(!gitstore.isAdopted(io, dir, gpa));
+    try testing.expect(!gitstore.isAdopted(io, dir, "/tmp/mygitstore", gpa));
+}
+
+test "repoStoragePath falls back to absolute minus slash when not under ghq" {
+    const out = gitstore.repoStoragePath("/Users/x/outside", "/Users/x/ghq").?;
+    try testing.expectEqualStrings("Users/x/outside", out);
+}
+
+test "repoStoragePath uses ghq-relative when under ghq root" {
+    const out = gitstore.repoStoragePath("/Users/x/ghq/github.com/o/r", "/Users/x/ghq").?;
+    try testing.expectEqualStrings("github.com/o/r", out);
+}
+
+test "repoStoragePath returns null for non-absolute path" {
+    try testing.expect(gitstore.repoStoragePath("relative/path", "/any") == null);
 }
 
 // =========================================================
@@ -426,14 +472,45 @@ test "e2e adopt is idempotent" {
 // E2E: adopt rejects repo not under ghq root
 // =========================================================
 
-test "e2e adopt rejects repo outside ghq root" {
+test "e2e adopt accepts repo outside ghq root (fallback absolute-path storage)" {
     const io = testing.io;
     const gpa = testing.allocator;
     var env = try TestEnv.setup(gpa, io);
     defer env.teardown();
 
-    const result = gitstore.adopt(gpa, io, "/tmp/random_path", env.ghq_root, env.gitstore_root, false);
-    try testing.expectError(error.InvalidGhqRoot, result);
+    // Create a repo OUTSIDE env.ghq_root
+    const repo = try std.fmt.allocPrint(gpa, "{s}/outside/myproject", .{env.base});
+    defer gpa.free(repo);
+    try Dir.cwd().createDirPath(io, repo);
+
+    const r0 = try ex.exec(gpa, io, &.{ "git", "init" }, repo);
+    gpa.free(r0.stdout);
+    gpa.free(r0.stderr);
+    const rc1 = try ex.exec(gpa, io, &.{ "git", "config", "user.email", "t@t.com" }, repo);
+    gpa.free(rc1.stdout);
+    gpa.free(rc1.stderr);
+    const rc2 = try ex.exec(gpa, io, &.{ "git", "config", "user.name", "T" }, repo);
+    gpa.free(rc2.stdout);
+    gpa.free(rc2.stderr);
+    const rc3 = try ex.exec(gpa, io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo);
+    gpa.free(rc3.stdout);
+    gpa.free(rc3.stderr);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+
+    // Gitstore subdir must mirror absolute path minus leading slash
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const expected = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(expected);
+    var d = try Dir.openDirAbsolute(io, expected, .{});
+    d.close(io);
+
+    const git_r = try ex.exec(gpa, io, &.{ "git", "-C", repo, "rev-parse", "--git-dir" }, null);
+    defer {
+        gpa.free(git_r.stdout);
+        gpa.free(git_r.stderr);
+    }
+    try testing.expect(git_r.succeeded());
 }
 
 // =========================================================
@@ -686,4 +763,615 @@ test "e2e status with empty gitstore" {
     // Just verify it doesn't error
     try gitstore.status(gpa, io, env.ghq_root, env.gitstore_root, false);
     try gitstore.status(gpa, io, env.ghq_root, env.gitstore_root, true);
+}
+
+// =========================================================
+// E2E: worktree-aware adopt
+// =========================================================
+
+test "e2e adopt repo with linked worktree rewrites pointer" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "wtrepo");
+    defer gpa.free(repo);
+
+    // Create a linked worktree on a new branch
+    const wt_dir = try std.fmt.allocPrint(gpa, "{s}/wt-feature", .{env.base});
+    defer gpa.free(wt_dir);
+    Dir.cwd().deleteTree(io, wt_dir) catch {};
+    defer Dir.cwd().deleteTree(io, wt_dir) catch {};
+    const wt_add = try ex.exec(gpa, io, &.{ "git", "worktree", "add", "-b", "feature", wt_dir }, repo);
+    gpa.free(wt_add.stdout);
+    gpa.free(wt_add.stderr);
+    try testing.expect(wt_add.term == .exited and wt_add.term.exited == 0);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+
+    // Main is adopted: .git is a pointer
+    const git_pointer = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(git_pointer);
+    const main_content = try Dir.cwd().readFileAlloc(io, git_pointer, gpa, .unlimited);
+    defer gpa.free(main_content);
+    try testing.expect(std.mem.startsWith(u8, main_content, "gitdir: "));
+
+    // Linked worktree's .git now points into gitstore
+    const wt_git = try std.fmt.allocPrint(gpa, "{s}/.git", .{wt_dir});
+    defer gpa.free(wt_git);
+    const wt_content = try Dir.cwd().readFileAlloc(io, wt_git, gpa, .unlimited);
+    defer gpa.free(wt_content);
+    try testing.expect(std.mem.indexOf(u8, wt_content, env.gitstore_root) != null);
+    try testing.expect(std.mem.indexOf(u8, wt_content, "/worktrees/") != null);
+
+    // Both main and linked worktree still work
+    const g_main = try ex.exec(gpa, io, &.{ "git", "-C", repo, "rev-parse", "--git-dir" }, null);
+    defer {
+        gpa.free(g_main.stdout);
+        gpa.free(g_main.stderr);
+    }
+    try testing.expect(g_main.succeeded());
+
+    const g_wt = try ex.exec(gpa, io, &.{ "git", "-C", wt_dir, "rev-parse", "--git-dir" }, null);
+    defer {
+        gpa.free(g_wt.stdout);
+        gpa.free(g_wt.stderr);
+    }
+    try testing.expect(g_wt.succeeded());
+}
+
+// =========================================================
+// E2E: detach round-trip
+// =========================================================
+
+test "e2e detach round-trip git-only" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "detachgit");
+    defer gpa.free(repo);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+    try gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false);
+
+    // .git is a directory again
+    const gp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(gp);
+    var d = try Dir.openDirAbsolute(io, gp, .{});
+    d.close(io);
+
+    // git log still works
+    const gl = try ex.exec(gpa, io, &.{ "git", "-C", repo, "log", "--oneline" }, null);
+    defer {
+        gpa.free(gl.stdout);
+        gpa.free(gl.stderr);
+    }
+    try testing.expect(gl.succeeded());
+    try testing.expect(std.mem.indexOf(u8, gl.stdout, "init") != null);
+
+    // gitstore entry removed
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const entry = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ env.gitstore_root, rel });
+    defer gpa.free(entry);
+    const opened = Dir.openDirAbsolute(io, entry, .{});
+    try testing.expectError(error.FileNotFound, opened);
+}
+
+test "e2e detach round-trip jj+git" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createJjRepo("testorg", "detachjj");
+    defer gpa.free(repo);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+    try gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false);
+
+    // .git is a directory again
+    const gp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(gp);
+    var d = try Dir.openDirAbsolute(io, gp, .{});
+    d.close(io);
+
+    // .jj is a directory (not symlink)
+    const jp = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jp);
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const link = Dir.readLinkAbsolute(io, jp, &buf);
+    try testing.expectError(error.NotLink, link);
+
+    // git_target is relative again
+    const gt = try std.fmt.allocPrint(gpa, "{s}/.jj/repo/store/git_target", .{repo});
+    defer gpa.free(gt);
+    const gt_content = try Dir.cwd().readFileAlloc(io, gt, gpa, .unlimited);
+    defer gpa.free(gt_content);
+    try testing.expect(std.mem.indexOf(u8, gt_content, "..") != null);
+
+    // jj still works
+    const js = try ex.exec(gpa, io, &.{ "jj", "status", "-R", repo }, null);
+    defer {
+        gpa.free(js.stdout);
+        gpa.free(js.stderr);
+    }
+    try testing.expect(js.succeeded());
+}
+
+test "e2e detach rejects non-adopted repo" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "notadopted");
+    defer gpa.free(repo);
+
+    const result = gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false);
+    try testing.expectError(error.NotAdopted, result);
+}
+
+test "e2e detach --keep-backup preserves archive" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "keepbackup");
+    defer gpa.free(repo);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+    try gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, true);
+
+    // Original entry removed
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const entry = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ env.gitstore_root, rel });
+    defer gpa.free(entry);
+    const opened = Dir.openDirAbsolute(io, entry, .{});
+    try testing.expectError(error.FileNotFound, opened);
+
+    // Some archive with .detached- prefix exists under the parent
+    var parent_end = rel.len;
+    while (parent_end > 0 and rel[parent_end - 1] != '/') parent_end -= 1;
+    const parent_slice = rel[0..if (parent_end > 0) parent_end - 1 else 0];
+    const parent = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ env.gitstore_root, parent_slice });
+    defer gpa.free(parent);
+
+    const ls_r = try ex.exec(gpa, io, &.{ "ls", "-a", parent }, null);
+    defer {
+        gpa.free(ls_r.stdout);
+        gpa.free(ls_r.stderr);
+    }
+    try testing.expect(ls_r.succeeded());
+    try testing.expect(std.mem.indexOf(u8, ls_r.stdout, ".detached-") != null);
+}
+
+test "e2e detach round-trip preserves linked worktree" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "detachwt");
+    defer gpa.free(repo);
+
+    const wt_dir = try std.fmt.allocPrint(gpa, "{s}/wt-detach", .{env.base});
+    defer gpa.free(wt_dir);
+    Dir.cwd().deleteTree(io, wt_dir) catch {};
+    defer Dir.cwd().deleteTree(io, wt_dir) catch {};
+    const wt_add = try ex.exec(gpa, io, &.{ "git", "worktree", "add", "-b", "feature", wt_dir }, repo);
+    gpa.free(wt_add.stdout);
+    gpa.free(wt_add.stderr);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+    try gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false);
+
+    // Linked worktree pointer now points back into repo's .git/worktrees
+    const wt_git = try std.fmt.allocPrint(gpa, "{s}/.git", .{wt_dir});
+    defer gpa.free(wt_git);
+    const wt_content = try Dir.cwd().readFileAlloc(io, wt_git, gpa, .unlimited);
+    defer gpa.free(wt_content);
+    const expected_prefix = try std.fmt.allocPrint(gpa, "gitdir: {s}/.git/worktrees/", .{repo});
+    defer gpa.free(expected_prefix);
+    try testing.expect(std.mem.startsWith(u8, wt_content, expected_prefix));
+
+    // Both main and linked work
+    const g_main = try ex.exec(gpa, io, &.{ "git", "-C", repo, "rev-parse", "--git-dir" }, null);
+    defer {
+        gpa.free(g_main.stdout);
+        gpa.free(g_main.stderr);
+    }
+    try testing.expect(g_main.succeeded());
+    const g_wt = try ex.exec(gpa, io, &.{ "git", "-C", wt_dir, "rev-parse", "--git-dir" }, null);
+    defer {
+        gpa.free(g_wt.stdout);
+        gpa.free(g_wt.stderr);
+    }
+    try testing.expect(g_wt.succeeded());
+}
+
+// =========================================================
+// config: resolvePrecedence — pure, Io.failing-testable
+// =========================================================
+
+test "config: resolvePrecedence prefers gitstore over all" {
+    const r = config.resolvePrecedence("/g", "/h", "/e", "/d");
+    try testing.expectEqualStrings("/g", r.value);
+    try testing.expectEqual(config.Source.gitstore, r.source);
+}
+
+test "config: resolvePrecedence falls through to ghq when gitstore unset" {
+    const r = config.resolvePrecedence(null, "/h", "/e", "/d");
+    try testing.expectEqualStrings("/h", r.value);
+    try testing.expectEqual(config.Source.ghq, r.source);
+}
+
+test "config: resolvePrecedence falls through to env when gitstore and ghq unset" {
+    const r = config.resolvePrecedence(null, null, "/e", "/d");
+    try testing.expectEqualStrings("/e", r.value);
+    try testing.expectEqual(config.Source.env, r.source);
+}
+
+test "config: resolvePrecedence returns default when all unset" {
+    const r = config.resolvePrecedence(null, null, null, "/d");
+    try testing.expectEqualStrings("/d", r.value);
+    try testing.expectEqual(config.Source.default, r.source);
+}
+
+test "config: resolvePrecedence empty gitstore is treated as unset" {
+    const r = config.resolvePrecedence("", "/h", "/e", "/d");
+    try testing.expectEqualStrings("/h", r.value);
+    try testing.expectEqual(config.Source.ghq, r.source);
+}
+
+test "config: resolvePrecedence empty ghq is treated as unset" {
+    const r = config.resolvePrecedence(null, "", "/e", "/d");
+    try testing.expectEqualStrings("/e", r.value);
+    try testing.expectEqual(config.Source.env, r.source);
+}
+
+test "config: resolvePrecedence empty env is treated as unset" {
+    const r = config.resolvePrecedence(null, null, "", "/d");
+    try testing.expectEqualStrings("/d", r.value);
+    try testing.expectEqual(config.Source.default, r.source);
+}
+
+test "config: resolvePrecedence all empty returns default" {
+    const r = config.resolvePrecedence("", "", "", "/d");
+    try testing.expectEqualStrings("/d", r.value);
+    try testing.expectEqual(config.Source.default, r.source);
+}
+
+test "config: resolvePrecedence empty default is returned as-is" {
+    const r = config.resolvePrecedence(null, null, null, "");
+    try testing.expectEqualStrings("", r.value);
+    try testing.expectEqual(config.Source.default, r.source);
+}
+
+test "config: resolvePrecedence gitstore empty but ghq set prefers ghq" {
+    const r = config.resolvePrecedence("", "github.com", null, "default.host");
+    try testing.expectEqualStrings("github.com", r.value);
+    try testing.expectEqual(config.Source.ghq, r.source);
+}
+
+test "config: resolvePrecedence single-char values" {
+    const r = config.resolvePrecedence("a", "b", "c", "d");
+    try testing.expectEqualStrings("a", r.value);
+    try testing.expectEqual(config.Source.gitstore, r.source);
+}
+
+test "config: resolveRootChain prefers gitstore gitconfig over ghq env" {
+    const r = config.resolveRootChain("/g", null, null, "/envghq", "/def");
+    try testing.expectEqualStrings("/g", r.value);
+    try testing.expectEqual(config.Source.gitstore, r.source);
+}
+
+test "config: resolveRootChain env gitstore_root beats env ghq_root" {
+    const r = config.resolveRootChain(null, null, "/env_gs", "/env_ghq", "/def");
+    try testing.expectEqualStrings("/env_gs", r.value);
+    try testing.expectEqual(config.Source.env, r.source);
+}
+
+test "config: resolveRootChain falls back to default with all unset" {
+    const r = config.resolveRootChain(null, null, null, null, "/def");
+    try testing.expectEqualStrings("/def", r.value);
+    try testing.expectEqual(config.Source.default, r.source);
+}
+
+// =========================================================
+// config: fuzz resolvePrecedence is total (never panics)
+// =========================================================
+
+fn fuzzResolvePrecedence(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [256]u8 = undefined;
+
+    const have_g = smith.value(bool);
+    const have_h = smith.value(bool);
+    const have_e = smith.value(bool);
+
+    const g_len = if (have_g) smith.valueRangeAtMost(u8, 0, 64) else 0;
+    const h_len = if (have_h) smith.valueRangeAtMost(u8, 0, 64) else 0;
+    const e_len = if (have_e) smith.valueRangeAtMost(u8, 0, 64) else 0;
+    const d_len = smith.valueRangeAtMost(u8, 0, 64);
+
+    // Layout three potentially-present slices + default, end-to-end, in `buf`.
+    var offset: usize = 0;
+    smith.bytes(buf[offset .. offset + g_len]);
+    const g_slice = buf[offset .. offset + g_len];
+    offset += g_len;
+    smith.bytes(buf[offset .. offset + h_len]);
+    const h_slice = buf[offset .. offset + h_len];
+    offset += h_len;
+    smith.bytes(buf[offset .. offset + e_len]);
+    const e_slice = buf[offset .. offset + e_len];
+    offset += e_len;
+    smith.bytes(buf[offset .. offset + d_len]);
+    const d_slice = buf[offset .. offset + d_len];
+
+    const g_opt: ?[]const u8 = if (have_g) g_slice else null;
+    const h_opt: ?[]const u8 = if (have_h) h_slice else null;
+    const e_opt: ?[]const u8 = if (have_e) e_slice else null;
+
+    const r = config.resolvePrecedence(g_opt, h_opt, e_opt, d_slice);
+
+    // Totality: value must be one of the inputs; source must match provenance.
+    switch (r.source) {
+        .gitstore => try testing.expect(have_g and g_slice.len != 0),
+        .ghq => try testing.expect(have_h and h_slice.len != 0),
+        .env => try testing.expect(have_e and e_slice.len != 0),
+        .default => {
+            // All earlier sources must be either null or empty.
+            if (have_g) try testing.expect(g_slice.len == 0);
+            if (have_h) try testing.expect(h_slice.len == 0);
+            if (have_e) try testing.expect(e_slice.len == 0);
+        },
+    }
+}
+
+test "config: fuzz resolvePrecedence is total" {
+    try std.testing.fuzz({}, fuzzResolvePrecedence, .{});
+}
+
+// =========================================================
+// config: load — shells out to real `git config`. Because git honors the
+// ambient process env (HOME) — not env_map — these tests mutate the real
+// global git config and restore it via defer. Tests run serially.
+// =========================================================
+
+/// Run `git config --unset <key>` globally; ignore errors (key may be unset).
+fn gitUnset(gpa: Allocator, io: Io, key: []const u8) void {
+    const r = ex.exec(gpa, io, &.{ "git", "config", "--global", "--unset-all", key }, null) catch return;
+    gpa.free(r.stdout);
+    gpa.free(r.stderr);
+}
+
+fn gitSet(gpa: Allocator, io: Io, key: []const u8, value: []const u8) !void {
+    const r = try ex.exec(gpa, io, &.{ "git", "config", "--global", key, value }, null);
+    defer {
+        gpa.free(r.stdout);
+        gpa.free(r.stderr);
+    }
+    try testing.expect(r.succeeded());
+}
+
+test "config: load reads gitstore.root from real global git config" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // Snapshot existing values so we can restore.
+    const before_gs = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "gitstore.root" }, null);
+    defer gpa.free(before_gs.stderr);
+    const had_gs = before_gs.succeeded();
+    const saved_gs: ?[]const u8 = if (had_gs)
+        try gpa.dupe(u8, ex.trimTrailingNewline(before_gs.stdout))
+    else
+        null;
+    gpa.free(before_gs.stdout);
+    defer if (saved_gs) |s| gpa.free(s);
+
+    const before_ghq = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "ghq.root" }, null);
+    defer gpa.free(before_ghq.stderr);
+    const had_ghq = before_ghq.succeeded();
+    const saved_ghq: ?[]const u8 = if (had_ghq)
+        try gpa.dupe(u8, ex.trimTrailingNewline(before_ghq.stdout))
+    else
+        null;
+    gpa.free(before_ghq.stdout);
+    defer if (saved_ghq) |s| gpa.free(s);
+
+    // Set a unique sentinel value.
+    try gitSet(gpa, io, "gitstore.root", "/gitstore_unit_test_sentinel_root");
+    gitUnset(gpa, io, "ghq.root");
+
+    defer {
+        gitUnset(gpa, io, "gitstore.root");
+        gitUnset(gpa, io, "ghq.root");
+        if (saved_gs) |s| gitSet(gpa, io, "gitstore.root", s) catch {};
+        if (saved_ghq) |s| gitSet(gpa, io, "ghq.root", s) catch {};
+    }
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    // Intentionally do NOT set HOME so default path formula is distinct.
+    try env_map.put("HOME", "/nonexistent_test_home");
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings("/gitstore_unit_test_sentinel_root", cfg.root);
+    try testing.expect(!cfg.used_legacy_ghq_keys);
+}
+
+test "config: load falls back to ghq.root and flags legacy" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const before_gs = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "gitstore.root" }, null);
+    defer gpa.free(before_gs.stderr);
+    const had_gs = before_gs.succeeded();
+    const saved_gs: ?[]const u8 = if (had_gs)
+        try gpa.dupe(u8, ex.trimTrailingNewline(before_gs.stdout))
+    else
+        null;
+    gpa.free(before_gs.stdout);
+    defer if (saved_gs) |s| gpa.free(s);
+
+    const before_ghq = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "ghq.root" }, null);
+    defer gpa.free(before_ghq.stderr);
+    const had_ghq = before_ghq.succeeded();
+    const saved_ghq: ?[]const u8 = if (had_ghq)
+        try gpa.dupe(u8, ex.trimTrailingNewline(before_ghq.stdout))
+    else
+        null;
+    gpa.free(before_ghq.stdout);
+    defer if (saved_ghq) |s| gpa.free(s);
+
+    gitUnset(gpa, io, "gitstore.root");
+    try gitSet(gpa, io, "ghq.root", "/ghq_legacy_test_sentinel_root");
+
+    defer {
+        gitUnset(gpa, io, "ghq.root");
+        gitUnset(gpa, io, "gitstore.root");
+        if (saved_gs) |s| gitSet(gpa, io, "gitstore.root", s) catch {};
+        if (saved_ghq) |s| gitSet(gpa, io, "ghq.root", s) catch {};
+    }
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/nonexistent_test_home");
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings("/ghq_legacy_test_sentinel_root", cfg.root);
+    try testing.expect(cfg.used_legacy_ghq_keys);
+}
+
+test "config: load uses env GITSTORE_ROOT when no git config set" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const before_gs = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "gitstore.root" }, null);
+    defer gpa.free(before_gs.stderr);
+    const had_gs = before_gs.succeeded();
+    const saved_gs: ?[]const u8 = if (had_gs)
+        try gpa.dupe(u8, ex.trimTrailingNewline(before_gs.stdout))
+    else
+        null;
+    gpa.free(before_gs.stdout);
+    defer if (saved_gs) |s| gpa.free(s);
+
+    const before_ghq = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "ghq.root" }, null);
+    defer gpa.free(before_ghq.stderr);
+    const had_ghq = before_ghq.succeeded();
+    const saved_ghq: ?[]const u8 = if (had_ghq)
+        try gpa.dupe(u8, ex.trimTrailingNewline(before_ghq.stdout))
+    else
+        null;
+    gpa.free(before_ghq.stdout);
+    defer if (saved_ghq) |s| gpa.free(s);
+
+    gitUnset(gpa, io, "gitstore.root");
+    gitUnset(gpa, io, "ghq.root");
+
+    defer {
+        if (saved_gs) |s| gitSet(gpa, io, "gitstore.root", s) catch {};
+        if (saved_ghq) |s| gitSet(gpa, io, "ghq.root", s) catch {};
+    }
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/nonexistent_test_home");
+    try env_map.put("GITSTORE_ROOT", "/from/env/gitstore");
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings("/from/env/gitstore", cfg.root);
+    try testing.expect(!cfg.used_legacy_ghq_keys);
+}
+
+// =========================================================
+// config: resolveRootForUrl honors a git urlmatch pattern
+// =========================================================
+
+test "config: resolveRootForUrl falls back to base.root when no pattern matches" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // Snapshot+scrub any pre-existing url-pattern key for a sentinel URL
+    // we know the user won't have real config for.
+    const sentinel_url = "https://gitstore-test.invalid/unused/sentinel";
+
+    var owned: std.ArrayList([]const u8) = .empty;
+    defer owned.deinit(gpa);
+    const base: config.Config = .{
+        .root = "/fallback/root",
+        .user = null,
+        .default_host = "github.com",
+        .complete_user = true,
+        .adopt_on_clone = true,
+        .jj_colocate = true,
+        .used_legacy_ghq_keys = false,
+        .owned_strings = owned,
+    };
+
+    const unmatched = try config.resolveRootForUrl(gpa, io, sentinel_url, base);
+    defer gpa.free(unmatched);
+    try testing.expectEqualStrings("/fallback/root", unmatched);
+}
+
+test "config: resolveRootForUrl prefers matching gitstore.<url>.root urlmatch" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const test_url = "https://gitstore-urlmatch-test.invalid/acme/widget";
+    const pattern_key = "gitstore.https://gitstore-urlmatch-test.invalid/acme/.root";
+
+    // Snapshot and restore around the test.
+    const before = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", pattern_key }, null);
+    defer gpa.free(before.stderr);
+    const had = before.succeeded();
+    const saved: ?[]const u8 = if (had)
+        try gpa.dupe(u8, ex.trimTrailingNewline(before.stdout))
+    else
+        null;
+    gpa.free(before.stdout);
+    defer if (saved) |s| gpa.free(s);
+
+    try gitSet(gpa, io, pattern_key, "/per-org/acme");
+    defer {
+        gitUnset(gpa, io, pattern_key);
+        if (saved) |s| gitSet(gpa, io, pattern_key, s) catch {};
+    }
+
+    var owned: std.ArrayList([]const u8) = .empty;
+    defer owned.deinit(gpa);
+    const base: config.Config = .{
+        .root = "/fallback/root",
+        .user = null,
+        .default_host = "github.com",
+        .complete_user = true,
+        .adopt_on_clone = true,
+        .jj_colocate = true,
+        .used_legacy_ghq_keys = false,
+        .owned_strings = owned,
+    };
+
+    const matched = try config.resolveRootForUrl(gpa, io, test_url, base);
+    defer gpa.free(matched);
+    try testing.expectEqualStrings("/per-org/acme", matched);
+}
+
+// =========================================================
+// list-walker / cache modules — pull in their module-local
+// tests so `zig build test-integration` also covers them.
+// =========================================================
+
+comptime {
+    _ = @import("list.zig");
+    _ = @import("cache.zig");
 }
