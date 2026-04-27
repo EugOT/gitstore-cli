@@ -194,15 +194,18 @@ const sub_help_list =
     \\
     \\OPTIONS:
     \\   -p, --full-path              Print full filesystem paths
-    \\   -e, --exact                  Match <pattern> exactly (host/owner/repo)
+    \\   -e, --exact                  Match <pattern> exactly against either the
+    \\                                full rel_path (host/owner/repo) OR the repo
+    \\                                leaf-name (the last path component)
     \\   --json                       Emit JSON array (each entry has rel_path,
     \\                                abs_path, host, owner, name, is_adopted,
     \\                                has_jj, worktrees, head_sha, last_fetched_unix)
     \\   --with-head                  Resolve HEAD sha (slow; shells out per repo)
     \\   --help, -h                   Show this help
     \\
-    \\If <pattern> is given, only repos whose rel_path contains it are listed
-    \\(or equals it, with --exact).
+    \\If <pattern> is given without --exact, only repos whose rel_path contains
+    \\<pattern> as a substring are listed. With --exact, the match must equal
+    \\either rel_path or the repo leaf-name exactly.
     \\
 ;
 
@@ -461,9 +464,21 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         if (all) {
+            // detachAll swallows per-repo GitDirMalformed and reports it as
+            // a `failed` count in the summary, so we don't need a special
+            // catch here — only path errors and IO failures propagate.
             try gitstore.detachAll(gpa, io, ghq_root, gitstore_root, dry_run, keep_backup);
         } else if (path) |p| {
-            try gitstore.detach(gpa, io, p, ghq_root, gitstore_root, dry_run, keep_backup);
+            gitstore.detach(gpa, io, p, ghq_root, gitstore_root, dry_run, keep_backup) catch |err| switch (err) {
+                error.GitDirMalformed => {
+                    var buf: [512]u8 = undefined;
+                    var w = File.stderr().writerStreaming(io, &buf);
+                    try w.interface.print("error: {s}/.git has a malformed gitdir pointer; refusing to detach\n", .{p});
+                    try w.flush();
+                    return 1;
+                },
+                else => return err,
+            };
         } else {
             try printErr(io, "error: detach requires <path> or --all\n");
             return 2;
@@ -525,6 +540,12 @@ pub fn main(init: std.process.Init) !u8 {
                 try printOut(io, sub_help_filter);
                 return 0;
             }
+            // Surface typos rather than silently ignoring.
+            var buf: [512]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: unexpected argument: {s}\n", .{arg});
+            try w.flush();
+            return 1;
         }
         try printOut(io, hooks.rclone_filter);
         return 0;
@@ -895,7 +916,16 @@ fn cmdRm(
     }
 
     if (target.is_adopted) {
-        try gitstore.detach(gpa, io, target.abs_path, ghq_root, gitstore_root, false, false);
+        gitstore.detach(gpa, io, target.abs_path, ghq_root, gitstore_root, false, false) catch |err| switch (err) {
+            error.GitDirMalformed => {
+                var ebuf: [512]u8 = undefined;
+                var ew = File.stderr().writerStreaming(io, &ebuf);
+                try ew.interface.print("error: {s}/.git has a malformed gitdir pointer; refusing to remove\n", .{target.abs_path});
+                try ew.flush();
+                return 1;
+            },
+            else => return err,
+        };
     } else {
         try Dir.cwd().deleteTree(io, target.abs_path);
     }

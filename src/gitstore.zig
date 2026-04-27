@@ -702,6 +702,42 @@ pub fn status(
     }
 }
 
+/// Create a uniquely-named filter file under /tmp using O_CREAT|O_EXCL
+/// (`exclusive = true`) and write the supplied contents to it. Returns the
+/// caller-owned absolute path. Retries on EPATHALREADYEXISTS / collisions
+/// with a fresh random suffix; bails after a small bound to avoid a poisoned
+/// tmp directory becoming an infinite loop.
+fn createExclusiveFilterTmp(gpa: Allocator, io: Io, contents: []const u8) ![]u8 {
+    var attempt: u32 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        const ns = Io.Clock.real.now(io).nanoseconds;
+        const path = try std.fmt.allocPrint(
+            gpa,
+            "/tmp/gitstore-rclone-filter.dryrun.{d}.{d}.txt",
+            .{ ns, attempt },
+        );
+
+        var file = Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                gpa.free(path);
+                continue;
+            },
+            else => |e| {
+                gpa.free(path);
+                return e;
+            },
+        };
+        defer file.close(io);
+
+        var buf: [4096]u8 = undefined;
+        var w = file.writerStreaming(io, &buf);
+        try w.interface.writeAll(contents);
+        try w.flush();
+        return path;
+    }
+    return error.TempFileCollision;
+}
+
 /// Write the rclone filter file to gitstore root and run rclone sync.
 pub fn sync(
     gpa: Allocator,
@@ -716,19 +752,18 @@ pub fn sync(
     // Ensure gitstore root exists
     try init(io, gitstore_root);
 
-    // Write filter file (for non-dry-run; for dry-run use a unique temp file
-    // to not pollute gitstore and to avoid TOCTOU races between concurrent
-    // dry-runs on shared hosts). CodeRabbit: matches the unique-tmp pattern
-    // already used in src/tests.zig (Io.Clock.real.now(io).nanoseconds).
-    const filter_path = if (dry_run) blk: {
-        const ns = Io.Clock.real.now(io).nanoseconds;
-        break :blk try std.fmt.allocPrint(gpa, "/tmp/gitstore-rclone-filter.dryrun.{d}.txt", .{ns});
-    } else try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
+    // Write filter file. For dry-run, use an exclusively-created temp file
+    // (O_CREAT|O_EXCL) under /tmp so concurrent dry-runs on a shared host
+    // can't race or collide. For real syncs, write the canonical
+    // <gitstore_root>/rclone-filter.txt path.
+    const filter_path = if (dry_run)
+        try createExclusiveFilterTmp(gpa, io, hooks.rclone_filter)
+    else blk: {
+        const p = try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
+        try Dir.cwd().writeFile(io, .{ .sub_path = p, .data = hooks.rclone_filter });
+        break :blk p;
+    };
     defer gpa.free(filter_path);
-    try Dir.cwd().writeFile(io, .{
-        .sub_path = filter_path,
-        .data = hooks.rclone_filter,
-    });
     info(io, "filter: {s}\n", .{filter_path});
     defer if (dry_run) {
         Dir.cwd().deleteFile(io, filter_path) catch {};
@@ -803,17 +838,34 @@ pub fn detach(
     const prefix = "gitdir: ";
     const git_src = trimmed[prefix.len..]; // e.g. /gitstore/.../git
 
-    // Derive jj_src and repo_store_dir by taking parent of git_src, then appending /jj
-    var parent_end = git_src.len;
-    while (parent_end > 0 and git_src[parent_end - 1] != '/') parent_end -= 1;
-    // CodeRabbit: when the gitdir pointer has no '/', parent_end stays at git_src.len
-    // and the original ternary slice [0 .. -1] would underflow / produce empty.
-    // A pointer with no path separator is malformed for a gitstore-managed repo.
-    if (parent_end == 0) {
-        warn(io, "error: gitdir pointer in {s}/.git has no path separator: {s}\n", .{ repo_path, git_src });
+    // Validate that git_src has the canonical gitstore shape:
+    //   "<gitstore_root>/<repo>/git"
+    // We require:
+    //   1. trailing "/git" segment (so we know we're looking at a git_src
+    //      pointer, not e.g. the gitstore root itself);
+    //   2. a slash before "<repo>" with non-empty root and non-empty repo
+    //      segments (so neither slice underflows).
+    // Anything else is malformed and could cause repo_store_dir to point
+    // somewhere unexpected (worst case: the gitstore root, which a later
+    // archive-rename would mangle).
+    const git_suffix = "/git";
+    if (git_src.len < git_suffix.len + 2 or !std.mem.endsWith(u8, git_src, git_suffix)) {
+        warn(io, "error: gitdir pointer in {s}/.git is not a gitstore git_src (missing /git suffix): {s}\n", .{ repo_path, git_src });
         return error.GitDirMalformed;
     }
-    const repo_store_dir = git_src[0 .. parent_end - 1];
+    // Slash immediately before the "git" segment.
+    const repo_end = git_src.len - git_suffix.len;
+    // Find the slash before "<repo>". After endsWith("/git") we know
+    // git_src[repo_end] == '/'. Scan backwards to the next '/'.
+    var root_end = repo_end;
+    while (root_end > 0 and git_src[root_end - 1] != '/') root_end -= 1;
+    // Need: non-empty root (root_end > 1, since root_end-1 is the slash and
+    // we want at least one byte before it) and non-empty repo segment.
+    if (root_end <= 1 or repo_end <= root_end) {
+        warn(io, "error: gitdir pointer in {s}/.git is malformed: {s}\n", .{ repo_path, git_src });
+        return error.GitDirMalformed;
+    }
+    const repo_store_dir = git_src[0..repo_end];
     const jj_src = try std.fmt.allocPrint(gpa, "{s}/jj", .{repo_store_dir});
     defer gpa.free(jj_src);
 
