@@ -14,10 +14,12 @@ const list_mod = @import("list.zig");
 const usage_text =
     \\Usage: gitstore <command> [options]
     \\
+    \\Run `gitstore <command> --help` (or `-h`) for per-command help.
+    \\
     \\Commands:
     \\  get [-u] [-P N] [--no-adopt] [--shallow] [-b BRANCH] <url>...
     \\                    Clone one or more repos via libgitstore
-    \\  list [--full-path] [--json] [--with-head] [<pattern>]
+    \\  list [-p] [-e] [--json] [--with-head] [<pattern>]
     \\                    List adopted/unadopted repos under ghq root
     \\  root [--all]      Print configured ghq/gitstore root
     \\  rm [--dry-run] <repo>
@@ -26,26 +28,241 @@ const usage_text =
     \\                    Create a new git+jj repo and adopt in one shot
     \\  migrate <new-root> [--dry-run]
     \\                    Plan/move adopted repos under a new ghq root
-    \\  init              Create gitstore directory structure
-    \\  init <path>       Init git+jj repo and adopt into gitstore in one shot
-    \\  adopt <path>      Migrate an existing repo into gitstore
-    \\  adopt --all       Migrate all repos under ghq root
-    \\  detach <path>     Restore an adopted repo (reverse of adopt)
-    \\  detach --all      Restore all adopted repos
-    \\  verify <path>     Check pointer/symlink integrity
-    \\  verify --all      Check all adopted repos
-    \\  status            Show gitstore disk usage and repo count
-    \\  sync <remote>     Sync ghq working trees to rclone remote
+    \\  init [<path>]     Create gitstore dir or init+adopt one-shot
+    \\  adopt <path>|--all
+    \\                    Migrate existing repo(s) into gitstore
+    \\  detach <path>|--all [--keep-backup]
+    \\                    Restore an adopted repo (reverse of adopt)
+    \\  verify <path>|--all
+    \\                    Check pointer/symlink integrity
+    \\  status [--json]   Show gitstore disk usage and repo count
+    \\  sync <remote> [--dry-run]
+    \\                    Sync ghq working trees to rclone remote
     \\  filter            Print rclone filter rules to stdout
-    \\  hook --zsh        Print the zsh hook function
-    \\  hook --bash       Print the bash hook function
-    \\  hook --nu         Print the nushell hook module
+    \\  hook --zsh|--bash|--nu
+    \\                    Print the shell wrapper for `ghq`->`gitstore`
     \\
-    \\Options:
-    \\  --dry-run         Print planned actions without modifying anything
-    \\  --keep-backup     Preserve gitstore entry when detaching (renames it)
-    \\  --json            Output status in JSON format
-    \\  --help            Show this help message
+    \\Global options:
+    \\  --help, -h        Show this help message
+    \\
+    \\See also: docs/MIGRATION-ghq-to-gitstore.md, https://github.com/EugOT/gitstore-cli
+    \\
+;
+
+const sub_help_init =
+    \\NAME:
+    \\   gitstore init — Create gitstore dir or init+adopt a repo in one shot
+    \\
+    \\USAGE:
+    \\   gitstore init                Ensure ~/.local/share/gitstore exists
+    \\   gitstore init <path>         git init + jj colocate + adopt at <path>
+    \\
+    \\OPTIONS:
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_hook =
+    \\NAME:
+    \\   gitstore hook — Print the shell wrapper that delegates ghq → gitstore
+    \\
+    \\USAGE:
+    \\   gitstore hook --zsh          Print zsh wrapper (source from .zshrc)
+    \\   gitstore hook --bash         Print bash wrapper (source from .bashrc)
+    \\   gitstore hook --nu           Print nushell module (source from config.nu)
+    \\
+    \\OPTIONS:
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_adopt =
+    \\NAME:
+    \\   gitstore adopt — Migrate an existing repo into gitstore (detach .git)
+    \\
+    \\USAGE:
+    \\   gitstore adopt <path>        Adopt a single repo
+    \\   gitstore adopt --all         Adopt every git repo under ghq root
+    \\
+    \\OPTIONS:
+    \\   --dry-run                    Print plan without touching disk
+    \\   --all                        Recurse over the entire ghq root
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_verify =
+    \\NAME:
+    \\   gitstore verify — Check pointer/symlink integrity of adopted repos
+    \\
+    \\USAGE:
+    \\   gitstore verify <path>       Verify a single adopted repo
+    \\   gitstore verify --all        Verify every adopted repo under ghq root
+    \\
+    \\OPTIONS:
+    \\   --all                        Recurse over the entire ghq root
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_detach =
+    \\NAME:
+    \\   gitstore detach — Reverse adopt: restore .git in the working tree
+    \\
+    \\USAGE:
+    \\   gitstore detach <path>       Detach a single adopted repo
+    \\   gitstore detach --all        Detach every adopted repo
+    \\
+    \\OPTIONS:
+    \\   --dry-run                    Print plan without touching disk
+    \\   --all                        Recurse over the entire ghq root
+    \\   --keep-backup                Rename the gitstore entry instead of deleting
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_status =
+    \\NAME:
+    \\   gitstore status — Show gitstore disk usage and repo counts
+    \\
+    \\USAGE:
+    \\   gitstore status              Plain text summary
+    \\   gitstore status --json       Machine-readable JSON
+    \\
+    \\OPTIONS:
+    \\   --json                       Emit JSON instead of text
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_sync =
+    \\NAME:
+    \\   gitstore sync — Push ghq working trees to an rclone remote
+    \\
+    \\USAGE:
+    \\   gitstore sync <remote>       e.g. gdrive:ghq
+    \\
+    \\OPTIONS:
+    \\   --dry-run                    Print rclone command without running it
+    \\   --help, -h                   Show this help
+    \\
+    \\NOTES:
+    \\   Excludes .git/.jj internals + build artifacts; see `gitstore filter`.
+    \\
+;
+
+const sub_help_filter =
+    \\NAME:
+    \\   gitstore filter — Print rclone filter rules suitable for `--filter-from`
+    \\
+    \\USAGE:
+    \\   gitstore filter > rclone-filter.txt
+    \\
+    \\OPTIONS:
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_get =
+    \\NAME:
+    \\   gitstore get — Clone repo(s); auto-adopt into gitstore unless --no-adopt
+    \\
+    \\USAGE:
+    \\   gitstore get [options] <url>...
+    \\
+    \\OPTIONS:
+    \\   -u, --update                 Pull latest if the repo already exists
+    \\   -P, --parallel N             Bounded parallelism (default 1)
+    \\   --no-adopt                   Skip auto-adopt after clone
+    \\   --shallow                    Pass --depth 1 to git clone
+    \\   -b, --branch BRANCH          Pass --branch=BRANCH (implies --single-branch)
+    \\   --help, -h                   Show this help
+    \\
+    \\URL FORMS:
+    \\   github.com/owner/repo, owner/repo, repo (uses gitstore.user default),
+    \\   https://host/owner/repo[.git], git@host:owner/repo, ssh://...,
+    \\   file:///abs/path
+    \\
+;
+
+const sub_help_list =
+    \\NAME:
+    \\   gitstore list — List repositories under the configured ghq root
+    \\
+    \\USAGE:
+    \\   gitstore list [options] [<pattern>]
+    \\
+    \\OPTIONS:
+    \\   -p, --full-path              Print full filesystem paths
+    \\   -e, --exact                  Match <pattern> exactly (host/owner/repo)
+    \\   --json                       Emit JSON array (each entry has rel_path,
+    \\                                abs_path, host, owner, name, is_adopted,
+    \\                                has_jj, worktrees, head_sha, last_fetched_unix)
+    \\   --with-head                  Resolve HEAD sha (slow; shells out per repo)
+    \\   --help, -h                   Show this help
+    \\
+    \\If <pattern> is given, only repos whose rel_path contains it are listed
+    \\(or equals it, with --exact).
+    \\
+;
+
+const sub_help_root =
+    \\NAME:
+    \\   gitstore root — Print the configured ghq/gitstore working-tree root
+    \\
+    \\USAGE:
+    \\   gitstore root                Print the primary root
+    \\   gitstore root --all          Print all configured roots (v1: same as primary)
+    \\
+    \\OPTIONS:
+    \\   --all                        Print every root (v1 subset: prints primary)
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_rm =
+    \\NAME:
+    \\   gitstore rm — Remove a repository (detaches adopted pointer first)
+    \\
+    \\USAGE:
+    \\   gitstore rm [--dry-run] <repo>
+    \\
+    \\OPTIONS:
+    \\   --dry-run                    Print plan without touching disk
+    \\   --help, -h                   Show this help
+    \\
+    \\<repo> is matched as exact rel_path or unique substring against
+    \\`gitstore list` output. If multiple repos match, the command refuses
+    \\to act and asks you to be more specific.
+    \\
+;
+
+const sub_help_create =
+    \\NAME:
+    \\   gitstore create — Create a new git+jj repo and adopt in one shot
+    \\
+    \\USAGE:
+    \\   gitstore create <host/owner/name>
+    \\
+    \\OPTIONS:
+    \\   --vcs git|jj                 (Accepted; v1 always git+jj colocate)
+    \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_migrate =
+    \\NAME:
+    \\   gitstore migrate — Move adopted repos under a new ghq root
+    \\
+    \\USAGE:
+    \\   gitstore migrate <new-root> --dry-run
+    \\
+    \\OPTIONS:
+    \\   --dry-run                    Print move plan without touching disk
+    \\   --help, -h                   Show this help
+    \\
+    \\NOTE: Only --dry-run is implemented in v1; real-mode returns
+    \\      error.MigrationNotImplemented pending the WAL replay design.
     \\
 ;
 
@@ -108,6 +325,10 @@ pub fn main(init: std.process.Init) !u8 {
         // init with a path: create git+jj repo and adopt in one shot
         const path_arg = args_iter.next();
         if (path_arg) |p| {
+            if (std.mem.eql(u8, p, "--help") or std.mem.eql(u8, p, "-h")) {
+                try printOut(io, sub_help_init);
+                return 0;
+            }
             const ghq_root = try getGhqRoot(gpa, io);
             defer gpa.free(ghq_root);
             try gitstore.initRepo(gpa, io, p, ghq_root, gitstore_root);
@@ -127,6 +348,10 @@ pub fn main(init: std.process.Init) !u8 {
             try printErr(io, "error: hook requires --zsh, --bash, or --nu\n");
             return 2;
         };
+        if (std.mem.eql(u8, flag, "--help") or std.mem.eql(u8, flag, "-h")) {
+            try printOut(io, sub_help_hook);
+            return 0;
+        }
         if (std.mem.eql(u8, flag, "--zsh")) {
             try printOut(io, hooks.zsh_hook);
         } else if (std.mem.eql(u8, flag, "--bash")) {
@@ -153,7 +378,10 @@ pub fn main(init: std.process.Init) !u8 {
         var path: ?[]const u8 = null;
 
         while (args_iter.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--dry-run")) {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                try printOut(io, sub_help_adopt);
+                return 0;
+            } else if (std.mem.eql(u8, arg, "--dry-run")) {
                 dry_run = true;
             } else if (std.mem.eql(u8, arg, "--all")) {
                 all = true;
@@ -183,7 +411,10 @@ pub fn main(init: std.process.Init) !u8 {
         var path: ?[]const u8 = null;
 
         while (args_iter.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--all")) {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                try printOut(io, sub_help_verify);
+                return 0;
+            } else if (std.mem.eql(u8, arg, "--all")) {
                 all = true;
             } else if (arg[0] != '-') {
                 path = arg;
@@ -215,7 +446,10 @@ pub fn main(init: std.process.Init) !u8 {
         var keep_backup = false;
         var path: ?[]const u8 = null;
         while (args_iter.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--dry-run")) {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                try printOut(io, sub_help_detach);
+                return 0;
+            } else if (std.mem.eql(u8, arg, "--dry-run")) {
                 dry_run = true;
             } else if (std.mem.eql(u8, arg, "--all")) {
                 all = true;
@@ -245,7 +479,10 @@ pub fn main(init: std.process.Init) !u8 {
 
         var json_mode = false;
         while (args_iter.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--json")) {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                try printOut(io, sub_help_status);
+                return 0;
+            } else if (std.mem.eql(u8, arg, "--json")) {
                 json_mode = true;
             }
         }
@@ -263,7 +500,10 @@ pub fn main(init: std.process.Init) !u8 {
         var dry_run = false;
         var remote: ?[]const u8 = null;
         while (args_iter.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--dry-run")) {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                try printOut(io, sub_help_sync);
+                return 0;
+            } else if (std.mem.eql(u8, arg, "--dry-run")) {
                 dry_run = true;
             } else if (arg[0] != '-') {
                 remote = arg;
@@ -280,6 +520,12 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "filter")) {
+        if (args_iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                try printOut(io, sub_help_filter);
+                return 0;
+            }
+        }
         try printOut(io, hooks.rclone_filter);
         return 0;
     }
@@ -332,7 +578,10 @@ fn cmdGet(
     defer urls.deinit(gpa);
 
     while (args_iter.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--update")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printOut(io, sub_help_get);
+            return 0;
+        } else if (std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--update")) {
             opts.update_if_exists = true;
         } else if (std.mem.eql(u8, arg, "--no-adopt")) {
             opts.no_adopt = true;
@@ -340,7 +589,7 @@ fn cmdGet(
             opts.shallow = true;
         } else if (std.mem.eql(u8, arg, "--no-recursive")) {
             opts.recursive = false;
-        } else if (std.mem.eql(u8, arg, "-P")) {
+        } else if (std.mem.eql(u8, arg, "-P") or std.mem.eql(u8, arg, "--parallel")) {
             const n = args_iter.next() orelse {
                 try printErr(io, "error: -P requires N\n");
                 return 2;
@@ -460,21 +709,21 @@ fn cmdList(
     var full_path = false;
     var json_mode = false;
     var with_head = false;
+    var exact = false;
     var pattern: ?[]const u8 = null;
 
     while (args_iter.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--full-path") or std.mem.eql(u8, arg, "-p")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printOut(io, sub_help_list);
+            return 0;
+        } else if (std.mem.eql(u8, arg, "--full-path") or std.mem.eql(u8, arg, "-p")) {
             full_path = true;
+        } else if (std.mem.eql(u8, arg, "--exact") or std.mem.eql(u8, arg, "-e")) {
+            exact = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             json_mode = true;
         } else if (std.mem.eql(u8, arg, "--with-head")) {
             with_head = true;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try printOut(
-                io,
-                "Usage: gitstore list [--full-path] [--json] [--with-head] [<pattern>]",
-            );
-            return 0;
         } else if (arg.len == 0 or arg[0] == '-') {
             try printErr(io, "error: unknown flag for list\n");
             return 2;
@@ -488,12 +737,25 @@ fn cmdList(
     const ghq_root = try resolveGhqRootOrHome(gpa, io, environ_map);
     defer gpa.free(ghq_root);
 
-    const entries = try list_mod.walk(gpa, io, ghq_root, gitstore_root, .{
+    const all_entries = try list_mod.walk(gpa, io, ghq_root, gitstore_root, .{
         .pattern = pattern,
         .include_worktrees = true,
         .include_head = with_head,
     });
-    defer list_mod.freeEntries(gpa, entries);
+    defer list_mod.freeEntries(gpa, all_entries);
+
+    // Apply --exact filter (in-place selection).
+    var filtered: std.ArrayList(list_mod.RepoEntry) = .empty;
+    defer filtered.deinit(gpa);
+    const entries = if (exact and pattern != null) blk: {
+        const p = pattern.?;
+        for (all_entries) |e| {
+            if (std.mem.eql(u8, e.rel_path, p) or std.mem.eql(u8, e.name, p)) {
+                try filtered.append(gpa, e);
+            }
+        }
+        break :blk filtered.items;
+    } else all_entries;
 
     const text = if (json_mode)
         try list_mod.renderJson(gpa, entries)
@@ -526,7 +788,7 @@ fn cmdRoot(
             // Multi-root enumeration is a v1 subset — no-op for now.
             continue;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try printOut(io, "Usage: gitstore root [--all]");
+            try printOut(io, sub_help_root);
             return 0;
         } else {
             try printErr(io, "error: unknown flag for root\n");
@@ -559,7 +821,7 @@ fn cmdRm(
         if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try printOut(io, "Usage: gitstore rm [--dry-run] <repo>");
+            try printOut(io, sub_help_rm);
             return 0;
         } else if (arg.len != 0 and arg[0] != '-') {
             repo_arg = arg;
@@ -663,7 +925,7 @@ fn cmdCreate(
             // The flag is accepted for forward-compatibility; initRepo
             // performs the canonical git+jj path unconditionally.
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try printOut(io, "Usage: gitstore create [--vcs git|jj] <host/owner/name>");
+            try printOut(io, sub_help_create);
             return 0;
         } else if (arg.len != 0 and arg[0] != '-') {
             repo_arg = arg;
@@ -725,7 +987,7 @@ fn cmdMigrate(
         if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try printOut(io, "Usage: gitstore migrate <new-root> [--dry-run]");
+            try printOut(io, sub_help_migrate);
             return 0;
         } else if (arg.len != 0 and arg[0] != '-') {
             new_root = arg;
