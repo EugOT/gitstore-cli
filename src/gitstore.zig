@@ -872,6 +872,30 @@ pub fn detach(
         warn(io, "error: gitdir pointer in {s}/.git is malformed: {s}\n", .{ repo_path, git_src });
         return error.GitDirMalformed;
     }
+    // Defense-in-depth (CR critical post-efc8ce6): re-validate that git_src is
+    // rooted under the configured gitstore_root and that no path component is
+    // "..", ".", or empty. Without this check, a hand-crafted gitdir pointer
+    // could resolve repo_store_dir outside the store and have detach's
+    // archive/remove ops mangle unrelated directories.
+    var root_norm = gitstore_root;
+    while (root_norm.len > 1 and root_norm[root_norm.len - 1] == '/') root_norm = root_norm[0 .. root_norm.len - 1];
+    if (!std.mem.startsWith(u8, git_src, root_norm) or
+        git_src.len <= root_norm.len or
+        git_src[root_norm.len] != '/')
+    {
+        warn(io, "error: gitdir pointer in {s}/.git escapes gitstore root: {s}\n", .{ repo_path, git_src });
+        return error.GitDirMalformed;
+    }
+    {
+        const rel = git_src[root_norm.len + 1 .. repo_end];
+        var comps = std.mem.splitScalar(u8, rel, '/');
+        while (comps.next()) |seg| {
+            if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) {
+                warn(io, "error: gitdir pointer in {s}/.git has invalid path components: {s}\n", .{ repo_path, git_src });
+                return error.GitDirMalformed;
+            }
+        }
+    }
     const repo_store_dir = git_src[0..repo_end];
     const jj_src = try std.fmt.allocPrint(gpa, "{s}/jj", .{repo_store_dir});
     defer gpa.free(jj_src);

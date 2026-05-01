@@ -327,23 +327,34 @@ pub fn main(init: std.process.Init) !u8 {
         const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
         defer gpa.free(gitstore_root);
 
-        // init with a path: create git+jj repo and adopt in one shot
-        const path_arg = args_iter.next();
-        if (path_arg) |p| {
-            if (std.mem.eql(u8, p, "--help") or std.mem.eql(u8, p, "-h")) {
+        // init with a path: create git+jj repo and adopt in one shot.
+        // Scan ALL args (not just the first) so `init /path --help` and
+        // `init --help /path` both surface help, and so unknown flags are
+        // caught regardless of position. Any non-flag is treated as the
+        // single optional path; multiple paths are rejected.
+        var path: ?[]const u8 = null;
+        while (args_iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 try printOut(io, sub_help_init);
                 return 0;
             }
-            // Reject unknown flags rather than silently treating them as paths
-            // (e.g. `gitstore init --helo` would otherwise create a repo named
-            // `--helo`).
-            if (p.len > 0 and p[0] == '-') {
+            if (arg.len > 0 and arg[0] == '-') {
                 var buf: [512]u8 = undefined;
                 var w = File.stderr().writerStreaming(io, &buf);
-                try w.interface.print("error: unknown flag for init: {s}\n", .{p});
+                try w.interface.print("error: unknown flag for init: {s}\n", .{arg});
                 try w.flush();
                 return 2;
             }
+            if (path != null) {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: init takes at most one path: {s}\n", .{arg});
+                try w.flush();
+                return 2;
+            }
+            path = arg;
+        }
+        if (path) |p| {
             const ghq_root = try getGhqRoot(gpa, io);
             defer gpa.free(ghq_root);
             try gitstore.initRepo(gpa, io, p, ghq_root, gitstore_root);
@@ -381,13 +392,6 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "adopt")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-
-        try gitstore.init(io, gitstore_root);
-
         var dry_run = false;
         var all = false;
         var path: ?[]const u8 = null;
@@ -405,23 +409,28 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
+        if (!all and path == null) {
+            try printErr(io, "error: adopt requires <path> or --all\n");
+            return 2;
+        }
+
+        // Resolve roots only after arg parse so `adopt --help` cannot fail
+        // with error.ProcessFailed when ghq is not installed.
+        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        defer gpa.free(gitstore_root);
+        const ghq_root = try getGhqRoot(gpa, io);
+        defer gpa.free(ghq_root);
+        try gitstore.init(io, gitstore_root);
+
         if (all) {
             try gitstore.adoptAll(gpa, io, ghq_root, gitstore_root, dry_run);
         } else if (path) |p| {
             try gitstore.adopt(gpa, io, p, ghq_root, gitstore_root, dry_run);
-        } else {
-            try printErr(io, "error: adopt requires <path> or --all\n");
-            return 2;
         }
         return 0;
     }
 
     if (std.mem.eql(u8, command, "verify")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-
         var all = false;
         var path: ?[]const u8 = null;
 
@@ -436,6 +445,18 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
+        if (!all and path == null) {
+            try printErr(io, "error: verify requires <path> or --all\n");
+            return 2;
+        }
+
+        // Resolve roots only after arg parse so `verify --help` cannot fail
+        // when ghq is not installed.
+        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        defer gpa.free(gitstore_root);
+        const ghq_root = try getGhqRoot(gpa, io);
+        defer gpa.free(ghq_root);
+
         if (all) {
             try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
         } else if (path) |p| {
@@ -443,19 +464,11 @@ pub fn main(init: std.process.Init) !u8 {
             if (!ok) {
                 return 1;
             }
-        } else {
-            try printErr(io, "error: verify requires <path> or --all\n");
-            return 2;
         }
         return 0;
     }
 
     if (std.mem.eql(u8, command, "detach")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-
         var dry_run = false;
         var all = false;
         var keep_backup = false;
@@ -475,6 +488,18 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
+        if (!all and path == null) {
+            try printErr(io, "error: detach requires <path> or --all\n");
+            return 2;
+        }
+
+        // Resolve roots only after arg parse so `detach --help` cannot fail
+        // when ghq is not installed.
+        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        defer gpa.free(gitstore_root);
+        const ghq_root = try getGhqRoot(gpa, io);
+        defer gpa.free(ghq_root);
+
         if (all) {
             // detachAll swallows per-repo GitDirMalformed and reports it as
             // a `failed` count in the summary, so we don't need a special
@@ -491,19 +516,11 @@ pub fn main(init: std.process.Init) !u8 {
                 },
                 else => return err,
             };
-        } else {
-            try printErr(io, "error: detach requires <path> or --all\n");
-            return 2;
         }
         return 0;
     }
 
     if (std.mem.eql(u8, command, "status")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-
         var json_mode = false;
         while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -514,16 +531,18 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
-        try gitstore.status(gpa, io, ghq_root, gitstore_root, json_mode);
-        return 0;
-    }
-
-    if (std.mem.eql(u8, command, "sync")) {
+        // Resolve roots only after arg parse so `status --help` cannot fail
+        // when ghq is not installed.
         const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
         defer gpa.free(gitstore_root);
         const ghq_root = try getGhqRoot(gpa, io);
         defer gpa.free(ghq_root);
 
+        try gitstore.status(gpa, io, ghq_root, gitstore_root, json_mode);
+        return 0;
+    }
+
+    if (std.mem.eql(u8, command, "sync")) {
         var dry_run = false;
         var remote: ?[]const u8 = null;
         while (args_iter.next()) |arg| {
@@ -537,22 +556,41 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
-        if (remote) |r| {
-            try gitstore.sync(gpa, io, ghq_root, gitstore_root, r, dry_run);
-        } else {
+        if (remote == null) {
             try printErr(io, "error: sync requires <remote>, e.g. 'gdrive:ghq'\n");
             return 2;
         }
+
+        // Resolve roots only after arg parse so `sync --help` cannot fail
+        // when ghq is not installed.
+        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        defer gpa.free(gitstore_root);
+        const ghq_root = try getGhqRoot(gpa, io);
+        defer gpa.free(ghq_root);
+
+        try gitstore.sync(gpa, io, ghq_root, gitstore_root, remote.?, dry_run);
         return 0;
     }
 
     if (std.mem.eql(u8, command, "filter")) {
-        if (args_iter.next()) |arg| {
+        // Scan all remaining args. If any is --help/-h, show help (regardless
+        // of position). Otherwise, the first non-help argument is rejected.
+        // This matches the Copilot finding so `filter foo -h` shows help and
+        // `filter foo` errors as unexpected.
+        var has_help = false;
+        var first_unexpected: ?[]const u8 = null;
+        while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-                try printOut(io, sub_help_filter);
-                return 0;
+                has_help = true;
+            } else if (first_unexpected == null) {
+                first_unexpected = arg;
             }
-            // Surface typos rather than silently ignoring.
+        }
+        if (has_help) {
+            try printOut(io, sub_help_filter);
+            return 0;
+        }
+        if (first_unexpected) |arg| {
             var buf: [512]u8 = undefined;
             var w = File.stderr().writerStreaming(io, &buf);
             try w.interface.print("error: unexpected argument: {s}\n", .{arg});
@@ -777,13 +815,17 @@ fn cmdList(
     });
     defer list_mod.freeEntries(gpa, all_entries);
 
-    // Apply --exact filter (in-place selection).
+    // Apply --exact filter (in-place selection) against the full relative
+    // repository path (host/owner/repo). Matching e.name in addition to
+    // e.rel_path is ambiguous when the same repo name exists under different
+    // owners or hosts, so the documented exact semantics restrict to rel_path
+    // only.
     var filtered: std.ArrayList(list_mod.RepoEntry) = .empty;
     defer filtered.deinit(gpa);
     const entries = if (exact and pattern != null) blk: {
         const p = pattern.?;
         for (all_entries) |e| {
-            if (std.mem.eql(u8, e.rel_path, p) or std.mem.eql(u8, e.name, p)) {
+            if (std.mem.eql(u8, e.rel_path, p)) {
                 try filtered.append(gpa, e);
             }
         }
