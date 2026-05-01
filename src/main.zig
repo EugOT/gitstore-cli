@@ -247,6 +247,7 @@ const sub_help_create =
     \\
     \\USAGE:
     \\   gitstore create <host/owner/name>
+    \\   gitstore create <owner/name>     (uses gitstore.user / default_host)
     \\
     \\OPTIONS:
     \\   --vcs git|jj                 (Accepted; v1 always git+jj colocate)

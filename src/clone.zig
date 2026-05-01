@@ -171,6 +171,10 @@ pub fn cloneOne(
     } else {
         try argv.append(gpa, "--no-recursive");
     }
+    // Terminate option parsing before the URL so a crafted spec.orig_url
+    // starting with "--" cannot be misinterpreted by `git clone` as an
+    // option (e.g. --upload-pack=/path/to/evil). Round-5 hardening.
+    try argv.append(gpa, "--");
     try argv.append(gpa, spec.orig_url);
     try argv.append(gpa, storage_path);
 

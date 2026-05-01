@@ -277,6 +277,26 @@ pub fn adopt(
         return error.InvalidGhqRoot;
     };
 
+    // Round-5 hardening: parity with detach. Refuse insecure gitstore_root
+    // and reject empty / "." / ".." segments in rel_path so a crafted
+    // repo_path (e.g. /foo/../etc) cannot resolve outside gitstore_root
+    // when later concatenated with cp/rename ops.
+    {
+        var root_norm = gitstore_root;
+        while (root_norm.len > 1 and root_norm[root_norm.len - 1] == '/') root_norm = root_norm[0 .. root_norm.len - 1];
+        if (root_norm.len < 2) {
+            warn(io, "error: refusing to adopt with insecure gitstore_root: {s}\n", .{gitstore_root});
+            return error.GitDirMalformed;
+        }
+        var comps = std.mem.splitScalar(u8, rel_path, '/');
+        while (comps.next()) |seg| {
+            if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) {
+                warn(io, "error: rel_path has invalid segments under gitstore_root: {s}\n", .{rel_path});
+                return error.GitDirMalformed;
+            }
+        }
+    }
+
     if (isAdopted(io, repo_path, gitstore_root, gpa)) {
         info(io, "skip: {s} (already adopted)\n", .{repo_path});
         return;
@@ -903,17 +923,34 @@ pub fn detach(
         }
     }
     const repo_store_dir = git_src[0..repo_end];
-    // Defense-in-depth (round-4): reject if repo_store_dir is itself a symlink.
-    // Even with the textual checks above, a hand-crafted pointer could resolve
-    // to a path whose final segment is a symlink to e.g. ~/.ssh — and the
-    // archive/remove ops below would mangle the link target. Refusing here
-    // closes a symlink-TOCTOU vector adjacent to the .. traversal vector.
+    // Defense-in-depth (round-5, supersedes round-4 readLinkAbsolute leaf
+    // check): canonicalize both gitstore_root and repo_store_dir via
+    // std.fs.realpath so any symlink in the path — leaf OR ancestor — is
+    // resolved before we verify the canonical repo path is still rooted
+    // under the canonical gitstore root. Without this, an attacker could
+    // bypass the textual ".." check by symlinking an ancestor (e.g.
+    // <gitstore_root>/github.com -> /Users/victim/.ssh) so the textual
+    // prefix matches but the actual on-disk path resolves elsewhere.
     {
-        var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        if (Dir.readLinkAbsolute(io, repo_store_dir, &link_buf)) |_| {
-            warn(io, "error: gitstore repo dir {s} is a symlink; refusing to detach\n", .{repo_store_dir});
+        var canon_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var canon_repo_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const canon_root_len = Dir.cwd().realPathFile(io, root_norm, &canon_root_buf) catch |err| {
+            warn(io, "error: could not canonicalize gitstore root {s}: {s}\n", .{ root_norm, @errorName(err) });
             return error.GitDirMalformed;
-        } else |_| {}
+        };
+        const canon_root = canon_root_buf[0..canon_root_len];
+        const canon_repo_len = Dir.cwd().realPathFile(io, repo_store_dir, &canon_repo_buf) catch |err| {
+            warn(io, "error: could not canonicalize gitstore repo dir {s}: {s}\n", .{ repo_store_dir, @errorName(err) });
+            return error.GitDirMalformed;
+        };
+        const canon_repo = canon_repo_buf[0..canon_repo_len];
+        if (!std.mem.startsWith(u8, canon_repo, canon_root) or
+            canon_repo.len <= canon_root.len or
+            canon_repo[canon_root.len] != '/')
+        {
+            warn(io, "error: canonicalized gitdir target {s} escapes canonicalized gitstore root {s}\n", .{ canon_repo, canon_root });
+            return error.GitDirMalformed;
+        }
     }
     const jj_src = try std.fmt.allocPrint(gpa, "{s}/jj", .{repo_store_dir});
     defer gpa.free(jj_src);
