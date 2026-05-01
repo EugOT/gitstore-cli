@@ -921,6 +921,17 @@ pub fn detach(
         warn(io, "error: gitdir pointer in {s}/.git escapes gitstore root: {s}\n", .{ repo_path, git_src });
         return error.GitDirMalformed;
     }
+    // v0.2.2 hardening: bounds-check the rel slice.
+    // The earlier `repo_end <= root_end` check uses a root_end derived by
+    // scanning backward for the last '/' before /git, which can match a slash
+    // INSIDE root_norm (e.g. for "/tmp/gitstore/git" root_end becomes 5 from
+    // the slash in "/tmp/", not 14 from end-of-root). That left an empty repo
+    // segment ("<root_norm>/git") slipping past the textual check and crashing
+    // when the rel slice computes start > end. Guard explicitly here.
+    if (repo_end <= root_norm.len + 1) {
+        warn(io, "error: gitdir pointer in {s}/.git has empty repo segment: {s}\n", .{ repo_path, git_src });
+        return error.GitDirMalformed;
+    }
     {
         const rel = git_src[root_norm.len + 1 .. repo_end];
         var comps = std.mem.splitScalar(u8, rel, '/');

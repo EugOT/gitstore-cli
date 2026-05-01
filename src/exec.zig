@@ -19,7 +19,63 @@ pub const ExecResult = struct {
 
 pub const ExecError = std.process.RunError;
 
+/// Whitelist of environment variables propagated to spawned subprocesses
+/// (git, jj, ghq, rclone, and friends). Everything else is dropped.
+///
+/// WHY: git honours `GIT_CONFIG_COUNT` + `GIT_CONFIG_KEY_<i>` /
+/// `GIT_CONFIG_VALUE_<i>` and `GIT_DIR` / `GIT_OBJECT_DIRECTORY` /
+/// `GIT_*` overrides at runtime. A caller (or an attacker who controls a
+/// hook context, sudo wrapper, etc.) could otherwise inject e.g.
+/// `core.fsmonitor=/tmp/evil.sh` and have gitstore execute it. By passing
+/// only a fresh, scrubbed map to the child, gitstore neutralises this
+/// injection vector while preserving the env vars users legitimately need
+/// (PATH for tool lookup, HOME / XDG_* for git config discovery,
+/// SSH_AUTH_SOCK for ssh-key clones, SSL_CERT_* for TLS, etc.).
+const env_whitelist = [_][]const u8{
+    "PATH",           "HOME",              "USER",
+    "LOGNAME",        "LANG",              "LC_ALL",
+    "LC_CTYPE",       "TERM",              "TZ",
+    "TMPDIR",         "SSH_AUTH_SOCK",     "SSL_CERT_FILE",
+    "SSL_CERT_DIR",   "NIX_SSL_CERT_FILE", "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+};
+
+/// Build a fresh env map containing only `env_whitelist` entries that are
+/// present in the current process environment. Caller owns the returned
+/// map and must `deinit` it.
+fn buildScrubbedEnv(gpa: Allocator) Allocator.Error!std.process.Environ.Map {
+    var out: std.process.Environ.Map = .init(gpa);
+    errdefer out.deinit();
+    for (env_whitelist) |key| {
+        if (lookupParentEnv(key)) |value| {
+            try out.put(key, value);
+        }
+    }
+    return out;
+}
+
+/// Look up a single variable in the parent process environment via the
+/// POSIX `environ` global. Returns null when the variable is unset or when
+/// running on a target without a libc `environ` symbol (e.g. WASI).
+fn lookupParentEnv(key: []const u8) ?[]const u8 {
+    if (!@hasDecl(std.c, "environ")) return null;
+    const environ = std.c.environ;
+    var i: usize = 0;
+    while (environ[i]) |entry| : (i += 1) {
+        const slice = std.mem.sliceTo(entry, 0);
+        if (slice.len <= key.len) continue;
+        if (slice[key.len] != '=') continue;
+        if (!std.mem.eql(u8, slice[0..key.len], key)) continue;
+        return slice[key.len + 1 ..];
+    }
+    return null;
+}
+
 /// Run a command, capture stdout and stderr, return result with exit status.
+///
+/// The child inherits a *scrubbed* environment (see `env_whitelist`) — not
+/// the full parent env — so callers cannot smuggle `GIT_CONFIG_*` /
+/// `GIT_DIR` overrides into the spawned git/jj/ghq/rclone process.
 pub fn exec(
     gpa: Allocator,
     io: Io,
@@ -27,9 +83,12 @@ pub fn exec(
     cwd: ?[]const u8,
 ) ExecError!ExecResult {
     const cwd_opt: std.process.Child.Cwd = if (cwd) |c| .{ .path = c } else .inherit;
+    var scrubbed = try buildScrubbedEnv(gpa);
+    defer scrubbed.deinit();
     const result = try std.process.run(gpa, io, .{
         .argv = argv,
         .cwd = cwd_opt,
+        .environ_map = &scrubbed,
     });
     return .{
         .stdout = result.stdout,
