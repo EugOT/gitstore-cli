@@ -370,23 +370,49 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "hook")) {
-        const flag = args_iter.next() orelse {
-            try printErr(io, "error: hook requires --zsh, --bash, or --nu\n");
-            return 2;
-        };
-        if (std.mem.eql(u8, flag, "--help") or std.mem.eql(u8, flag, "-h")) {
+        // Scan all args so `gitstore hook --zsh --help` (and any reordering)
+        // surfaces help instead of printing the wrapper. Round-6 fix per CR
+        // major outside-diff.
+        var has_help = false;
+        var shell: ?[]const u8 = null;
+        var first_unknown: ?[]const u8 = null;
+        while (args_iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                has_help = true;
+            } else if (std.mem.eql(u8, arg, "--zsh") or std.mem.eql(u8, arg, "--bash") or std.mem.eql(u8, arg, "--nu")) {
+                if (shell != null and !std.mem.eql(u8, shell.?, arg)) {
+                    var buf: [512]u8 = undefined;
+                    var w = File.stderr().writerStreaming(io, &buf);
+                    try w.interface.print("error: hook accepts only one of --zsh/--bash/--nu (got {s} after {s})\n", .{ arg, shell.? });
+                    try w.flush();
+                    return 2;
+                }
+                shell = arg;
+            } else if (first_unknown == null) {
+                first_unknown = arg;
+            }
+        }
+        if (has_help) {
             try printOut(io, sub_help_hook);
             return 0;
         }
-        if (std.mem.eql(u8, flag, "--zsh")) {
-            try printOut(io, hooks.zsh_hook);
-        } else if (std.mem.eql(u8, flag, "--bash")) {
-            try printOut(io, hooks.bash_hook);
-        } else if (std.mem.eql(u8, flag, "--nu")) {
-            try printOut(io, hooks.nu_hook);
-        } else {
+        if (first_unknown) |arg| {
+            var buf: [512]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: unknown argument for hook: {s}\n", .{arg});
+            try w.flush();
+            return 2;
+        }
+        const which = shell orelse {
             try printErr(io, "error: hook requires --zsh, --bash, or --nu\n");
             return 2;
+        };
+        if (std.mem.eql(u8, which, "--zsh")) {
+            try printOut(io, hooks.zsh_hook);
+        } else if (std.mem.eql(u8, which, "--bash")) {
+            try printOut(io, hooks.bash_hook);
+        } else {
+            try printOut(io, hooks.nu_hook);
         }
         return 0;
     }
@@ -404,7 +430,20 @@ pub fn main(init: std.process.Init) !u8 {
                 dry_run = true;
             } else if (std.mem.eql(u8, arg, "--all")) {
                 all = true;
-            } else if (arg[0] != '-') {
+            } else if (arg.len != 0 and arg[0] == '-') {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: unknown flag for adopt: {s}\n", .{arg});
+                try w.flush();
+                return 2;
+            } else {
+                if (path != null) {
+                    var buf: [512]u8 = undefined;
+                    var w = File.stderr().writerStreaming(io, &buf);
+                    try w.interface.print("error: adopt takes at most one path: {s}\n", .{arg});
+                    try w.flush();
+                    return 2;
+                }
                 path = arg;
             }
         }
@@ -440,7 +479,20 @@ pub fn main(init: std.process.Init) !u8 {
                 return 0;
             } else if (std.mem.eql(u8, arg, "--all")) {
                 all = true;
-            } else if (arg[0] != '-') {
+            } else if (arg.len != 0 and arg[0] == '-') {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: unknown flag for verify: {s}\n", .{arg});
+                try w.flush();
+                return 2;
+            } else {
+                if (path != null) {
+                    var buf: [512]u8 = undefined;
+                    var w = File.stderr().writerStreaming(io, &buf);
+                    try w.interface.print("error: verify takes at most one path: {s}\n", .{arg});
+                    try w.flush();
+                    return 2;
+                }
                 path = arg;
             }
         }
@@ -483,7 +535,20 @@ pub fn main(init: std.process.Init) !u8 {
                 all = true;
             } else if (std.mem.eql(u8, arg, "--keep-backup")) {
                 keep_backup = true;
-            } else if (arg[0] != '-') {
+            } else if (arg.len != 0 and arg[0] == '-') {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: unknown flag for detach: {s}\n", .{arg});
+                try w.flush();
+                return 2;
+            } else {
+                if (path != null) {
+                    var buf: [512]u8 = undefined;
+                    var w = File.stderr().writerStreaming(io, &buf);
+                    try w.interface.print("error: detach takes at most one path: {s}\n", .{arg});
+                    try w.flush();
+                    return 2;
+                }
                 path = arg;
             }
         }
@@ -528,6 +593,12 @@ pub fn main(init: std.process.Init) !u8 {
                 return 0;
             } else if (std.mem.eql(u8, arg, "--json")) {
                 json_mode = true;
+            } else {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: unknown argument for status: {s}\n", .{arg});
+                try w.flush();
+                return 2;
             }
         }
 
@@ -551,7 +622,20 @@ pub fn main(init: std.process.Init) !u8 {
                 return 0;
             } else if (std.mem.eql(u8, arg, "--dry-run")) {
                 dry_run = true;
-            } else if (arg[0] != '-') {
+            } else if (arg.len != 0 and arg[0] == '-') {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: unknown flag for sync: {s}\n", .{arg});
+                try w.flush();
+                return 2;
+            } else {
+                if (remote != null) {
+                    var buf: [512]u8 = undefined;
+                    var w = File.stderr().writerStreaming(io, &buf);
+                    try w.interface.print("error: sync takes at most one remote: {s}\n", .{arg});
+                    try w.flush();
+                    return 2;
+                }
                 remote = arg;
             }
         }

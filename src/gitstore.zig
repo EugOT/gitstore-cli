@@ -858,11 +858,20 @@ pub fn detach(
     const git_pointer_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
     defer gpa.free(git_pointer_path);
 
-    // Read the pointer to discover the gitstore location
+    // Read the pointer to discover the gitstore location.
+    // Round-6 (CR major outside-diff): re-validate the "gitdir: " prefix on
+    // this second read. isAdopted() already checked the prefix on its own
+    // read, but if .git is swapped or truncated between the two reads we
+    // would slice past the buffer. Refusing here turns malformed input into
+    // error.GitDirMalformed instead of a panic.
     const pointer_content = try Dir.cwd().readFileAlloc(io, git_pointer_path, gpa, .unlimited);
     defer gpa.free(pointer_content);
     const trimmed = ex.trimTrailingNewline(pointer_content);
     const prefix = "gitdir: ";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) {
+        warn(io, "error: gitdir pointer in {s}/.git lost its 'gitdir: ' prefix between reads: {s}\n", .{ repo_path, trimmed });
+        return error.GitDirMalformed;
+    }
     const git_src = trimmed[prefix.len..]; // e.g. /gitstore/.../git
 
     // Validate that git_src has the canonical gitstore shape:
