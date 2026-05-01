@@ -879,6 +879,12 @@ pub fn detach(
     // archive/remove ops mangle unrelated directories.
     var root_norm = gitstore_root;
     while (root_norm.len > 1 and root_norm[root_norm.len - 1] == '/') root_norm = root_norm[0 .. root_norm.len - 1];
+    // Refuse insecure roots like "/" or "" — with such a root any absolute
+    // git_src would pass the prefix check, defeating the boundary guarantee.
+    if (root_norm.len < 2) {
+        warn(io, "error: refusing to detach with insecure gitstore_root: {s}\n", .{gitstore_root});
+        return error.GitDirMalformed;
+    }
     if (!std.mem.startsWith(u8, git_src, root_norm) or
         git_src.len <= root_norm.len or
         git_src[root_norm.len] != '/')
@@ -897,6 +903,18 @@ pub fn detach(
         }
     }
     const repo_store_dir = git_src[0..repo_end];
+    // Defense-in-depth (round-4): reject if repo_store_dir is itself a symlink.
+    // Even with the textual checks above, a hand-crafted pointer could resolve
+    // to a path whose final segment is a symlink to e.g. ~/.ssh — and the
+    // archive/remove ops below would mangle the link target. Refusing here
+    // closes a symlink-TOCTOU vector adjacent to the .. traversal vector.
+    {
+        var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        if (Dir.readLinkAbsolute(io, repo_store_dir, &link_buf)) |_| {
+            warn(io, "error: gitstore repo dir {s} is a symlink; refusing to detach\n", .{repo_store_dir});
+            return error.GitDirMalformed;
+        } else |_| {}
+    }
     const jj_src = try std.fmt.allocPrint(gpa, "{s}/jj", .{repo_store_dir});
     defer gpa.free(jj_src);
 

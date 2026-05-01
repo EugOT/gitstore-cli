@@ -196,9 +196,8 @@ const sub_help_list =
     \\
     \\OPTIONS:
     \\   -p, --full-path              Print full filesystem paths
-    \\   -e, --exact                  Match <pattern> exactly against either the
-    \\                                full rel_path (host/owner/repo) OR the repo
-    \\                                leaf-name (the last path component)
+    \\   -e, --exact                  Match <pattern> exactly against the full
+    \\                                rel_path (host/owner/repo)
     \\   --json                       Emit JSON array (each entry has rel_path,
     \\                                abs_path, host, owner, name, is_adopted,
     \\                                has_jj, worktrees, head_sha, last_fetched_unix)
@@ -207,7 +206,7 @@ const sub_help_list =
     \\
     \\If <pattern> is given without --exact, only repos whose rel_path contains
     \\<pattern> as a substring are listed. With --exact, the match must equal
-    \\either rel_path or the repo leaf-name exactly.
+    \\the full rel_path (host/owner/repo) exactly.
     \\
 ;
 
