@@ -727,7 +727,14 @@ fn createExclusiveFilterTmp(gpa: Allocator, io: Io, contents: []const u8) ![]u8 
                 return e;
             },
         };
+        // Clean up file + heap-allocated path on write failures. errdefer
+        // only runs on error returns, so a successful `return path` transfers
+        // ownership cleanly without unlinking.
         defer file.close(io);
+        errdefer {
+            Dir.cwd().deleteFile(io, path) catch {};
+            gpa.free(path);
+        }
 
         var buf: [4096]u8 = undefined;
         var w = file.writerStreaming(io, &buf);

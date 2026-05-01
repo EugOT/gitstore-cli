@@ -143,7 +143,8 @@ const sub_help_sync =
     \\   gitstore sync <remote>       e.g. gdrive:ghq
     \\
     \\OPTIONS:
-    \\   --dry-run                    Print rclone command without running it
+    \\   --dry-run                    Run rclone with --dry-run (shows what
+    \\                                would be transferred without copying)
     \\   --help, -h                   Show this help
     \\
     \\NOTES:
@@ -175,6 +176,7 @@ const sub_help_get =
     \\   -P, --parallel N             Bounded parallelism (default 1)
     \\   --no-adopt                   Skip auto-adopt after clone
     \\   --shallow                    Pass --depth 1 to git clone
+    \\   --no-recursive               Disable submodule init/update (default: on)
     \\   -b, --branch BRANCH          Pass --branch=BRANCH (implies --single-branch)
     \\   --help, -h                   Show this help
     \\
@@ -331,6 +333,16 @@ pub fn main(init: std.process.Init) !u8 {
             if (std.mem.eql(u8, p, "--help") or std.mem.eql(u8, p, "-h")) {
                 try printOut(io, sub_help_init);
                 return 0;
+            }
+            // Reject unknown flags rather than silently treating them as paths
+            // (e.g. `gitstore init --helo` would otherwise create a repo named
+            // `--helo`).
+            if (p.len > 0 and p[0] == '-') {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: unknown flag for init: {s}\n", .{p});
+                try w.flush();
+                return 2;
             }
             const ghq_root = try getGhqRoot(gpa, io);
             defer gpa.free(ghq_root);
