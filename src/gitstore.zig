@@ -277,6 +277,26 @@ pub fn adopt(
         return error.InvalidGhqRoot;
     };
 
+    // Round-5 hardening: parity with detach. Refuse insecure gitstore_root
+    // and reject empty / "." / ".." segments in rel_path so a crafted
+    // repo_path (e.g. /foo/../etc) cannot resolve outside gitstore_root
+    // when later concatenated with cp/rename ops.
+    {
+        var root_norm = gitstore_root;
+        while (root_norm.len > 1 and root_norm[root_norm.len - 1] == '/') root_norm = root_norm[0 .. root_norm.len - 1];
+        if (root_norm.len < 2) {
+            warn(io, "error: refusing to adopt with insecure gitstore_root: {s}\n", .{gitstore_root});
+            return error.GitDirMalformed;
+        }
+        var comps = std.mem.splitScalar(u8, rel_path, '/');
+        while (comps.next()) |seg| {
+            if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) {
+                warn(io, "error: rel_path has invalid segments under gitstore_root: {s}\n", .{rel_path});
+                return error.GitDirMalformed;
+            }
+        }
+    }
+
     if (isAdopted(io, repo_path, gitstore_root, gpa)) {
         info(io, "skip: {s} (already adopted)\n", .{repo_path});
         return;
@@ -702,6 +722,49 @@ pub fn status(
     }
 }
 
+/// Create a uniquely-named filter file under /tmp using O_CREAT|O_EXCL
+/// (`exclusive = true`) and write the supplied contents to it. Returns the
+/// caller-owned absolute path. Retries on EPATHALREADYEXISTS / collisions
+/// with a fresh random suffix; bails after a small bound to avoid a poisoned
+/// tmp directory becoming an infinite loop.
+fn createExclusiveFilterTmp(gpa: Allocator, io: Io, contents: []const u8) ![]u8 {
+    var attempt: u32 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        const ns = Io.Clock.real.now(io).nanoseconds;
+        const path = try std.fmt.allocPrint(
+            gpa,
+            "/tmp/gitstore-rclone-filter.dryrun.{d}.{d}.txt",
+            .{ ns, attempt },
+        );
+
+        var file = Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                gpa.free(path);
+                continue;
+            },
+            else => |e| {
+                gpa.free(path);
+                return e;
+            },
+        };
+        // Clean up file + heap-allocated path on write failures. errdefer
+        // only runs on error returns, so a successful `return path` transfers
+        // ownership cleanly without unlinking.
+        defer file.close(io);
+        errdefer {
+            Dir.cwd().deleteFile(io, path) catch {};
+            gpa.free(path);
+        }
+
+        var buf: [4096]u8 = undefined;
+        var w = file.writerStreaming(io, &buf);
+        try w.interface.writeAll(contents);
+        try w.flush();
+        return path;
+    }
+    return error.TempFileCollision;
+}
+
 /// Write the rclone filter file to gitstore root and run rclone sync.
 pub fn sync(
     gpa: Allocator,
@@ -716,16 +779,18 @@ pub fn sync(
     // Ensure gitstore root exists
     try init(io, gitstore_root);
 
-    // Write filter file (for non-dry-run; for dry-run use a temp file to not pollute gitstore)
+    // Write filter file. For dry-run, use an exclusively-created temp file
+    // (O_CREAT|O_EXCL) under /tmp so concurrent dry-runs on a shared host
+    // can't race or collide. For real syncs, write the canonical
+    // <gitstore_root>/rclone-filter.txt path.
     const filter_path = if (dry_run)
-        try std.fmt.allocPrint(gpa, "/tmp/gitstore-rclone-filter.dryrun.txt", .{})
-    else
-        try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
+        try createExclusiveFilterTmp(gpa, io, hooks.rclone_filter)
+    else blk: {
+        const p = try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
+        try Dir.cwd().writeFile(io, .{ .sub_path = p, .data = hooks.rclone_filter });
+        break :blk p;
+    };
     defer gpa.free(filter_path);
-    try Dir.cwd().writeFile(io, .{
-        .sub_path = filter_path,
-        .data = hooks.rclone_filter,
-    });
     info(io, "filter: {s}\n", .{filter_path});
     defer if (dry_run) {
         Dir.cwd().deleteFile(io, filter_path) catch {};
@@ -793,17 +858,109 @@ pub fn detach(
     const git_pointer_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
     defer gpa.free(git_pointer_path);
 
-    // Read the pointer to discover the gitstore location
+    // Read the pointer to discover the gitstore location.
+    // Round-6 (CR major outside-diff): re-validate the "gitdir: " prefix on
+    // this second read. isAdopted() already checked the prefix on its own
+    // read, but if .git is swapped or truncated between the two reads we
+    // would slice past the buffer. Refusing here turns malformed input into
+    // error.GitDirMalformed instead of a panic.
     const pointer_content = try Dir.cwd().readFileAlloc(io, git_pointer_path, gpa, .unlimited);
     defer gpa.free(pointer_content);
     const trimmed = ex.trimTrailingNewline(pointer_content);
     const prefix = "gitdir: ";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) {
+        warn(io, "error: gitdir pointer in {s}/.git lost its 'gitdir: ' prefix between reads: {s}\n", .{ repo_path, trimmed });
+        return error.GitDirMalformed;
+    }
     const git_src = trimmed[prefix.len..]; // e.g. /gitstore/.../git
 
-    // Derive jj_src and repo_store_dir by taking parent of git_src, then appending /jj
-    var parent_end = git_src.len;
-    while (parent_end > 0 and git_src[parent_end - 1] != '/') parent_end -= 1;
-    const repo_store_dir = git_src[0..if (parent_end > 0) parent_end - 1 else 0];
+    // Validate that git_src has the canonical gitstore shape:
+    //   "<gitstore_root>/<repo>/git"
+    // We require:
+    //   1. trailing "/git" segment (so we know we're looking at a git_src
+    //      pointer, not e.g. the gitstore root itself);
+    //   2. a slash before "<repo>" with non-empty root and non-empty repo
+    //      segments (so neither slice underflows).
+    // Anything else is malformed and could cause repo_store_dir to point
+    // somewhere unexpected (worst case: the gitstore root, which a later
+    // archive-rename would mangle).
+    const git_suffix = "/git";
+    if (git_src.len < git_suffix.len + 2 or !std.mem.endsWith(u8, git_src, git_suffix)) {
+        warn(io, "error: gitdir pointer in {s}/.git is not a gitstore git_src (missing /git suffix): {s}\n", .{ repo_path, git_src });
+        return error.GitDirMalformed;
+    }
+    // Slash immediately before the "git" segment.
+    const repo_end = git_src.len - git_suffix.len;
+    // Find the slash before "<repo>". After endsWith("/git") we know
+    // git_src[repo_end] == '/'. Scan backwards to the next '/'.
+    var root_end = repo_end;
+    while (root_end > 0 and git_src[root_end - 1] != '/') root_end -= 1;
+    // Need: non-empty root (root_end > 1, since root_end-1 is the slash and
+    // we want at least one byte before it) and non-empty repo segment.
+    if (root_end <= 1 or repo_end <= root_end) {
+        warn(io, "error: gitdir pointer in {s}/.git is malformed: {s}\n", .{ repo_path, git_src });
+        return error.GitDirMalformed;
+    }
+    // Defense-in-depth (CR critical post-efc8ce6): re-validate that git_src is
+    // rooted under the configured gitstore_root and that no path component is
+    // "..", ".", or empty. Without this check, a hand-crafted gitdir pointer
+    // could resolve repo_store_dir outside the store and have detach's
+    // archive/remove ops mangle unrelated directories.
+    var root_norm = gitstore_root;
+    while (root_norm.len > 1 and root_norm[root_norm.len - 1] == '/') root_norm = root_norm[0 .. root_norm.len - 1];
+    // Refuse insecure roots like "/" or "" — with such a root any absolute
+    // git_src would pass the prefix check, defeating the boundary guarantee.
+    if (root_norm.len < 2) {
+        warn(io, "error: refusing to detach with insecure gitstore_root: {s}\n", .{gitstore_root});
+        return error.GitDirMalformed;
+    }
+    if (!std.mem.startsWith(u8, git_src, root_norm) or
+        git_src.len <= root_norm.len or
+        git_src[root_norm.len] != '/')
+    {
+        warn(io, "error: gitdir pointer in {s}/.git escapes gitstore root: {s}\n", .{ repo_path, git_src });
+        return error.GitDirMalformed;
+    }
+    {
+        const rel = git_src[root_norm.len + 1 .. repo_end];
+        var comps = std.mem.splitScalar(u8, rel, '/');
+        while (comps.next()) |seg| {
+            if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) {
+                warn(io, "error: gitdir pointer in {s}/.git has invalid path components: {s}\n", .{ repo_path, git_src });
+                return error.GitDirMalformed;
+            }
+        }
+    }
+    const repo_store_dir = git_src[0..repo_end];
+    // Defense-in-depth (round-5, supersedes round-4 readLinkAbsolute leaf
+    // check): canonicalize both gitstore_root and repo_store_dir via
+    // std.fs.realpath so any symlink in the path — leaf OR ancestor — is
+    // resolved before we verify the canonical repo path is still rooted
+    // under the canonical gitstore root. Without this, an attacker could
+    // bypass the textual ".." check by symlinking an ancestor (e.g.
+    // <gitstore_root>/github.com -> /Users/victim/.ssh) so the textual
+    // prefix matches but the actual on-disk path resolves elsewhere.
+    {
+        var canon_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var canon_repo_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const canon_root_len = Dir.cwd().realPathFile(io, root_norm, &canon_root_buf) catch |err| {
+            warn(io, "error: could not canonicalize gitstore root {s}: {s}\n", .{ root_norm, @errorName(err) });
+            return error.GitDirMalformed;
+        };
+        const canon_root = canon_root_buf[0..canon_root_len];
+        const canon_repo_len = Dir.cwd().realPathFile(io, repo_store_dir, &canon_repo_buf) catch |err| {
+            warn(io, "error: could not canonicalize gitstore repo dir {s}: {s}\n", .{ repo_store_dir, @errorName(err) });
+            return error.GitDirMalformed;
+        };
+        const canon_repo = canon_repo_buf[0..canon_repo_len];
+        if (!std.mem.startsWith(u8, canon_repo, canon_root) or
+            canon_repo.len <= canon_root.len or
+            canon_repo[canon_root.len] != '/')
+        {
+            warn(io, "error: canonicalized gitdir target {s} escapes canonicalized gitstore root {s}\n", .{ canon_repo, canon_root });
+            return error.GitDirMalformed;
+        }
+    }
     const jj_src = try std.fmt.allocPrint(gpa, "{s}/jj", .{repo_store_dir});
     defer gpa.free(jj_src);
 
