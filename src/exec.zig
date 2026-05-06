@@ -77,8 +77,17 @@ fn buildScrubbedEnv(gpa: Allocator) Allocator.Error!std.process.Environ.Map {
 /// an empty map on no-libc targets — gitstore's spawned subprocesses
 /// then run with only the explicit whitelist values, which is the
 /// security contract this function exists to maintain.
+///
+/// WHY (CR R7-1, v0.2.2): in Zig 0.16 `std.c.environ` is declared as
+/// `extern var environ: [*:null]?[*:0]u8;` regardless of libc linkage —
+/// `@hasDecl(std.c, "environ")` is therefore TRUE on no-libc builds too,
+/// and dereferencing the symbol there is undefined behaviour (null pointer).
+/// `builtin.link_libc` is the compile-time constant that actually reflects
+/// whether the symbol is backed by a real libc-provided block. We gate on
+/// that primarily and keep `@hasDecl` as a defensive secondary check so the
+/// code still compiles on hypothetical std builds that drop the decl.
 fn parentEnvMap(gpa: Allocator) !std.process.Environ.Map {
-    if (@hasDecl(std.c, "environ")) {
+    if (builtin.link_libc and @hasDecl(std.c, "environ")) {
         const c_environ = std.c.environ;
         var count: usize = 0;
         while (c_environ[count] != null) : (count += 1) {}
@@ -180,6 +189,27 @@ test "buildScrubbedEnv preserves whitelisted vars from parent env" {
 
     const home = scrubbed.get("HOME") orelse return error.HomeMissingInScrubbedEnv;
     try testing.expectEqualStrings(parent_home, home);
+}
+
+test "buildScrubbedEnv excludes dangerous git/jj/rclone env vars" {
+    // Even if the parent env contains these (set by an attacker, hook,
+    // sudo wrapper, etc.), they must NEVER reach the scrubbed map. This
+    // is the security contract that buildScrubbedEnv exists to enforce.
+    const gpa = testing.allocator;
+    var scrubbed = try buildScrubbedEnv(gpa);
+    defer scrubbed.deinit();
+
+    const forbidden = [_][]const u8{
+        "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",     "GIT_CONFIG_VALUE_0",
+        "GIT_DIR",          "GIT_OBJECT_DIRECTORY", "GIT_SSH_COMMAND",
+        "GIT_AUTHOR_NAME",  "GIT_COMMITTER_NAME",   "GIT_TERMINAL_PROMPT",
+        "GIT_INDEX_FILE",   "GIT_WORK_TREE",        "JJ_USER",
+        "JJ_EMAIL",         "JJ_OP_HOSTNAME",       "RCLONE_CONFIG",
+        "RCLONE_VERBOSE",   "GH_TOKEN",             "GITHUB_TOKEN",
+    };
+    for (forbidden) |key| {
+        try testing.expect(scrubbed.get(key) == null);
+    }
 }
 
 test "buildScrubbedEnv mirrors parent environ for every whitelist key" {
