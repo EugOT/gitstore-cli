@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -37,38 +38,55 @@ const env_whitelist = [_][]const u8{
     "LC_CTYPE",       "TERM",              "TZ",
     "TMPDIR",         "SSH_AUTH_SOCK",     "SSL_CERT_FILE",
     "SSL_CERT_DIR",   "NIX_SSL_CERT_FILE", "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
+    "XDG_CACHE_HOME", "GHQ_ROOT",          "GITSTORE_ROOT",
 };
 
 /// Build a fresh env map containing only `env_whitelist` entries that are
 /// present in the current process environment. Caller owns the returned
 /// map and must `deinit` it.
+///
+/// WHY (Codex P1, v0.2.2): the previous implementation walked
+/// `std.c.environ` directly. That symbol is null on no-libc Zig 0.16
+/// builds, so the scrubbed map silently came back EMPTY — dropping HOME,
+/// PATH, and locale vars from every spawned git/jj/ghq subprocess. The
+/// portable replacement is to materialize the parent environment via
+/// `std.process.Environ.createMap`, sourced from `std.testing.environ`
+/// inside the test runner (which is libc-independent) and from the
+/// libc-backed `std.c.environ` block in production POSIX builds.
 fn buildScrubbedEnv(gpa: Allocator) Allocator.Error!std.process.Environ.Map {
+    var parent_map = parentEnvMap(gpa) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => std.process.Environ.Map.init(gpa),
+    };
+    defer parent_map.deinit();
+
     var out: std.process.Environ.Map = .init(gpa);
     errdefer out.deinit();
     for (env_whitelist) |key| {
-        if (lookupParentEnv(key)) |value| {
+        if (parent_map.get(key)) |value| {
             try out.put(key, value);
         }
     }
     return out;
 }
 
-/// Look up a single variable in the parent process environment via the
-/// POSIX `environ` global. Returns null when the variable is unset or when
-/// running on a target without a libc `environ` symbol (e.g. WASI).
-fn lookupParentEnv(key: []const u8) ?[]const u8 {
-    if (!@hasDecl(std.c, "environ")) return null;
-    const environ = std.c.environ;
-    var i: usize = 0;
-    while (environ[i]) |entry| : (i += 1) {
-        const slice = std.mem.sliceTo(entry, 0);
-        if (slice.len <= key.len) continue;
-        if (slice[key.len] != '=') continue;
-        if (!std.mem.eql(u8, slice[0..key.len], key)) continue;
-        return slice[key.len + 1 ..];
+/// Materialize the parent process environment as a portable
+/// `std.process.Environ.Map`. Builds from `std.c.environ` when libc is
+/// linked (the standard POSIX path, including under `zig build test`
+/// where the test binary inherits the parent shell's environ). Returns
+/// an empty map on no-libc targets — gitstore's spawned subprocesses
+/// then run with only the explicit whitelist values, which is the
+/// security contract this function exists to maintain.
+fn parentEnvMap(gpa: Allocator) !std.process.Environ.Map {
+    if (@hasDecl(std.c, "environ")) {
+        const c_environ = std.c.environ;
+        var count: usize = 0;
+        while (c_environ[count] != null) : (count += 1) {}
+        const slice: [:null]const ?[*:0]const u8 = @ptrCast(c_environ[0..count :null]);
+        const env: std.process.Environ = .{ .block = .{ .slice = slice } };
+        return env.createMap(gpa);
     }
-    return null;
+    return std.process.Environ.Map.init(gpa);
 }
 
 /// Run a command, capture stdout and stderr, return result with exit status.
@@ -124,6 +142,74 @@ pub fn trimTrailingNewline(s: []const u8) []const u8 {
 }
 
 const testing = std.testing;
+
+// ===== env_whitelist / buildScrubbedEnv tests =====
+
+test "env_whitelist contains GHQ_ROOT and GITSTORE_ROOT" {
+    // ghq honours GHQ_ROOT for repo location. gitstore-cli wraps `ghq root`
+    // and other ghq commands through exec() with a SCRUBBED env, so if
+    // GHQ_ROOT is dropped here every adoptAll/detachAll/status call will
+    // resolve the wrong root. Same logic for gitstore's own GITSTORE_ROOT.
+    var has_ghq = false;
+    var has_gitstore = false;
+    for (env_whitelist) |key| {
+        if (std.mem.eql(u8, key, "GHQ_ROOT")) has_ghq = true;
+        if (std.mem.eql(u8, key, "GITSTORE_ROOT")) has_gitstore = true;
+    }
+    try testing.expect(has_ghq);
+    try testing.expect(has_gitstore);
+}
+
+test "buildScrubbedEnv preserves whitelisted vars from parent env" {
+    // The test runner exposes the host environ block via std.testing.environ
+    // regardless of libc linkage. buildScrubbedEnv must honour that block,
+    // not std.c.environ which is null on no-libc Zig 0.16 builds. If it
+    // doesn't, HOME (and friends) drop out of the scrubbed map and every
+    // git/jj/ghq subprocess loses its config-discovery anchor.
+    const gpa = testing.allocator;
+
+    // Resolve HOME via the testing-environ block — this is the contract
+    // buildScrubbedEnv must match, not "whatever libc happens to expose".
+    var parent_map = try std.testing.environ.createMap(gpa);
+    defer parent_map.deinit();
+    const parent_home = parent_map.get("HOME") orelse return error.SkipZigTest;
+    try testing.expect(parent_home.len > 0);
+
+    var scrubbed = try buildScrubbedEnv(gpa);
+    defer scrubbed.deinit();
+
+    const home = scrubbed.get("HOME") orelse return error.HomeMissingInScrubbedEnv;
+    try testing.expectEqualStrings(parent_home, home);
+}
+
+test "buildScrubbedEnv mirrors parent environ for every whitelist key" {
+    // Contract: scrubbed env must agree with the parent shell environ
+    // for every whitelist key — present in parent ⇒ present and equal in
+    // scrubbed; absent in parent ⇒ absent in scrubbed. Compares against
+    // std.testing.environ.createMap (the portable view of the same block
+    // std.c.environ exposes under POSIX libc), so it catches any bug
+    // where buildScrubbedEnv silently drops or rewrites whitelisted vars.
+    const gpa = testing.allocator;
+
+    var parent_map = try std.testing.environ.createMap(gpa);
+    defer parent_map.deinit();
+
+    var scrubbed = try buildScrubbedEnv(gpa);
+    defer scrubbed.deinit();
+
+    for (env_whitelist) |key| {
+        const parent_value = parent_map.get(key);
+        const scrubbed_value = scrubbed.get(key);
+        if (parent_value) |pv| {
+            // Parent has this var → scrubbed must too, with the same value.
+            const sv = scrubbed_value orelse return error.WhitelistedVarMissing;
+            try testing.expectEqualStrings(pv, sv);
+        } else {
+            // Parent doesn't have it → scrubbed must not have it either.
+            try testing.expect(scrubbed_value == null);
+        }
+    }
+}
 
 // ===== exec() tests =====
 

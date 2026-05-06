@@ -1450,23 +1450,30 @@ test "detach refuses insecure gitstore_root '/'" {
     return error.SkipZigTest;
 }
 
-test "detach rejects gitdir that escapes gitstore_root prefix" {
+test "detach rejects gitdir whose canonical form escapes gitstore_root" {
+    // CR-minor follow-up (PR #6): the test name was previously "rejects
+    // gitdir that escapes gitstore_root prefix", suggesting it exercised
+    // the textual prefix-with-slash branch in detach(). It does not — and
+    // cannot, in a unit test. The textual branch in detach() (root_norm
+    // startsWith + boundary char check) is identical to the gate already
+    // applied by isAdopted(); if isAdopted passes, the textual branch
+    // also passes. The textual branch is defense-in-depth against a
+    // TOCTOU where the .git pointer is swapped between the isAdopted
+    // read and detach()'s second read. Exercising it requires fault
+    // injection at file-read level, which is out of scope for unit tests.
+    //
+    // What this test DOES exercise (and is genuinely useful coverage):
+    // the round-5 canonicalization branch. The constructed target lives
+    // inside fake_root (so isAdopted passes via the textual path) but
+    // the target directory is never created on disk, so detach()'s
+    // realPathFile call returns FileNotFound → the canonicalization
+    // branch returns GitDirMalformed. That is the user-visible contract
+    // and is what we pin here.
     const io = testing.io;
     const gpa = testing.allocator;
     var env = try TestEnv.setup(gpa, io);
     defer env.teardown();
 
-    // Use an alternate "store" prefix that shares enough with gitstore_root
-    // to pass isAdopted (root_norm match) but on a sibling path that the
-    // strict prefix-with-slash check rejects.
-    //
-    // We instead make isAdopted pass by using gitstore_root = "/elsewhere"
-    // and a target inside it. Then we ALSO call detach with a different
-    // (real) gitstore_root that doesn't contain the target. That triggers
-    // the round-5 escape check.
-    //
-    // Simplest construction: make the real gitstore_root a sibling of the
-    // target's prefix, both >=2 chars.
     const fake_root = try std.fmt.allocPrint(gpa, "{s}/elsewhere", .{env.base});
     defer gpa.free(fake_root);
     try Dir.cwd().createDirPath(io, fake_root);
@@ -1474,33 +1481,12 @@ test "detach rejects gitdir that escapes gitstore_root prefix" {
     const repo = try std.fmt.allocPrint(gpa, "{s}/r", .{env.base});
     defer gpa.free(repo);
 
-    // Target starts with fake_root so isAdopted(..., fake_root) returns true.
+    // Target inside fake_root → isAdopted(repo, fake_root) returns true.
+    // Target dir does NOT exist → realPathFile fails → GitDirMalformed.
     const target = try std.fmt.allocPrint(gpa, "{s}/host/owner/repo/git", .{fake_root});
     defer gpa.free(target);
     try writeGitPointer(&env, repo, target);
 
-    // Now call detach with fake_root as the gitstore_root — but note the
-    // crafted target is *inside* fake_root so escape doesn't trigger here.
-    // To trigger the escape branch we need isAdopted-passing target whose
-    // canonical form leaves canonical store. Use a symlink at the host
-    // segment to redirect outside store. (See ancestor-symlink test.)
-    //
-    // For a pure-textual escape, use a target string that starts with the
-    // root prefix but has no "/" boundary after — this is the
-    // "git_src[root_norm.len] != '/'" branch. Construct a separate
-    // detach_root that is a strict prefix of target without trailing slash.
-    const sibling_root = try std.fmt.allocPrint(gpa, "{s}/elsewhe", .{env.base});
-    defer gpa.free(sibling_root);
-    try Dir.cwd().createDirPath(io, sibling_root);
-
-    // isAdopted("...elsewhere/...", sibling_root="...elsewhe") — does it
-    // pass? It checks startsWith and then '/' boundary. Since the next
-    // char is 'r' (from "elsewhere"), boundary fails → isAdopted=false.
-    // To pass isAdopted we keep using fake_root. The escape branch we
-    // exercise here is via the canonical check: if target dir doesn't
-    // exist on disk, realPathFile fails first → we still get
-    // GitDirMalformed (just via the canonicalization path, not the
-    // textual prefix path). That's still in scope for round-5.
     const r = gitstore.detach(gpa, io, repo, env.ghq_root, fake_root, false, false);
     try testing.expectError(error.GitDirMalformed, r);
 }
