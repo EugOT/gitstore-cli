@@ -43,6 +43,7 @@ async function main(): Promise<void> {
 	const toolName = payload.tool_name ?? "";
 	if (!toolName.startsWith("mcp__")) {
 		emitPostTool({ kind: "allow" });
+		return;
 	}
 
 	const text = JSON.stringify(payload.tool_response ?? "");
@@ -79,6 +80,7 @@ async function main(): Promise<void> {
 		);
 	}
 	emitPostTool({ kind: "allow" });
+	return;
 }
 
 main().catch(async (err) => {

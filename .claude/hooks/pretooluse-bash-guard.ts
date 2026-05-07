@@ -83,6 +83,7 @@ async function main(): Promise<void> {
 		tool: toolName,
 	});
 	emitPreTool({ kind: "allow" });
+	return;
 }
 
 main().catch(async (err) => {

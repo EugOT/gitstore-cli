@@ -32,6 +32,7 @@ async function main(): Promise<void> {
 	const file = payload.tool_input?.file_path ?? "";
 	if (!file.endsWith(".zig")) {
 		emitPreTool({ kind: "allow" });
+		return;
 	}
 
 	// Obtain the proposed content depending on tool shape
@@ -47,6 +48,7 @@ async function main(): Promise<void> {
 
 	if (!proposed || proposed.length === 0) {
 		emitPreTool({ kind: "allow" });
+		return;
 	}
 
 	// Dump to temp file and run zig ast-check (0.16 accepts a path)
@@ -69,6 +71,7 @@ async function main(): Promise<void> {
 		});
 	}
 	emitPreTool({ kind: "allow" });
+	return;
 }
 
 main().catch(async (err) => {

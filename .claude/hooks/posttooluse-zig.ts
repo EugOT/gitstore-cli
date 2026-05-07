@@ -51,6 +51,7 @@ async function main(): Promise<void> {
 	const file = payload.tool_input?.file_path ?? "";
 	if (!file.endsWith(".zig")) {
 		emitPostTool({ kind: "allow" });
+		return;
 	}
 
 	// zig fmt --check
@@ -104,6 +105,7 @@ async function main(): Promise<void> {
 		file,
 	});
 	emitPostTool({ kind: "allow" });
+	return;
 }
 
 main().catch(async (err) => {
