@@ -75,7 +75,7 @@ async function cleanArtifacts(root: string): Promise<void> {
  * without spinning up a real `zig build`.
  */
 export async function hashDir(dir: string): Promise<string> {
-	const glob = new Bun.Glob("*");
+	const glob = new Bun.Glob("**/*");
 	const files: string[] = [];
 	try {
 		for (const f of glob.scanSync({ cwd: dir, absolute: true })) files.push(f);
@@ -132,7 +132,7 @@ async function hashZigOut(root: string): Promise<string> {
 // case is the regression boundary for this contract (R7-4).
 export function listArtifacts(bin: string): string[] {
 	// `"*"` = top-level entries only; intentionally non-recursive.
-	const glob = new Bun.Glob("*");
+	const glob = new Bun.Glob("**/*");
 	const out: string[] = [];
 	try {
 		for (const f of glob.scanSync({ cwd: bin, absolute: true })) out.push(f);

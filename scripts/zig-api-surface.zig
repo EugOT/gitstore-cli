@@ -127,7 +127,14 @@ fn hasPubBefore(token_tags: []const std.zig.Token.Tag, tok: std.zig.Ast.TokenInd
         const t = token_tags[i];
         switch (t) {
             .keyword_pub => return true,
-            .doc_comment, .container_doc_comment => continue,
+            .doc_comment,
+            .container_doc_comment,
+            .keyword_inline,
+            .keyword_noinline,
+            .keyword_extern,
+            .keyword_export,
+            .keyword_threadlocal,
+            => continue,
             else => return false,
         }
     }
