@@ -82,11 +82,24 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	// Banned-API grep for the 0.14/0.15 → 0.16 drift
+	// Banned-API grep for the 0.14/0.15 → 0.16 drift.
+	// Strip line comments, block comments, and string literals before matching
+	// to avoid false positives on patterns that appear only in docs or strings
+	// (CR finding: raw text scan causes workflow-breaking false positives).
 	try {
-		const content = await Bun.file(file).text();
+		const raw = await Bun.file(file).text();
+		// Remove Zig block comments (//! ... \n and // ... \n), then
+		// remove string literals ("...") with a simple single-pass strip.
+		// This is intentionally heuristic — precise tokenisation requires
+		// zig ast-check which runs in the separate preflight hook.
+		const stripped = raw
+			// Remove doc-comment and line-comment lines
+			.replace(/\/\/[^\n]*/g, "")
+			// Remove string literals (single-line; does not handle escape sequences
+			// perfectly, but false-negative rate is acceptable for drift detection)
+			.replace(/"(?:[^"\\]|\\.)*"/g, '""');
 		for (const { re, fix } of BANNED_API) {
-			if (re.test(content)) {
+			if (re.test(stripped)) {
 				await appendJsonl(".claude/logs/posttool-zig.jsonl", {
 					event: "banned-api",
 					file,
