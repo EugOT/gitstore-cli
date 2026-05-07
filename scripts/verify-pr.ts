@@ -34,8 +34,11 @@ const TARGETS: ReadonlyArray<string> = [
 	"wasm32-wasi",
 ];
 
+// `Debug` mode is intentionally absent: verify-commit (which the PR tier
+// shells into above) already runs `zig build test` in Debug, so listing it
+// here repeats the same lane with zero extra coverage and inflates PR-gate
+// time. The PR tier only adds non-Debug optimisation modes on top.
 const SAFETY_MODES: ReadonlyArray<string> = [
-	"Debug",
 	"ReleaseSafe",
 	"ReleaseFast",
 	"ReleaseSmall",

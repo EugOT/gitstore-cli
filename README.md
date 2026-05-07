@@ -3,14 +3,24 @@
 <!-- badges: build, license, zig-version, zls-version go here -->
 
 A Zig 0.16 project scaffolded from
-[`zig-qm-toolkit`](../doc/ARCHITECTURE.md), with a TS/Bun-first
+[`zig-qm-toolkit`](./doc/ARCHITECTURE.md), with a TS/Bun-first
 four-tier quality gate.
+
+## Prerequisites
+
+- Zig `0.16.0` and ZLS `0.16.0` (resolved through `mise`).
+- Bun `>= 1.1.0` — every quality gate (`scripts/verify-*.ts`) runs under
+  Bun. Install via your runtime manager (e.g. `mise install bun`) and
+  confirm `bun --version`.
 
 ## Quick start
 
 ```bash
 # Pinned toolchain (chezmoi-managed mise.toml)
 mise install zig@0.16.0 zls@0.16.0
+
+# Bun (one-time; pin a version in your runtime manager)
+mise install bun
 
 # Build
 mise x zig@0.16.0 -- zig build

@@ -44,7 +44,16 @@ async function extractSurface(root: string, rootFile: string): Promise<string> {
 	// (CodeRabbit finding).
 	if (await Bun.file(scriptPath).exists()) {
 		const r = zig(["run", "scripts/zig-api-surface.zig", "--", abs]);
-		if (r.code === 0) return r.stdout.trimEnd();
+		if (r.code !== 0) {
+			// Once the authoritative extractor is wired in, a non-zero exit
+			// must be a hard failure: silently downgrading to grep/sed hides
+			// extractor regressions and produces a false "surface matches
+			// baseline" verdict from a much weaker snapshot.
+			throw new Error(
+				`scripts/zig-api-surface.zig failed (code ${r.code}): ${r.stderr || r.stdout || "<no output>"}`,
+			);
+		}
+		return r.stdout.trimEnd();
 	}
 	// Fallback: grep-and-sed. Matches lines like:
 	//   pub const Foo = ...
@@ -153,7 +162,15 @@ export async function emitDriftDiff(
 
 // Only run as a CLI when invoked directly. Importing for unit tests
 // (tests/unit/public-api-cleanup.test.ts re-using `emitDriftDiff`)
-// must not trigger a full public-API surface check.
+// must not trigger a full public-API surface check. Errors thrown from
+// `extractSurface` (e.g. an authoritative extractor failure) flow through
+// `finish(1, …)` so the verify-log entry stays consistent.
 if (import.meta.main) {
-	await main();
+	const startedAt = Date.now();
+	await main().catch(async (err) => {
+		console.error(
+			`check-public-api: ${err instanceof Error ? err.message : String(err)}`,
+		);
+		await finish(1, startedAt);
+	});
 }

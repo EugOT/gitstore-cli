@@ -1,23 +1,23 @@
 {
-  "name": "gitstore-cli",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "description": "Zig 0.16 project scaffolded from zig-qm-toolkit (TS/Bun-first quality gate).",
-  "engines": {
-    "bun": ">=1.1.0"
-  },
-  "scripts": {
-    "verify-fast": "bun scripts/verify-fast.ts",
-    "verify-commit": "bun scripts/verify-commit.ts",
-    "verify-pr": "bun scripts/verify-pr.ts",
-    "verify-release": "bun scripts/verify-release.ts",
-    "eval": "bun scripts/eval.ts",
-    "eval:check": "bun scripts/eval.ts --check",
-    "check-public-api": "bun scripts/check-public-api.ts",
-    "check-public-api:write": "bun scripts/check-public-api.ts --write"
-  },
-  "devDependencies": {
-    "bun-types": "^1.3.0"
-  }
+	"name": "gitstore-cli",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Zig 0.16 project scaffolded from zig-qm-toolkit (TS/Bun-first quality gate).",
+	"engines": {
+		"bun": ">=1.1.0"
+	},
+	"scripts": {
+		"verify-fast": "bun scripts/verify-fast.ts",
+		"verify-commit": "bun scripts/verify-commit.ts",
+		"verify-pr": "bun scripts/verify-pr.ts",
+		"verify-release": "bun scripts/verify-release.ts",
+		"eval": "bun scripts/eval.ts",
+		"eval:check": "bun scripts/eval.ts --check",
+		"check-public-api": "bun scripts/check-public-api.ts",
+		"check-public-api:write": "bun scripts/check-public-api.ts --write"
+	},
+	"devDependencies": {
+		"bun-types": "^1.3.0"
+	}
 }

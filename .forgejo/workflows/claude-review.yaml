@@ -26,7 +26,12 @@ jobs:
           fetch-depth: 0
 
       - name: Claude Code Review
-        uses: anthropics/claude-code-action@v1
+        # Pinned to the v1 immutable commit SHA per Forgejo + GitHub Actions
+        # security guidance (third-party actions must be SHA-pinned so a
+        # rewritten tag cannot inject arbitrary code). Bump along with the
+        # upstream `v1` tag and verify with
+        # `git ls-remote https://github.com/anthropics/claude-code-action.git v1`.
+        uses: anthropics/claude-code-action@cacf511db27f37088382624faf2fe2f397735494 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           mode: agent

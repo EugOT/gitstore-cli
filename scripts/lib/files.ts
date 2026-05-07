@@ -38,10 +38,26 @@ export function collectZigInputs(root = repoRoot()): {
 	if (jj.code === 0 && jj.stdout.trim().length > 0) {
 		tracked = jj.stdout.split("\n").filter((l) => l.length > 0);
 	} else {
-		const git = spawnSync(["git", "ls-files", ...existingDirs], { cwd: root });
-		if (git.code === 0 && git.stdout.trim().length > 0) {
-			tracked = git.stdout.split("\n").filter((l) => l.length > 0);
+		// `git ls-files` defaults to tracked-only, which silently skipped any
+		// freshly-added .zig file before its first commit. Combine the tracked
+		// listing with `--others --exclude-standard` so the verify pipeline
+		// fmt/ast-checks new files too while still respecting `.gitignore`.
+		const gitTracked = spawnSync(["git", "ls-files", ...existingDirs], {
+			cwd: root,
+		});
+		const gitUntracked = spawnSync(
+			["git", "ls-files", "--others", "--exclude-standard", ...existingDirs],
+			{ cwd: root },
+		);
+		const merged = new Set<string>();
+		for (const r of [gitTracked, gitUntracked]) {
+			if (r.code === 0 && r.stdout.trim().length > 0) {
+				for (const l of r.stdout.split("\n")) {
+					if (l.length > 0) merged.add(l);
+				}
+			}
 		}
+		tracked = [...merged].sort();
 	}
 
 	if (tracked.length === 0) {

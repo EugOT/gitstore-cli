@@ -3,3 +3,5 @@ zig-out/
 .omc/
 .jj
 .zig-qm/
+
+node_modules/

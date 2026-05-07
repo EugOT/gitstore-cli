@@ -1,4 +1,5 @@
-You are reviewing a pull request for the `claude-zig-quality` Zig 0.16 template repository.
+You are reviewing a pull request for the `gitstore-cli` Zig 0.16 project,
+which is scaffolded from the `zig-qm-toolkit` template.
 
 ## Context boundary
 
@@ -19,9 +20,10 @@ Verify the PR against the four-tier gate semantics:
 
 1. **Per-turn** — formatting, ast-check sanity on changed files.
 2. **Per-commit** — commit-tier gate (`bun scripts/verify-commit.ts`).
-3. **Per-PR** — full PR gate (`bun scripts/verify-pr.sh`) and public-API
-   drift (`bun scripts/check-public-api.ts`; default mode diffs against
-   the baseline at `.zig-qm/public-api.txt`).
+3. **Per-PR** — full PR gate (`./scripts/verify-pr.sh`, the shell-shim
+   that `exec bun scripts/verify-pr.ts`) and public-API drift
+   (`bun scripts/check-public-api.ts`; default mode diffs against the
+   baseline at `.zig-qm/public-api.txt`).
 4. **Per-release** — only verify boundary claims; do not run the release
    gate here.
 

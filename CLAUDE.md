@@ -1,5 +1,22 @@
 # CLAUDE.md — `gitstore-cli`
 
+> **Canonical ownership.** This repo-local `CLAUDE.md` and the entire
+> `.claude/` tree are **scaffolded artifacts** of the `zig-qm-toolkit`
+> chezmoi template (sourced from `EugOT/dotfiles`,
+> `~/.local/share/chezmoi/.chezmoitemplates/zig-qm-toolkit/`). The
+> *project-local* copy is authoritative for `gitstore-cli`-specific
+> overrides; the *chezmoi template* is authoritative for invariants. To
+> avoid silent divergence on a future `chezmoi apply`:
+>
+> 1. Edit invariants in the chezmoi template, not here, then re-scaffold
+>    with `ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=<repo-path> chezmoi apply`.
+> 2. Edit project-local overrides here; the toolkit scaffold script
+>    skips files marked `# scaffold-skip:` in their first 3 lines.
+> 3. The dotfiles `.chezmoiignore` excludes `gitstore-cli/CLAUDE.md`
+>    and `gitstore-cli/.claude/` from the unscoped `chezmoi apply`
+>    path; running it without `ZIG_QM_PROJECT` will not touch this
+>    repo.
+
 ## Why
 
 Agentic quality management for **gitstore-cli**, a Zig 0.16 project.
@@ -15,7 +32,7 @@ update the template and re-apply via the toolkit scaffold script.
   (`zig-build-system`, `zig-fuzz-target`) + task skills
   (`verify`, `release`, `api-drift`, `eval`)
 - `.claude/agents/` — three narrow subagents
-  (`zig-verifier`, `zig-fixer`, `zig-api-drift`)
+  (`zig-fuzzer`, `zig-release-engineer`, `zig-api-drift`)
 - `scripts/verify-{fast,commit,pr,release}.ts` — the four tiers
 - `scripts/zig-{api-surface,fitness}.zig`, `scripts/emit-sbom.zig` —
   Zig-native auxiliary programs
@@ -33,9 +50,13 @@ update the template and re-apply via the toolkit scaffold script.
 
 ## Quick start
 
+Bun is a hard prerequisite — every quality-gate script runs under it. Install
+it once via your runtime manager (e.g. `mise install bun` after configuring it
+through nix-darwin) and confirm `bun --version` reports `>= 1.1.0`.
+
 ```bash
 mise install zig@0.16.0 zls@0.16.0
-bun install                        # no-op v0; produces bun.lock
+bun install                        # produces bun.lock; commit it
 bun scripts/verify-fast.ts         # tier 1 (<2s)
 bun scripts/verify-commit.ts       # tier 2 (~30s)
 bun scripts/verify-pr.ts           # tier 3 (~10min)
@@ -63,9 +84,9 @@ Toolkit version is recorded in `.zig-qm/.toolkit-version` after every
 scaffold; bump it when re-applying. Re-scaffold idempotently with:
 
 ```bash
-ZIG_QM_PROJECT={{ repo path }} chezmoi apply
+ZIG_QM_PROJECT=<path/to/gitstore-cli> chezmoi apply
 # or, to overwrite existing toolkit-managed files:
-ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=... chezmoi apply
+ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=<path/to/gitstore-cli> chezmoi apply
 ```
 
 @doc/ARCHITECTURE.md

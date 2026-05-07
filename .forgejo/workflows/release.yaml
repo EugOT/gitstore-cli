@@ -1,9 +1,20 @@
 name: release
 
+# This workflow is intentionally `workflow_dispatch`-only until the real
+# Tier 4 release verification (verify-release.ts: clean rebuild,
+# reproducibility check, deep fuzz, SBOM, signed-tag dry-run) is wired in.
+# Auto-running on tag pushes used to greenlight every `v*.*.*` tag with a
+# no-op success check, which weakened the release signal exactly where the
+# repo claims it is strongest. Re-enable the `push.tags` trigger only after
+# `verify-release` runs as a real step here.
+
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to verify (informational only; the workflow does not push or sign)."
+        required: false
+        type: string
 
 jobs:
   release-placeholder:
