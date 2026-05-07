@@ -159,7 +159,7 @@ Two Forgejo workflows ship in v0, plus a release skeleton:
 - `.forgejo/workflows/release.yaml` — tag-triggered skeleton only.
   Real signing and SBOM is a separate flow (plan §0.12).
 
-No secrets are inline. Workflows reference `${{ "{{" }} secrets.ANTHROPIC_API_KEY {{ "}}" }}`
+No secrets are inline. Workflows reference `${{ secrets.ANTHROPIC_API_KEY }}`
 by name only.
 
 ## 8. Reuse story — eight follow-on languages

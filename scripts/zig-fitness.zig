@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    try w.print("{{ "{{" }}\"summary\": {{ "{{" }}\"violations\": {d}{{ "}}" }}{{ "}}" }}\n", .{violation_count});
+    try w.print("{{\"summary\": {{\"violations\": {d}}}}}\n", .{violation_count});
     try w.flush();
     return if (violation_count == 0) 0 else 1;
 }
@@ -310,7 +310,7 @@ fn emit(w: *std.Io.Writer, gpa: std.mem.Allocator, args: EmitArgs) !void {
     const message_esc = try escapeJsonString(gpa, args.message);
     defer gpa.free(message_esc);
     try w.print(
-        "{{ "{{" }}\"file\":\"{s}\",\"kind\":\"{s}\",\"line\":{d},\"message\":\"{s}\"{{ "}}" }}\n",
+        "{{\"file\":\"{s}\",\"kind\":\"{s}\",\"line\":{d},\"message\":\"{s}\"}}\n",
         .{ file_esc, kind_esc, args.line, message_esc },
     );
 }
@@ -343,7 +343,7 @@ fn emitFmt(w: *std.Io.Writer, gpa: std.mem.Allocator, args: EmitFmtArgs) !void {
     defer gpa.free(escaped_message);
     const line = try std.fmt.allocPrint(
         gpa,
-        "{{ "{{" }}\"file\":\"{s}\",\"kind\":\"{s}\",\"line\":{d},\"message\":\"{s}\"{{ "}}" }}\n",
+        "{{\"file\":\"{s}\",\"kind\":\"{s}\",\"line\":{d},\"message\":\"{s}\"}}\n",
         .{ file_esc, kind_esc, args.line, escaped_message },
     );
     defer gpa.free(line);

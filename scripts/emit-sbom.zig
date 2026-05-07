@@ -109,18 +109,18 @@ fn emitSbomDocument(
 
     // CycloneDX 1.5 envelope.
     try w.print(
-        \\{{ "{{" }}
+        \\{{
         \\  "bomFormat": "CycloneDX",
         \\  "specVersion": "1.5",
         \\  "version": 1,
-        \\  "metadata": {{ "{{" }}
-        \\    "component": {{ "{{" }}
+        \\  "metadata": {{
+        \\    "component": {{
         \\      "type": "library",
         \\      "name": "{s}",
         \\      "version": "{s}",
         \\      "bom-ref": "pkg:zig/{s}@{s}"
-        \\    {{ "}}" }}
-        \\  {{ "}}" }},
+        \\    }}
+        \\  }},
         \\  "components": [
     ,
         .{ name_esc, version_esc, name_esc, version_esc },
@@ -153,13 +153,13 @@ fn emitSbomDocument(
             first = false;
             try w.print(
                 \\
-                \\    {{ "{{" }}
+                \\    {{
                 \\      "type": "library",
                 \\      "name": "{s}",
                 \\      "bom-ref": "pkg:zig/{s}",
-                \\      "hashes": [ {{ "{{" }} "alg": "SHA-256", "content": "{s}" {{ "}}" }} ],
-                \\      "externalReferences": [ {{ "{{" }} "type": "distribution", "url": "{s}" {{ "}}" }} ]
-                \\    {{ "}}" }}
+                \\      "hashes": [ {{ "alg": "SHA-256", "content": "{s}" }} ],
+                \\      "externalReferences": [ {{ "type": "distribution", "url": "{s}" }} ]
+                \\    }}
             , .{ dep_name_esc, dep_name_esc, dep_hash_esc, dep_url_esc });
         }
     }
@@ -168,9 +168,9 @@ fn emitSbomDocument(
         \\
         \\  ],
         \\  "properties": [
-        \\    {{ "{{" }} "name": "zig:fingerprint", "value": "{s}" {{ "}}" }}
+        \\    {{ "name": "zig:fingerprint", "value": "{s}" }}
         \\  ]
-        \\{{ "}}" }}
+        \\}}
         \\
     , .{fingerprint_esc});
 }
