@@ -25,7 +25,7 @@ jobs:
         env:
           MISE_VERSION: v2025.1.0
         run: |
-          curl https://mise.run | sh
+          curl -fsSL https://mise.run | sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Install Bun
