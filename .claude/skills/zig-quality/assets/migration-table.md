@@ -52,4 +52,4 @@ row against `../references/0.16-grounded-facts.md`.
 | 43 | module-level `var` in library files | scoped owner type + `init(gpa)` | No globals outside `main.zig` / `build.zig`. |
 | 44 | `anyerror` on public API | declared named error set | Precise error set is part of the public type. |
 | 45 | `else =>` branch on public error switch | exhaustive arms | Compiler-enforced update when upstream adds variants. |
-| 46 | `catch unreachable` on I/O | `catch |err| ...` with real handling | I/O can always fail; `unreachable` is UB in release. |
+| 46 | `catch unreachable` on I/O | `catch \|err\| ...` with real handling | I/O can always fail; `unreachable` is UB in release. |

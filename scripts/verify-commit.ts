@@ -33,7 +33,7 @@ async function main(): Promise<void> {
 	const root = repoRoot();
 
 	console.log("== verify-commit -> verify-fast ==");
-	const fast = Bun.spawnSync(["bun", "scripts/verify-fast.ts"], {
+	const fast = Bun.spawnSync([process.execPath, "scripts/verify-fast.ts"], {
 		cwd: root,
 		stdout: "inherit",
 		stderr: "inherit",
@@ -63,12 +63,15 @@ async function main(): Promise<void> {
 	const libZig = Bun.file(resolve(root, "src/lib.zig"));
 	if (await libZig.exists()) {
 		console.log("== check-public-api ==");
-		const api = Bun.spawnSync(["bun", "scripts/check-public-api.ts"], {
-			cwd: root,
-			stdout: "inherit",
-			stderr: "inherit",
-			stdin: "ignore",
-		});
+		const api = Bun.spawnSync(
+			[process.execPath, "scripts/check-public-api.ts"],
+			{
+				cwd: root,
+				stdout: "inherit",
+				stderr: "inherit",
+				stdin: "ignore",
+			},
+		);
 		if (api.exitCode !== 0) await finish(api.exitCode ?? 1, startedAt);
 	} else {
 		console.log("(no src/lib.zig — skipping public API surface check)");

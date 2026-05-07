@@ -34,7 +34,7 @@ did not pass.
 4. **Deep fuzz, gated.** If `zig build -l` lists a `fuzz` step and
    the runtime reports `zig_supports_fuzz() == true`:
    - Run `zig build fuzz --summary failures --fuzz=<limit> -j<N>`
-     wrapped in a real-time budget (`$FUZZ_BUDGET`, default `2h`;
+     wrapped in a real-time budget (`FUZZ_BUDGET_SECONDS`, default `2h`;
      tag-day runs use `72h`).
    - Treat exit code 124 from the timeout wrapper as "budget elapsed,
      no crashes" — **not** a failure. Any other non-zero exit is a

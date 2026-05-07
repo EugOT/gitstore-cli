@@ -70,12 +70,23 @@ async function extractSurface(root: string, rootFile: string): Promise<string> {
 		"^[[:space:]]*pub[[:space:]]+((extern|inline|export)[[:space:]]+)?(const|fn|var|usingnamespace)\\b",
 		abs,
 	]);
-	if (grep.code !== 0) return "";
+	// grep exits 1 for "no matches" (not an error), >1 for real errors
+	if (grep.code === 1) return "";
+	if (grep.code !== 0) {
+		throw new Error(
+			`grep failed (code ${grep.code}): ${grep.stderr?.toString() ?? ""}`,
+		);
+	}
 	const sed = Bun.spawnSync(["sed", "-E", "s/[[:space:]]+/ /g"], {
 		stdin: new TextEncoder().encode(grep.stdout),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+	if (sed.exitCode !== 0) {
+		throw new Error(
+			`sed failed (code ${sed.exitCode}): ${sed.stderr?.toString() ?? ""}`,
+		);
+	}
 	return (sed.stdout?.toString() ?? "").trimEnd();
 }
 

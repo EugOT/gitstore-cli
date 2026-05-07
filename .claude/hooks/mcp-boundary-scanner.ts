@@ -47,6 +47,7 @@ async function main(): Promise<void> {
 	const toolName = payload.tool_name ?? "";
 	if (!toolName.startsWith("mcp__")) {
 		emitPostTool({ kind: "allow" });
+		return;
 	}
 
 	const text = JSON.stringify(payload.tool_response ?? "");
@@ -55,12 +56,13 @@ async function main(): Promise<void> {
 	);
 	if (ZERO_WIDTH.test(text)) detections.push("zero-width-unicode");
 
+	// Derive risk from per-detection severity: any HIGH_RISK regex match is
+	// inherently high-severity; zero-width-unicode alone is medium. Count-based
+	// escalation was incorrect — a single injection marker must immediately
+	// trigger block mode when MCP_SCAN_BLOCK=1.
+	const hasHigh = detections.some((d) => d !== "zero-width-unicode");
 	const riskLevel =
-		detections.length === 0
-			? "low"
-			: detections.length >= 2
-				? "high"
-				: "medium";
+		detections.length === 0 ? "low" : hasHigh ? "high" : "medium";
 
 	await appendJsonl(".claude/logs/mcp-scan.jsonl", {
 		event: "mcp-posttool-scan",

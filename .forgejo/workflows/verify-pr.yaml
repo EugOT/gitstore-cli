@@ -33,7 +33,7 @@ jobs:
           bun-version: latest
 
       - name: Install Zig 0.16.0 via mise
-        run: mise use -g zig@0.16.0
+        run: mise install zig@0.16.0
 
       - name: Verify Zig toolchain resolves
         run: mise x zig@0.16.0 -- zig version

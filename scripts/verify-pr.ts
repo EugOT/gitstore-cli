@@ -76,7 +76,7 @@ async function main(): Promise<void> {
 	const root = repoRoot();
 
 	console.log("== verify-pr -> verify-commit ==");
-	const commit = Bun.spawnSync(["bun", "scripts/verify-commit.ts"], {
+	const commit = Bun.spawnSync([process.execPath, "scripts/verify-commit.ts"], {
 		cwd: root,
 		stdout: "inherit",
 		stderr: "inherit",

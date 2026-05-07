@@ -159,7 +159,7 @@ async function main(): Promise<void> {
 	const root = repoRoot();
 
 	console.log("== verify-release -> verify-pr ==");
-	const pr = Bun.spawnSync(["bun", "scripts/verify-pr.ts"], {
+	const pr = Bun.spawnSync([process.execPath, "scripts/verify-pr.ts"], {
 		cwd: root,
 		stdout: "inherit",
 		stderr: "inherit",

@@ -1,6 +1,5 @@
 //! zig-api-surface — walk src/lib.zig (or any given .zig file) and emit a
-//! JSON inventory of every top-level `pub fn`, `pub const`, `pub var`,
-//! `pub usingnamespace` decl.
+//! JSON inventory of every top-level `pub fn`, `pub const`, `pub var` decl.
 //!
 //! Adapted from EugOT/gitstore-cli's scripts/zig-api-surface.zig (MIT).
 //! The logic is intentionally the same: a tiny AST walker over root decls.
@@ -134,6 +133,10 @@ fn hasPubBefore(token_tags: []const std.zig.Token.Tag, tok: std.zig.Ast.TokenInd
             .keyword_noinline,
             .doc_comment,
             .container_doc_comment,
+            // Covers `pub extern "C" fn` — the string literal "C" between
+            // `extern` and `fn` must be skipped so hasPubBefore continues
+            // walking back to find the `pub` keyword.
+            .string_literal,
             => continue,
             else => return false,
         }

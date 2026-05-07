@@ -6,6 +6,7 @@
  *
  * Only fires for .zig files. All others pass through with exit 0.
  */
+import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
@@ -45,6 +46,7 @@ async function main(): Promise<void> {
 	const file = payload.tool_input?.file_path ?? "";
 	if (!file.endsWith(".zig")) {
 		emitPreTool({ kind: "allow" });
+		return;
 	}
 
 	// Obtain the proposed POST-EDIT file content. ast-check requires complete
@@ -66,18 +68,23 @@ async function main(): Promise<void> {
 		) {
 			// Let the actual tool surface a real error (file missing, no match)
 			emitPreTool({ kind: "allow" });
+			return;
 		}
-		proposed = original!.replace(oldStr, newStr);
+		proposed = original.replace(oldStr, newStr);
 	} else if (tool === "MultiEdit") {
 		const edits = payload.tool_input?.edits ?? [];
 		const original = await readOriginalOrUndefined(file);
-		if (original === undefined) emitPreTool({ kind: "allow" });
-		let working = original!;
+		if (original === undefined) {
+			emitPreTool({ kind: "allow" });
+			return;
+		}
+		let working = original;
 		for (const e of edits) {
 			const oldStr = e.old_string ?? "";
 			const newStr = e.new_string ?? "";
 			if (oldStr.length === 0 || !working.includes(oldStr)) {
 				emitPreTool({ kind: "allow" });
+				return;
 			}
 			working = working.replace(oldStr, newStr);
 		}
@@ -86,12 +93,21 @@ async function main(): Promise<void> {
 
 	if (!proposed || proposed.length === 0) {
 		emitPreTool({ kind: "allow" });
+		return;
 	}
 
-	// Dump to temp file and run zig ast-check (0.16 accepts a path)
+	// Dump to temp file and run zig ast-check (0.16 accepts a path).
+	// Always clean up the temp file in a finally block — the hook runs before
+	// every Zig edit, so leaking one file per invocation accumulates quickly.
 	const tmp = resolve(tmpdir(), `preflight-${Date.now()}.zig`);
-	await Bun.write(tmp, proposed!);
-	const r = zig(["ast-check", tmp]);
+	let r: ReturnType<typeof zig>;
+	try {
+		await Bun.write(tmp, proposed);
+		r = zig(["ast-check", tmp]);
+	} finally {
+		// Best-effort deletion; swallow errors so cleanup never masks the verdict.
+		await unlink(tmp).catch(() => {});
+	}
 
 	await appendJsonl(".claude/logs/zig-preflight.jsonl", {
 		event: r.code === 0 ? "pass" : "fail",
@@ -116,6 +132,4 @@ main().catch(async (err) => {
 		event: "error",
 		error: String(err),
 	});
-	console.error(`pretooluse-zig-preflight: ${String(err)}`);
-	process.exit(1);
 });

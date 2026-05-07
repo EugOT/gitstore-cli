@@ -2,7 +2,7 @@
 name: zig-fuzz-target
 description: Use when writing a Zig 0.16 fuzz harness, adding fuzz steps to build.zig, designing Smith-based typed generators, or triaging a fuzzer crash. Covers std.testing.Smith generators, -j multiprocess mode, infinite mode with crash dumps, corpus persistence via FuzzInputOptions.corpus, and the differential-oracle pattern proven by squeek502/zig-std-lib-fuzzing.
 user-invocable: false
-allowed-tools: Read, Grep, Bash(zig build fuzz:*), Bash(zig build --fuzz*:*)
+allowed-tools: Read, Grep, Bash(mise x zig@0.16.0 -- zig build fuzz:*), Bash(mise x zig@0.16.0 -- zig build --fuzz*:*)
 ---
 
 # Zig 0.16 Fuzz Targets
@@ -104,7 +104,7 @@ regression becomes self-reinforcing.
 
 - `-j N` — N worker processes sharing corpus.
 - `--test-timeout 60s` — kill hangs.
-- `--fuzz --infinite` — runs forever, coverage-prioritized. Nightly 8h, release 72h.
+- `--fuzz --infinite` — runs forever, coverage-prioritized. Nightly 8h, release 2h (FUZZ_BUDGET_SECONDS default in scripts/verify-release.ts).
 
 ## What to fuzz
 
