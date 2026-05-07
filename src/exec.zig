@@ -207,6 +207,23 @@ test "buildScrubbedEnv excludes dangerous git/jj/rclone env vars" {
         "JJ_EMAIL",         "JJ_OP_HOSTNAME",       "RCLONE_CONFIG",
         "RCLONE_VERBOSE",   "GH_TOKEN",             "GITHUB_TOKEN",
     };
+
+    // Deterministic contract (CR R8.5, v0.2.2): if a forbidden key is
+    // accidentally added to env_whitelist but happens to be unset in the
+    // host env / CI runner, the runtime check below would silently pass.
+    // Pin the whitelist itself so the test fails the moment any forbidden
+    // name appears there, regardless of host env contents.
+    for (forbidden) |blocked| {
+        var found = false;
+        for (env_whitelist) |allowed| {
+            if (std.mem.eql(u8, blocked, allowed)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(!found);
+    }
+
     for (forbidden) |key| {
         try testing.expect(scrubbed.get(key) == null);
     }
