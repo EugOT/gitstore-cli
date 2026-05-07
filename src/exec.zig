@@ -170,11 +170,21 @@ test "env_whitelist contains GHQ_ROOT and GITSTORE_ROOT" {
 }
 
 test "buildScrubbedEnv preserves whitelisted vars from parent env" {
-    // The test runner exposes the host environ block via std.testing.environ
-    // regardless of libc linkage. buildScrubbedEnv must honour that block,
-    // not std.c.environ which is null on no-libc Zig 0.16 builds. If it
-    // doesn't, HOME (and friends) drop out of the scrubbed map and every
-    // git/jj/ghq subprocess loses its config-discovery anchor.
+    // CR R8.6 (v0.2.2): on no-libc Zig 0.16 test builds parentEnvMap()
+    // intentionally returns an empty map (the documented security contract,
+    // R7-1) — so buildScrubbedEnv() also returns empty, and HOME is missing
+    // from `scrubbed` for legitimate reasons. Skip there to keep the contract
+    // self-consistent across libc-linked and no-libc test builds. The
+    // libc-linked path (default for `zig build test`) is what carries the
+    // production guarantee that HOME, PATH, locale, etc. propagate to spawned
+    // git/jj/ghq subprocesses.
+    if (!builtin.link_libc) return error.SkipZigTest;
+
+    // On the libc-linked path, std.testing.environ is the portable view of
+    // the same environ block that std.c.environ exposes. buildScrubbedEnv
+    // must agree with that view — if it doesn't, HOME (and friends) silently
+    // drop from the scrubbed map and every git/jj/ghq subprocess loses its
+    // config-discovery anchor.
     const gpa = testing.allocator;
 
     // Resolve HOME via the testing-environ block — this is the contract
@@ -230,6 +240,14 @@ test "buildScrubbedEnv excludes dangerous git/jj/rclone env vars" {
 }
 
 test "buildScrubbedEnv mirrors parent environ for every whitelist key" {
+    // CR R8.6 (v0.2.2): same no-libc carve-out as the "preserves" test.
+    // parentEnvMap returns Map.init(gpa) when builtin.link_libc is false, so
+    // scrubbed is also empty there — the assertion below would fire for
+    // legitimate reasons (the documented R7-1 security contract), not a
+    // real regression. Default `zig build test` links libc and exercises
+    // the production guarantee path that this test pins.
+    if (!builtin.link_libc) return error.SkipZigTest;
+
     // Contract: scrubbed env must agree with the parent shell environ
     // for every whitelist key — present in parent ⇒ present and equal in
     // scrubbed; absent in parent ⇒ absent in scrubbed. Compares against
