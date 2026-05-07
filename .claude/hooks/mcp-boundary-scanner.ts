@@ -32,7 +32,11 @@ const HIGH_RISK: Array<{ re: RegExp; category: string }> = [
 		category: "instruction-override",
 	},
 	{ re: /<\s*system\s*>/i, category: "role-impersonation" },
-	{ re: /\bassistant\s*:\s*/i, category: "role-impersonation" },
+	// Anchored to start-of-line (multiline) + colon-space — the role-prefix
+	// shape that signals a transcript-style impersonation attempt. The looser
+	// `\bassistant\s*:` form had a high false-positive rate on YAML/Markdown
+	// (e.g. "assistant: claude" key/value lines, prose mentioning "Assistant:").
+	{ re: /^assistant:\s+/im, category: "role-impersonation" },
 	{ re: /secrets?\s*:\s*op:\/\//i, category: "secret-exfil" },
 ];
 
@@ -43,7 +47,6 @@ async function main(): Promise<void> {
 	const toolName = payload.tool_name ?? "";
 	if (!toolName.startsWith("mcp__")) {
 		emitPostTool({ kind: "allow" });
-		return;
 	}
 
 	const text = JSON.stringify(payload.tool_response ?? "");
@@ -80,7 +83,6 @@ async function main(): Promise<void> {
 		);
 	}
 	emitPostTool({ kind: "allow" });
-	return;
 }
 
 main().catch(async (err) => {

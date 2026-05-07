@@ -224,13 +224,15 @@ fn isPubFn(token_tags: []const std.zig.Token.Tag, fn_tok: std.zig.Ast.TokenIndex
         i -= 1;
         switch (token_tags[i]) {
             .keyword_pub => return true,
-            .doc_comment,
-            .container_doc_comment,
+            // Skip fn-modifier keywords so `pub inline fn`, `pub extern fn`,
+            // `pub export fn`, and `pub noinline fn` are still recognised as
+            // public functions (CEL-456 #5).
             .keyword_inline,
-            .keyword_noinline,
             .keyword_extern,
             .keyword_export,
-            .keyword_threadlocal,
+            .keyword_noinline,
+            .doc_comment,
+            .container_doc_comment,
             => continue,
             else => return false,
         }

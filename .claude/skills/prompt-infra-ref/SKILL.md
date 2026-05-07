@@ -15,7 +15,7 @@ allowed-tools: Read
 This skill is a **router**, not a knowledge dump. Each row points to one
 `.md` file in the prompt-infra corpus at:
 
-`${ZIG_QM_PROMPT_INFRA_DIR} Drive/01_🏗️Projects/2026-04-23-prompt-infra/`
+`${HOME}/Library/CloudStorage/GoogleDrive-<your-email>/My Drive/01_🏗️Projects/2026-04-23-prompt-infra/`
 
 The filenames, topics, and triggers below were inferred from titles only.
 Load a single file on demand when your task matches its triggers. `.gdoc`

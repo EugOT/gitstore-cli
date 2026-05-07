@@ -21,10 +21,23 @@ type PreToolPayload = {
 	tool_input?: {
 		file_path?: string;
 		content?: string;
+		old_string?: string;
 		new_string?: string;
-		edits?: Array<{ new_string?: string }>;
+		edits?: Array<{ old_string?: string; new_string?: string }>;
 	};
 };
+
+async function readOriginalOrUndefined(
+	path: string,
+): Promise<string | undefined> {
+	try {
+		const f = Bun.file(path);
+		if (!(await f.exists())) return undefined;
+		return await f.text();
+	} catch {
+		return undefined;
+	}
+}
 
 async function main(): Promise<void> {
 	const payload = await readStdinJson<PreToolPayload>();
@@ -32,23 +45,47 @@ async function main(): Promise<void> {
 	const file = payload.tool_input?.file_path ?? "";
 	if (!file.endsWith(".zig")) {
 		emitPreTool({ kind: "allow" });
-		return;
 	}
 
-	// Obtain the proposed content depending on tool shape
+	// Obtain the proposed POST-EDIT file content. ast-check requires complete
+	// syntactically-valid input; running it on a bare Edit/MultiEdit replacement
+	// snippet always fails because the snippet is a fragment. Apply the
+	// replacements in memory against the original file so the checker sees the
+	// merged result (CEL-452).
 	let proposed: string | undefined;
 	if (tool === "Write") {
 		proposed = payload.tool_input?.content;
 	} else if (tool === "Edit") {
-		proposed = payload.tool_input?.new_string;
+		const oldStr = payload.tool_input?.old_string ?? "";
+		const newStr = payload.tool_input?.new_string ?? "";
+		const original = await readOriginalOrUndefined(file);
+		if (
+			original === undefined ||
+			oldStr.length === 0 ||
+			!original.includes(oldStr)
+		) {
+			// Let the actual tool surface a real error (file missing, no match)
+			emitPreTool({ kind: "allow" });
+		}
+		proposed = original!.replace(oldStr, newStr);
 	} else if (tool === "MultiEdit") {
 		const edits = payload.tool_input?.edits ?? [];
-		proposed = edits.map((e) => e.new_string ?? "").join("\n");
+		const original = await readOriginalOrUndefined(file);
+		if (original === undefined) emitPreTool({ kind: "allow" });
+		let working = original!;
+		for (const e of edits) {
+			const oldStr = e.old_string ?? "";
+			const newStr = e.new_string ?? "";
+			if (oldStr.length === 0 || !working.includes(oldStr)) {
+				emitPreTool({ kind: "allow" });
+			}
+			working = working.replace(oldStr, newStr);
+		}
+		proposed = working;
 	}
 
 	if (!proposed || proposed.length === 0) {
 		emitPreTool({ kind: "allow" });
-		return;
 	}
 
 	// Dump to temp file and run zig ast-check (0.16 accepts a path)
@@ -71,7 +108,6 @@ async function main(): Promise<void> {
 		});
 	}
 	emitPreTool({ kind: "allow" });
-	return;
 }
 
 main().catch(async (err) => {

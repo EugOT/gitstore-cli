@@ -5,6 +5,7 @@
 			"Bash(rm -rf *)",
 			"Bash(git push *)",
 			"Bash(git push --force *)",
+			"Bash(git push --force-with-lease *)",
 			"Bash(git tag *)",
 			"Bash(cosign *)",
 			"Bash(chezmoi purge *)",

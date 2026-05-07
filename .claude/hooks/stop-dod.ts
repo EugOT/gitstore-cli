@@ -13,7 +13,6 @@ import {
 	appendJsonl,
 	readStdinJson,
 	repoRoot,
-	spawnSync,
 	tail,
 } from "../../scripts/lib/runtime.ts";
 
@@ -31,22 +30,39 @@ async function main(): Promise<void> {
 		process.exit(0);
 	}
 
-	const r = spawnSync(["bun", "scripts/verify-commit.ts"], {
+	// Inline Bun.spawnSync (instead of the shared runtime helper) so we can
+	// apply a hard timeout — the shared helper has no timeout knob and we
+	// don't want a wedged verify-commit to hang the Stop hook indefinitely.
+	// 30 minutes matches the Tier-3 verify-pr upper bound; commit-tier should
+	// never approach this in practice.
+	const proc = Bun.spawnSync({
+		cmd: ["bun", "scripts/verify-commit.ts"],
 		cwd: repoRoot(),
+		stderr: "pipe",
+		stdout: "pipe",
+		timeout: 30 * 60 * 1000,
 	});
+	const r = {
+		code: proc.exitCode ?? 124, // 124 mirrors GNU `timeout` exit code
+		stdout: proc.stdout?.toString() ?? "",
+		stderr: proc.stderr?.toString() ?? "",
+	};
 	await appendJsonl(".claude/logs/stop-dod.jsonl", {
 		event: r.code === 0 ? "pass" : "fail",
 		code: r.code,
 	});
 
 	if (r.code !== 0) {
-		console.log(
+		// Per Claude Code Stop-hook contract, exit 2 with stderr feedback is the
+		// robust block path. Stdout-only `decision: "block"` JSON has been
+		// unreliable across versions, making this DoD gate a silent no-op.
+		process.stderr.write(
 			JSON.stringify({
 				decision: "block",
 				reason: `Definition-of-Done gate failed (bun scripts/verify-commit.ts). Fix the failures and try again:\n${tail(r.stderr || r.stdout)}`,
-			}),
+			}) + "\n",
 		);
-		process.exit(0);
+		process.exit(2);
 	}
 	process.exit(0);
 }

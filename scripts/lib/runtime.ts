@@ -31,12 +31,28 @@ export function cpuCount(): number {
 export function repoRoot(): string {
 	const fromEnv = process.env.CLAUDE_PROJECT_DIR;
 	if (fromEnv && fromEnv.length > 0) return resolve(fromEnv);
-	const proc = Bun.spawnSync(["jj", "workspace", "root"], { stdout: "pipe" });
-	if (proc.exitCode === 0) return proc.stdout.toString().trim();
-	const git = Bun.spawnSync(["git", "rev-parse", "--show-toplevel"], {
-		stdout: "pipe",
-	});
-	if (git.exitCode === 0) return git.stdout.toString().trim();
+	// Guard `jj` lookup: if the binary is missing, Bun.spawnSync throws
+	// ENOENT instead of returning a non-zero exit code. Catch and fall
+	// through to git so consumers without jj installed still work
+	// (CEL-456 #7).
+	try {
+		const proc = Bun.spawnSync(["jj", "workspace", "root"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (proc.exitCode === 0) return proc.stdout.toString().trim();
+	} catch {
+		// jj not installed; fall through to git.
+	}
+	try {
+		const git = Bun.spawnSync(["git", "rev-parse", "--show-toplevel"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (git.exitCode === 0) return git.stdout.toString().trim();
+	} catch {
+		// git not installed either; fall back to cwd.
+	}
 	return resolve(process.cwd());
 }
 
@@ -124,18 +140,30 @@ export type SpawnResult = {
 };
 
 export function spawnSync(cmd: string[], opts: SpawnOpts = {}): SpawnResult {
-	const proc = Bun.spawnSync(cmd, {
-		cwd: opts.cwd ?? repoRoot(),
-		env: { ...process.env, ...(opts.env ?? {}) },
-		stdout: "pipe",
-		stderr: "pipe",
-		stdin: opts.stdin ?? "ignore",
-	});
-	return {
-		code: proc.exitCode,
-		stdout: proc.stdout.toString(),
-		stderr: proc.stderr.toString(),
-	};
+	// Guard against missing binaries: Bun.spawnSync throws ENOENT (rather
+	// than returning a non-zero exit code) when the executable is absent.
+	// Returning a structured failure result lets callers fall back to other
+	// tools without crashing the whole verify chain (CEL-456 #7).
+	try {
+		const proc = Bun.spawnSync(cmd, {
+			cwd: opts.cwd ?? repoRoot(),
+			env: { ...process.env, ...(opts.env ?? {}) },
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: opts.stdin ?? "ignore",
+		});
+		return {
+			code: proc.exitCode,
+			stdout: proc.stdout.toString(),
+			stderr: proc.stderr.toString(),
+		};
+	} catch (err) {
+		return {
+			code: 127,
+			stdout: "",
+			stderr: err instanceof Error ? err.message : String(err),
+		};
+	}
 }
 
 export type LogLine = Record<string, unknown> & {

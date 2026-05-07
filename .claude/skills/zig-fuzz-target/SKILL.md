@@ -13,13 +13,18 @@ deserializer, and state machine should have a fuzz target.
 
 ## Minimal fuzz target
 
+The Zig 0.16 `std.testing.fuzz` signature is `(context, testOne, options)`
+where `testOne` receives the context value and a `*Smith` generator. Use
+`smith.slice(u8, 0, N)` to draw raw bytes.
+
 ```zig
 test "fuzz: parse never crashes" {
-    try std.testing.fuzz(fuzzOne, .{});
+    try std.testing.fuzz({}, fuzzOne, .{});
 }
 
-fn fuzzOne(input: []const u8) !void {
+fn fuzzOne(_: void, smith: *std.testing.Smith) !void {
     const gpa = std.testing.allocator;
+    const input = try smith.slice(u8, 0, 4096);
     const result = parse(gpa, input) catch return;  // rejecting malformed is fine
     defer result.deinit(gpa);
 }
@@ -67,7 +72,9 @@ Per-subsystem targeting: `zig build fuzz -- <target>`.
 ## Differential-oracle pattern (highest leverage)
 
 ```zig
-fn fuzzCompare(input: []const u8) !void {
+fn fuzzCompare(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    const input = try smith.slice(u8, 0, 4096);
     const ours = decodeOurs(gpa, input) catch null;
     defer if (ours) |d| gpa.free(d);
     const theirs = decodeReference(gpa, input) catch null;
@@ -83,8 +90,10 @@ Run our code and a reference on the same bytes. Any divergence is a bug
 ## Corpus persistence
 
 ```zig
-try std.testing.fuzz(fuzzOne, .{
-    .corpus = @embedFile("testdata/fuzz-corpus.bin"),
+try std.testing.fuzz({}, fuzzOne, .{
+    // FuzzInputOptions.corpus is a slice of byte slices; one entry per
+    // seed file. Add @embedFile() entries as the corpus grows.
+    .corpus = &.{ @embedFile("testdata/fuzz-corpus.bin") },
 });
 ```
 

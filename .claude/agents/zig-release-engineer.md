@@ -2,7 +2,7 @@
 name: zig-release-engineer
 description: Runs the release gate, reproducibility checks, SBOM generation,
   and signing workflow. Use only for release preparation.
-tools: Read, Bash(bun scripts/verify-release.ts:*), Bash(cosign:*), Bash(syft:*), Bash(mise x zig@0.16.0:*), Bash(jj:*), Bash(git tag:*)
+tools: Read, Bash(bun scripts/verify-release.ts:*), Bash(cosign:*), Bash(syft:*), Bash(mise x zig@0.16.0:*), Bash(jj log:*), Bash(jj show:*), Bash(jj diff:*), Bash(jj status:*), Bash(jj op log:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Bash(git tag:*)
 model: opus
 ---
 

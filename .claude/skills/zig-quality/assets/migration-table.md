@@ -11,7 +11,7 @@ row against `../references/0.16-grounded-facts.md`.
 | 2 | `l.append(v);` | `try l.append(allocator, v);` | Per-method allocator; matches unmanaged migration. |
 | 3 | `l.deinit();` | `l.deinit(allocator);` | Same allocator that grew the list must release it. |
 | 4 | `std.heap.GeneralPurposeAllocator(.{})` | `std.heap.DebugAllocator(.{})` | Rename. GPA identity is now explicitly "debug" tier. |
-| 5 | `std.heap.ThreadSafeAllocator` wrapper | remove wrapper; use `ArenaAllocator` | `ArenaAllocator` is lock-free; wrapper declared anti-pattern. |
+| 5 | `std.heap.ThreadSafeAllocator` wrapper | use `std.heap.smp_allocator` (lock-free SMP) | `ThreadSafeAllocator` removed in 0.16; `smp_allocator` is the lock-free first-class replacement for thread-shared general-purpose allocation. |
 | 6 | `std.fs.cwd().openFile(path, .{})` | `dir.openFile(io, path, .{})` via Juicy Main preopens | `cwd()` removed; `Io` and `Dir` are injected. |
 | 7 | `file.close()` | `file.close(io)` | All file ops take `io` in 0.16. |
 | 8 | `file.reader(buffer)` | `file.reader(io, buffer)` (or `deprecatedReader`) | Writer/Reader consolidation; old form marked deprecated. |

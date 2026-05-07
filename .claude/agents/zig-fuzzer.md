@@ -3,7 +3,7 @@ name: zig-fuzzer
 description: Runs bounded fuzz campaigns and records explicit degradations on
   unsupported host/platform combinations. Use when a parser/decoder changes or
   when the user asks for a longer fuzz session.
-tools: Read, Bash(bun scripts/verify-pr.ts:*), Bash(mise x zig@0.16.0:*), Bash(jj:*)
+tools: Read, Bash(bun scripts/verify-pr.ts:*), Bash(mise x zig@0.16.0:*), Bash(jj log:*), Bash(jj show:*), Bash(jj diff:*), Bash(jj status:*), Bash(jj op log:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*)
 model: sonnet
 ---
 
