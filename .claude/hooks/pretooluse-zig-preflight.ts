@@ -106,6 +106,7 @@ async function main(): Promise<void> {
 			permissionDecision: "deny",
 			permissionDecisionReason: `zig ast-check failed on proposed edit to ${file}:\n${tail(r.stderr || r.stdout, 1500)}`,
 		});
+		return;
 	}
 	emitPreTool({ kind: "allow" });
 }

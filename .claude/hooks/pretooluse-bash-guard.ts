@@ -57,6 +57,7 @@ async function main(): Promise<void> {
 				permissionDecision: "deny",
 				permissionDecisionReason: `pretooluse-bash-guard: blocked ${re.source} in "${cmd}". Use a reversible alternative or ask the user.`,
 			});
+			return;
 		}
 	}
 
