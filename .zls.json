@@ -1,0 +1,5 @@
+{
+	"zig_exe_path": "${env:HOME}/.local/share/mise/installs/zig/0.16.0/zig",
+	"enable_build_on_save": true,
+	"build_on_save_step": "test"
+}

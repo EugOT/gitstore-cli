@@ -1,22 +1,23 @@
-//! zig-api-surface — walk src/lib.zig (or any given file) and emit a JSON
-//! inventory of every top-level `pub fn`, `pub const`, `pub var` decl.
+//! zig-api-surface — walk src/lib.zig (or any given .zig file) and emit a
+//! JSON inventory of every top-level `pub fn`, `pub const`, `pub var` decl.
+//!
+//! Adapted from EugOT/gitstore-cli's scripts/zig-api-surface.zig (MIT).
+//! The logic is intentionally the same: a tiny AST walker over root decls.
 //!
 //! Intended use:
-//!   zig run scripts/zig-api-surface.zig -- src/lib.zig > api.json
-//!   diff <(git show main:api.json) api.json     # PR gate
+//!   mise x zig@0.16.0 -- zig run scripts/zig-api-surface.zig -- src/lib.zig > api.json
+//!   diff <(git show main:.zig-qm/public-api.txt) api.txt   # PR gate
 //!
 //! Output shape (JSON array):
 //!   [
-//!     {"name": "url.parse", "kind": "fn"},
-//!     {"name": "config.Source", "kind": "const"},
+//!     {"name": "hello", "kind": "fn"},
+//!     {"name": "HelloError", "kind": "const"},
 //!     ...
 //!   ]
 //!
 //! v1 scaffolding only — enumerates pub decls at the top level of the given
 //! file. It does NOT recurse into re-exported modules; run once per module
-//! file if you need the full transitive surface. Follow-on work in the plan:
-//! walk each `pub const X = @import("x.zig")` and merge its surface under
-//! namespace `X.*`.
+//! file if you need the full transitive surface.
 
 const std = @import("std");
 
@@ -76,7 +77,6 @@ const Entry = struct { name: []const u8, kind: []const u8 };
 /// Classify a top-level decl. Returns null for non-pub decls.
 fn classifyDecl(ast: std.zig.Ast, decl_idx: std.zig.Ast.Node.Index) ?Entry {
     const tags = ast.nodes.items(.tag);
-    const datas = ast.nodes.items(.data);
     const main_tokens = ast.nodes.items(.main_token);
     const token_tags = ast.tokens.items(.tag);
 
@@ -111,14 +111,14 @@ fn classifyDecl(ast: std.zig.Ast, decl_idx: std.zig.Ast.Node.Index) ?Entry {
             if (token_tags[name_tok] != .identifier) return null;
             return .{ .name = ast.tokenSlice(name_tok), .kind = kind };
         },
-        else => {
-            _ = datas;
-            return null;
-        },
+        else => return null,
     }
 }
 
-/// Returns true if the nearest non-doc-comment token before `tok` is `pub`.
+/// Returns true if the nearest non-doc-comment, non-fn-modifier token before
+/// `tok` is `pub`. Skips `inline`/`extern`/`export`/`noinline` so that
+/// `pub inline fn`, `pub extern fn`, `pub export fn`, and `pub noinline fn`
+/// are recognised as public (CEL-456 #5).
 fn hasPubBefore(token_tags: []const std.zig.Token.Tag, tok: std.zig.Ast.TokenIndex) bool {
     if (tok == 0) return false;
     var i: usize = @as(usize, tok);
@@ -127,7 +127,17 @@ fn hasPubBefore(token_tags: []const std.zig.Token.Tag, tok: std.zig.Ast.TokenInd
         const t = token_tags[i];
         switch (t) {
             .keyword_pub => return true,
-            .doc_comment, .container_doc_comment => continue,
+            .keyword_inline,
+            .keyword_extern,
+            .keyword_export,
+            .keyword_noinline,
+            .doc_comment,
+            .container_doc_comment,
+            // Covers `pub extern "C" fn` — the string literal "C" between
+            // `extern` and `fn` must be skipped so hasPubBefore continues
+            // walking back to find the `pub` keyword.
+            .string_literal,
+            => continue,
             else => return false,
         }
     }

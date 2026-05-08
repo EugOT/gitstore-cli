@@ -1,0 +1,49 @@
+name: claude-review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: claude-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Claude review
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch review prompt (trusted source)
+        # Reviewer configuration must come from the base branch, not the PR
+        # branch, so a PR author cannot modify reviewer behavior by changing
+        # .forgejo/prompts/review.md in their PR (CR security finding).
+        run: |
+          git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }} --depth=1
+          git show origin/${{ github.base_ref }}:.forgejo/prompts/review.md > /tmp/trusted-review-prompt.md
+
+      - name: Claude Code Review
+        # Pinned to the v1 immutable commit SHA per Forgejo + GitHub Actions
+        # security guidance (third-party actions must be SHA-pinned so a
+        # rewritten tag cannot inject arbitrary code). Bump along with the
+        # upstream `v1` tag and verify with
+        # `git ls-remote https://github.com/anthropics/claude-code-action.git v1`.
+        uses: anthropics/claude-code-action@cacf511db27f37088382624faf2fe2f397735494 # v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          mode: agent
+          max_turns: 8
+          setting_sources: none
+          skills: zig-quality,zig-build-system,zig-fuzz-target
+          prompt_file: /tmp/trusted-review-prompt.md
