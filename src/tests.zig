@@ -1182,16 +1182,18 @@ test "config: load reads gitstore.root from real global git config" {
     gpa.free(before_ghq.stdout);
     defer if (saved_ghq) |s| gpa.free(s);
 
-    // Set a unique sentinel value.
-    try gitSet(gpa, io, "gitstore.root", "/gitstore_unit_test_sentinel_root");
-    gitUnset(gpa, io, "ghq.root");
-
+    // Register cleanup before any destructive write so a failure
+    // during setup still restores the user's global git config.
     defer {
         gitUnset(gpa, io, "gitstore.root");
         gitUnset(gpa, io, "ghq.root");
         if (saved_gs) |s| gitSet(gpa, io, "gitstore.root", s) catch {};
         if (saved_ghq) |s| gitSet(gpa, io, "ghq.root", s) catch {};
     }
+
+    // Set a unique sentinel value.
+    try gitSet(gpa, io, "gitstore.root", "/gitstore_unit_test_sentinel_root");
+    gitUnset(gpa, io, "ghq.root");
 
     var env_map: std.process.Environ.Map = .init(gpa);
     defer env_map.deinit();
@@ -1229,15 +1231,17 @@ test "config: load falls back to ghq.root and flags legacy" {
     gpa.free(before_ghq.stdout);
     defer if (saved_ghq) |s| gpa.free(s);
 
-    gitUnset(gpa, io, "gitstore.root");
-    try gitSet(gpa, io, "ghq.root", "/ghq_legacy_test_sentinel_root");
-
+    // Register cleanup before any destructive write so a failure
+    // during setup still restores the user's global git config.
     defer {
         gitUnset(gpa, io, "ghq.root");
         gitUnset(gpa, io, "gitstore.root");
         if (saved_gs) |s| gitSet(gpa, io, "gitstore.root", s) catch {};
         if (saved_ghq) |s| gitSet(gpa, io, "ghq.root", s) catch {};
     }
+
+    gitUnset(gpa, io, "gitstore.root");
+    try gitSet(gpa, io, "ghq.root", "/ghq_legacy_test_sentinel_root");
 
     var env_map: std.process.Environ.Map = .init(gpa);
     defer env_map.deinit();
