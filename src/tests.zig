@@ -27,30 +27,59 @@ const config = @import("config.zig");
 
 // ===== Test helpers =====
 
-/// Monotonic per-process counter mixed into temp-path names so two setups in
-/// the same clock tick (or on different threads, where the stack-local entropy
-/// marker resolves to the same address) never collide on the same `/tmp` path.
-/// `@intFromPtr(&marker)` alone is a fixed stack slot per call-site, so without
-/// this counter uniqueness depended solely on clock resolution — two tests in
-/// one tick could share a dir and `deleteTree` could nuke another test's dir.
-var temp_path_seq: usize = 0;
-
-/// Allocate a collision-resistant `/tmp` path. `prefix` is the leading name
-/// segment (no trailing separators); `suffix` is appended verbatim (e.g. a
-/// file extension, or "" for a directory). Uniqueness sources, strongest
-/// first: a monotonic atomic counter (per-process), the thread id (per
-/// concurrent test thread), the real-clock nanoseconds, and a stack-local
-/// pointer. Caller owns the returned slice.
-fn uniqueTempPath(gpa: Allocator, io: Io, prefix: []const u8, suffix: []const u8) ![]u8 {
+fn tempPathCandidate(gpa: Allocator, io: Io, prefix: []const u8, suffix: []const u8, attempt: u32) ![]u8 {
     var entropy_marker: u8 = undefined;
-    const seq = @atomicRmw(usize, &temp_path_seq, .Add, 1, .monotonic);
     const tid = std.Thread.getCurrentId();
     const ns = Io.Clock.real.now(io).nanoseconds;
     return std.fmt.allocPrint(
         gpa,
-        "{s}_{d}_{d}_{d}_{x}{s}",
-        .{ prefix, seq, tid, ns, @intFromPtr(&entropy_marker), suffix },
+        "{s}_{d}_{d}_{x}{s}",
+        .{ prefix, attempt, tid ^ @as(u64, @intCast(ns)), @intFromPtr(&entropy_marker), suffix },
     );
+}
+
+/// Reserve a collision-resistant `/tmp` directory. Exclusive creation is the
+/// load-bearing safety property: if another test process chooses the same path,
+/// it gets `PathAlreadyExists` and retries instead of deleting shared state.
+fn uniqueTempDir(gpa: Allocator, io: Io, prefix: []const u8) ![]u8 {
+    var attempt: u32 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        const path = try tempPathCandidate(gpa, io, prefix, "", attempt);
+        Dir.cwd().createDir(io, path, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                gpa.free(path);
+                continue;
+            },
+            else => |e| {
+                gpa.free(path);
+                return e;
+            },
+        };
+        return path;
+    }
+    return error.PathAlreadyExists;
+}
+
+/// Reserve a collision-resistant empty file and return its path. The caller may
+/// write through normal APIs and is responsible for deleting the file.
+fn uniqueTempFile(gpa: Allocator, io: Io, prefix: []const u8, suffix: []const u8) ![]u8 {
+    var attempt: u32 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        const path = try tempPathCandidate(gpa, io, prefix, suffix, attempt);
+        var file = Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                gpa.free(path);
+                continue;
+            },
+            else => |e| {
+                gpa.free(path);
+                return e;
+            },
+        };
+        file.close(io);
+        return path;
+    }
+    return error.PathAlreadyExists;
 }
 
 const TestEnv = struct {
@@ -61,14 +90,12 @@ const TestEnv = struct {
     io: Io,
 
     fn setup(gpa: Allocator, io: Io) !TestEnv {
-        const base = try uniqueTempPath(gpa, io, "/tmp/gitstore_test_env", "");
+        const base = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_env");
         errdefer gpa.free(base);
         const ghq = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
         errdefer gpa.free(ghq);
         const store = try std.fmt.allocPrint(gpa, "{s}/gitstore", .{base});
         errdefer gpa.free(store);
-
-        Dir.cwd().deleteTree(io, base) catch {};
 
         try Dir.cwd().createDirPath(io, ghq);
         try Dir.cwd().createDirPath(io, store);
@@ -1152,7 +1179,7 @@ test "config: fuzz resolvePrecedence is total" {
 // =========================================================
 
 fn tempGitConfigPath(gpa: Allocator, io: Io) ![]u8 {
-    return uniqueTempPath(gpa, io, "/tmp/gitstore_config_test", ".gitconfig");
+    return uniqueTempFile(gpa, io, "/tmp/gitstore_config_test", ".gitconfig");
 }
 
 /// Run `git config --unset <key>` against a test-local config file.
