@@ -27,6 +27,32 @@ const config = @import("config.zig");
 
 // ===== Test helpers =====
 
+/// Monotonic per-process counter mixed into temp-path names so two setups in
+/// the same clock tick (or on different threads, where the stack-local entropy
+/// marker resolves to the same address) never collide on the same `/tmp` path.
+/// `@intFromPtr(&marker)` alone is a fixed stack slot per call-site, so without
+/// this counter uniqueness depended solely on clock resolution — two tests in
+/// one tick could share a dir and `deleteTree` could nuke another test's dir.
+var temp_path_seq: usize = 0;
+
+/// Allocate a collision-resistant `/tmp` path. `prefix` is the leading name
+/// segment (no trailing separators); `suffix` is appended verbatim (e.g. a
+/// file extension, or "" for a directory). Uniqueness sources, strongest
+/// first: a monotonic atomic counter (per-process), the thread id (per
+/// concurrent test thread), the real-clock nanoseconds, and a stack-local
+/// pointer. Caller owns the returned slice.
+fn uniqueTempPath(gpa: Allocator, io: Io, prefix: []const u8, suffix: []const u8) ![]u8 {
+    var entropy_marker: u8 = undefined;
+    const seq = @atomicRmw(usize, &temp_path_seq, .Add, 1, .monotonic);
+    const tid = std.Thread.getCurrentId();
+    const ns = Io.Clock.real.now(io).nanoseconds;
+    return std.fmt.allocPrint(
+        gpa,
+        "{s}_{d}_{d}_{d}_{x}{s}",
+        .{ prefix, seq, tid, ns, @intFromPtr(&entropy_marker), suffix },
+    );
+}
+
 const TestEnv = struct {
     base: []const u8,
     ghq_root: []const u8,
@@ -35,13 +61,7 @@ const TestEnv = struct {
     io: Io,
 
     fn setup(gpa: Allocator, io: Io) !TestEnv {
-        var entropy_marker: u8 = undefined;
-        const ns = Io.Clock.real.now(io).nanoseconds;
-        const base = try std.fmt.allocPrint(
-            gpa,
-            "/tmp/gitstore_test_env_{d}_{x}",
-            .{ ns, @intFromPtr(&entropy_marker) },
-        );
+        const base = try uniqueTempPath(gpa, io, "/tmp/gitstore_test_env", "");
         errdefer gpa.free(base);
         const ghq = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
         errdefer gpa.free(ghq);
@@ -1132,13 +1152,7 @@ test "config: fuzz resolvePrecedence is total" {
 // =========================================================
 
 fn tempGitConfigPath(gpa: Allocator, io: Io) ![]u8 {
-    var entropy_marker: u8 = undefined;
-    const ns = Io.Clock.real.now(io).nanoseconds;
-    return std.fmt.allocPrint(
-        gpa,
-        "/tmp/gitstore_config_test_{d}_{x}.gitconfig",
-        .{ ns, @intFromPtr(&entropy_marker) },
-    );
+    return uniqueTempPath(gpa, io, "/tmp/gitstore_config_test", ".gitconfig");
 }
 
 /// Run `git config --unset <key>` against a test-local config file.
