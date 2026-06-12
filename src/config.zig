@@ -80,8 +80,16 @@ fn parseBool(s: []const u8) bool {
 /// absent (non-zero exit) or if its value is empty after trimming.
 ///
 /// Caller owns returned memory.
-fn gitConfigGet(gpa: Allocator, io: Io, key: []const u8) LoadError!?[]u8 {
-    var result = try exec.exec(gpa, io, &.{ "git", "config", "--global", "--get", key }, null);
+fn gitConfigGet(
+    gpa: Allocator,
+    io: Io,
+    key: []const u8,
+    config_file: ?[]const u8,
+) LoadError!?[]u8 {
+    const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get", key } else undefined;
+    const global_argv = [_][]const u8{ "git", "config", "--global", "--get", key };
+    const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
+    var result = try exec.exec(gpa, io, argv, null);
     defer gpa.free(result.stderr);
     if (!result.succeeded()) {
         gpa.free(result.stdout);
@@ -140,9 +148,10 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     var used_legacy = false;
 
     // --- root ---
-    const gitstore_root_raw = try gitConfigGet(gpa, io, "gitstore.root");
+    const config_file = env.get("GIT_CONFIG_GLOBAL");
+    const gitstore_root_raw = try gitConfigGet(gpa, io, "gitstore.root", config_file);
     defer if (gitstore_root_raw) |v| gpa.free(v);
-    const ghq_root_raw = try gitConfigGet(gpa, io, "ghq.root");
+    const ghq_root_raw = try gitConfigGet(gpa, io, "ghq.root", config_file);
     defer if (ghq_root_raw) |v| gpa.free(v);
     const env_gitstore_root = env.get("GITSTORE_ROOT");
     const env_ghq_root = env.get("GHQ_ROOT");
@@ -168,9 +177,9 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     if (root_res.source == .ghq) used_legacy = true;
 
     // --- user ---
-    const gitstore_user_raw = try gitConfigGet(gpa, io, "gitstore.user");
+    const gitstore_user_raw = try gitConfigGet(gpa, io, "gitstore.user", config_file);
     defer if (gitstore_user_raw) |v| gpa.free(v);
-    const ghq_user_raw = try gitConfigGet(gpa, io, "ghq.user");
+    const ghq_user_raw = try gitConfigGet(gpa, io, "ghq.user", config_file);
     defer if (ghq_user_raw) |v| gpa.free(v);
     const gh_user_raw = try ghUser(gpa, io);
     defer if (gh_user_raw) |v| gpa.free(v);
@@ -189,9 +198,9 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     }
 
     // --- defaultHost ---
-    const gitstore_host_raw = try gitConfigGet(gpa, io, "gitstore.defaultHost");
+    const gitstore_host_raw = try gitConfigGet(gpa, io, "gitstore.defaultHost", config_file);
     defer if (gitstore_host_raw) |v| gpa.free(v);
-    const ghq_host_raw = try gitConfigGet(gpa, io, "ghq.defaultHost");
+    const ghq_host_raw = try gitConfigGet(gpa, io, "ghq.defaultHost", config_file);
     defer if (ghq_host_raw) |v| gpa.free(v);
     const host_res = resolvePrecedence(
         gitstore_host_raw,
@@ -206,22 +215,22 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     if (host_res.source == .ghq) used_legacy = true;
 
     // --- completeUser ---
-    const gitstore_cu_raw = try gitConfigGet(gpa, io, "gitstore.completeUser");
+    const gitstore_cu_raw = try gitConfigGet(gpa, io, "gitstore.completeUser", config_file);
     defer if (gitstore_cu_raw) |v| gpa.free(v);
-    const ghq_cu_raw = try gitConfigGet(gpa, io, "ghq.completeUser");
+    const ghq_cu_raw = try gitConfigGet(gpa, io, "ghq.completeUser", config_file);
     defer if (ghq_cu_raw) |v| gpa.free(v);
     const cu_res = resolvePrecedence(gitstore_cu_raw, ghq_cu_raw, null, "true");
     const complete_user = parseBool(cu_res.value);
     if (cu_res.source == .ghq) used_legacy = true;
 
     // --- adoptOnClone (no ghq fallback) ---
-    const gitstore_aoc_raw = try gitConfigGet(gpa, io, "gitstore.adoptOnClone");
+    const gitstore_aoc_raw = try gitConfigGet(gpa, io, "gitstore.adoptOnClone", config_file);
     defer if (gitstore_aoc_raw) |v| gpa.free(v);
     const aoc_res = resolvePrecedence(gitstore_aoc_raw, null, null, "true");
     const adopt_on_clone = parseBool(aoc_res.value);
 
     // --- jjColocate (no ghq fallback) ---
-    const gitstore_jj_raw = try gitConfigGet(gpa, io, "gitstore.jjColocate");
+    const gitstore_jj_raw = try gitConfigGet(gpa, io, "gitstore.jjColocate", config_file);
     defer if (gitstore_jj_raw) |v| gpa.free(v);
     const jj_res = resolvePrecedence(gitstore_jj_raw, null, null, "true");
     const jj_colocate = parseBool(jj_res.value);
@@ -264,12 +273,27 @@ pub fn resolveRootForUrl(
     url: []const u8,
     base: Config,
 ) LoadError![]u8 {
+    return resolveRootForUrlWithConfigFile(gpa, io, url, base, null);
+}
+
+/// Testable variant of `resolveRootForUrl` that reads a specific git config
+/// file instead of the ambient global config.
+pub fn resolveRootForUrlWithConfigFile(
+    gpa: Allocator,
+    io: Io,
+    url: []const u8,
+    base: Config,
+    config_file: ?[]const u8,
+) LoadError![]u8 {
     // git config --get-urlmatch <key> <url>
     {
+        const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "gitstore.root", url } else undefined;
+        const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "gitstore.root", url };
+        const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
         var result = try exec.exec(
             gpa,
             io,
-            &.{ "git", "config", "--global", "--get-urlmatch", "gitstore.root", url },
+            argv,
             null,
         );
         defer gpa.free(result.stderr);
@@ -286,10 +310,13 @@ pub fn resolveRootForUrl(
     }
 
     {
+        const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "ghq.root", url } else undefined;
+        const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "ghq.root", url };
+        const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
         var result = try exec.exec(
             gpa,
             io,
-            &.{ "git", "config", "--global", "--get-urlmatch", "ghq.root", url },
+            argv,
             null,
         );
         defer gpa.free(result.stderr);

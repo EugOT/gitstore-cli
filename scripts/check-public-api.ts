@@ -17,7 +17,7 @@
  *
  * Exit codes:
  *   0 — surface matches baseline, or baseline written, or no root exists
- *   1 — drift detected; unified diff printed on stdout
+ *   1 — drift detected, missing baseline, or extractor failure
  */
 import { rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -120,9 +120,15 @@ async function main(): Promise<void> {
 
 	const baselineFile = Bun.file(absBaseline);
 	if (!(await baselineFile.exists())) {
-		console.log("(no public API baseline; current surface follows)");
-		console.log(current);
-		await finish(0, startedAt);
+		console.error(
+			`check-public-api: missing public API baseline at ${baselinePath}`,
+		);
+		console.error(
+			"check-public-api: run `bun scripts/check-public-api.ts --write` after recording an observation stamp, then commit the baseline",
+		);
+		console.error("check-public-api: current surface follows");
+		console.error(current);
+		await finish(1, startedAt);
 	}
 
 	const baseline = (await baselineFile.text()).trimEnd();

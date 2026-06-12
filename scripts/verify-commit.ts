@@ -60,6 +60,18 @@ async function main(): Promise<void> {
 		await finish(test.code ?? 1, startedAt);
 	}
 
+	console.log("== zig-fitness (src) ==");
+	const fitness = zig(["run", "scripts/zig-fitness.zig", "--", "src"]);
+	process.stdout.write(fitness.stdout);
+	process.stderr.write(fitness.stderr);
+	if (fitness.code !== 0) {
+		console.error(
+			`verify-commit: zig-fitness failed (exit ${fitness.code ?? "?"})`,
+		);
+		console.error(tail(fitness.stderr || fitness.stdout));
+		await finish(fitness.code ?? 1, startedAt);
+	}
+
 	const libZig = Bun.file(resolve(root, "src/lib.zig"));
 	if (await libZig.exists()) {
 		console.log("== check-public-api ==");

@@ -2,6 +2,8 @@ zig-out/
 .zig-cache/
 .omc/
 .jj
-.zig-qm/
+.zig-qm/*
+!.zig-qm/.toolkit-version
+!.zig-qm/public-api.txt
 
 node_modules/

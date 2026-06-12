@@ -26,17 +26,6 @@ comptime {
 const config = @import("config.zig");
 
 // ===== Test helpers =====
-var test_env_counter = std.atomic.Value(u64).init(0);
-
-/// Suppress stdout output from gitstore functions during tests
-/// to prevent interleaving with the test runner.
-fn suppressOutput() void {
-    gitstore.quiet = true;
-}
-
-fn restoreOutput() void {
-    gitstore.quiet = false;
-}
 
 const TestEnv = struct {
     base: []const u8,
@@ -46,11 +35,13 @@ const TestEnv = struct {
     io: Io,
 
     fn setup(gpa: Allocator, io: Io) !TestEnv {
-        suppressOutput();
-
-        const seq = test_env_counter.fetchAdd(1, .monotonic);
+        var entropy_marker: u8 = undefined;
         const ns = Io.Clock.real.now(io).nanoseconds;
-        const base = try std.fmt.allocPrint(gpa, "/tmp/gitstore_test_env_{d}_{d}", .{ ns, seq });
+        const base = try std.fmt.allocPrint(
+            gpa,
+            "/tmp/gitstore_test_env_{d}_{x}",
+            .{ ns, @intFromPtr(&entropy_marker) },
+        );
         errdefer gpa.free(base);
         const ghq = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
         errdefer gpa.free(ghq);
@@ -76,7 +67,6 @@ const TestEnv = struct {
         self.gpa.free(self.base);
         self.gpa.free(self.ghq_root);
         self.gpa.free(self.gitstore_root);
-        restoreOutput();
     }
 
     /// Create a git repo at ghq_root/org/name with an initial commit.
@@ -1136,20 +1126,30 @@ test "config: fuzz resolvePrecedence is total" {
 }
 
 // =========================================================
-// config: load — shells out to real `git config`. Because git honors the
-// ambient process env (HOME) — not env_map — these tests mutate the real
-// global git config and restore it via defer. Tests run serially.
+// config: load — shells out to real `git config`, but each test uses a
+// temporary config file through the config loader test seam so randomized
+// test order cannot mutate or observe the user's real global config.
 // =========================================================
 
-/// Run `git config --unset <key>` globally; ignore errors (key may be unset).
-fn gitUnset(gpa: Allocator, io: Io, key: []const u8) void {
-    const r = ex.exec(gpa, io, &.{ "git", "config", "--global", "--unset-all", key }, null) catch return;
+fn tempGitConfigPath(gpa: Allocator, io: Io) ![]u8 {
+    var entropy_marker: u8 = undefined;
+    const ns = Io.Clock.real.now(io).nanoseconds;
+    return std.fmt.allocPrint(
+        gpa,
+        "/tmp/gitstore_config_test_{d}_{x}.gitconfig",
+        .{ ns, @intFromPtr(&entropy_marker) },
+    );
+}
+
+/// Run `git config --unset <key>` against a test-local config file.
+fn gitUnsetFile(gpa: Allocator, io: Io, config_path: []const u8, key: []const u8) void {
+    const r = ex.exec(gpa, io, &.{ "git", "config", "--file", config_path, "--unset-all", key }, null) catch return;
     gpa.free(r.stdout);
     gpa.free(r.stderr);
 }
 
-fn gitSet(gpa: Allocator, io: Io, key: []const u8, value: []const u8) !void {
-    const r = try ex.exec(gpa, io, &.{ "git", "config", "--global", key, value }, null);
+fn gitSetFile(gpa: Allocator, io: Io, config_path: []const u8, key: []const u8, value: []const u8) !void {
+    const r = try ex.exec(gpa, io, &.{ "git", "config", "--file", config_path, key, value }, null);
     defer {
         gpa.free(r.stdout);
         gpa.free(r.stderr);
@@ -1161,44 +1161,17 @@ test "config: load reads gitstore.root from real global git config" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    // Snapshot existing values so we can restore.
-    const before_gs = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "gitstore.root" }, null);
-    defer gpa.free(before_gs.stderr);
-    const had_gs = before_gs.succeeded();
-    const saved_gs: ?[]const u8 = if (had_gs)
-        try gpa.dupe(u8, ex.trimTrailingNewline(before_gs.stdout))
-    else
-        null;
-    gpa.free(before_gs.stdout);
-    defer if (saved_gs) |s| gpa.free(s);
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
 
-    const before_ghq = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "ghq.root" }, null);
-    defer gpa.free(before_ghq.stderr);
-    const had_ghq = before_ghq.succeeded();
-    const saved_ghq: ?[]const u8 = if (had_ghq)
-        try gpa.dupe(u8, ex.trimTrailingNewline(before_ghq.stdout))
-    else
-        null;
-    gpa.free(before_ghq.stdout);
-    defer if (saved_ghq) |s| gpa.free(s);
-
-    // Register cleanup before any destructive write so a failure
-    // during setup still restores the user's global git config.
-    defer {
-        gitUnset(gpa, io, "gitstore.root");
-        gitUnset(gpa, io, "ghq.root");
-        if (saved_gs) |s| gitSet(gpa, io, "gitstore.root", s) catch {};
-        if (saved_ghq) |s| gitSet(gpa, io, "ghq.root", s) catch {};
-    }
-
-    // Set a unique sentinel value.
-    try gitSet(gpa, io, "gitstore.root", "/gitstore_unit_test_sentinel_root");
-    gitUnset(gpa, io, "ghq.root");
+    try gitSetFile(gpa, io, config_path, "gitstore.root", "/gitstore_unit_test_sentinel_root");
 
     var env_map: std.process.Environ.Map = .init(gpa);
     defer env_map.deinit();
     // Intentionally do NOT set HOME so default path formula is distinct.
     try env_map.put("HOME", "/nonexistent_test_home");
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
 
     var cfg = try config.load(gpa, io, &env_map);
     defer cfg.deinit(gpa);
@@ -1211,41 +1184,16 @@ test "config: load falls back to ghq.root and flags legacy" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const before_gs = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "gitstore.root" }, null);
-    defer gpa.free(before_gs.stderr);
-    const had_gs = before_gs.succeeded();
-    const saved_gs: ?[]const u8 = if (had_gs)
-        try gpa.dupe(u8, ex.trimTrailingNewline(before_gs.stdout))
-    else
-        null;
-    gpa.free(before_gs.stdout);
-    defer if (saved_gs) |s| gpa.free(s);
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
 
-    const before_ghq = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "ghq.root" }, null);
-    defer gpa.free(before_ghq.stderr);
-    const had_ghq = before_ghq.succeeded();
-    const saved_ghq: ?[]const u8 = if (had_ghq)
-        try gpa.dupe(u8, ex.trimTrailingNewline(before_ghq.stdout))
-    else
-        null;
-    gpa.free(before_ghq.stdout);
-    defer if (saved_ghq) |s| gpa.free(s);
-
-    // Register cleanup before any destructive write so a failure
-    // during setup still restores the user's global git config.
-    defer {
-        gitUnset(gpa, io, "ghq.root");
-        gitUnset(gpa, io, "gitstore.root");
-        if (saved_gs) |s| gitSet(gpa, io, "gitstore.root", s) catch {};
-        if (saved_ghq) |s| gitSet(gpa, io, "ghq.root", s) catch {};
-    }
-
-    gitUnset(gpa, io, "gitstore.root");
-    try gitSet(gpa, io, "ghq.root", "/ghq_legacy_test_sentinel_root");
+    try gitSetFile(gpa, io, config_path, "ghq.root", "/ghq_legacy_test_sentinel_root");
 
     var env_map: std.process.Environ.Map = .init(gpa);
     defer env_map.deinit();
     try env_map.put("HOME", "/nonexistent_test_home");
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
 
     var cfg = try config.load(gpa, io, &env_map);
     defer cfg.deinit(gpa);
@@ -1258,37 +1206,15 @@ test "config: load uses env GITSTORE_ROOT when no git config set" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const before_gs = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "gitstore.root" }, null);
-    defer gpa.free(before_gs.stderr);
-    const had_gs = before_gs.succeeded();
-    const saved_gs: ?[]const u8 = if (had_gs)
-        try gpa.dupe(u8, ex.trimTrailingNewline(before_gs.stdout))
-    else
-        null;
-    gpa.free(before_gs.stdout);
-    defer if (saved_gs) |s| gpa.free(s);
-
-    const before_ghq = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", "ghq.root" }, null);
-    defer gpa.free(before_ghq.stderr);
-    const had_ghq = before_ghq.succeeded();
-    const saved_ghq: ?[]const u8 = if (had_ghq)
-        try gpa.dupe(u8, ex.trimTrailingNewline(before_ghq.stdout))
-    else
-        null;
-    gpa.free(before_ghq.stdout);
-    defer if (saved_ghq) |s| gpa.free(s);
-
-    gitUnset(gpa, io, "gitstore.root");
-    gitUnset(gpa, io, "ghq.root");
-
-    defer {
-        if (saved_gs) |s| gitSet(gpa, io, "gitstore.root", s) catch {};
-        if (saved_ghq) |s| gitSet(gpa, io, "ghq.root", s) catch {};
-    }
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
 
     var env_map: std.process.Environ.Map = .init(gpa);
     defer env_map.deinit();
     try env_map.put("HOME", "/nonexistent_test_home");
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
     try env_map.put("GITSTORE_ROOT", "/from/env/gitstore");
 
     var cfg = try config.load(gpa, io, &env_map);
@@ -1306,9 +1232,11 @@ test "config: resolveRootForUrl falls back to base.root when no pattern matches"
     const gpa = testing.allocator;
     const io = testing.io;
 
-    // Snapshot+scrub any pre-existing url-pattern key for a sentinel URL
-    // we know the user won't have real config for.
     const sentinel_url = "https://gitstore-test.invalid/unused/sentinel";
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
 
     var owned: std.ArrayList([]const u8) = .empty;
     defer owned.deinit(gpa);
@@ -1323,7 +1251,7 @@ test "config: resolveRootForUrl falls back to base.root when no pattern matches"
         .owned_strings = owned,
     };
 
-    const unmatched = try config.resolveRootForUrl(gpa, io, sentinel_url, base);
+    const unmatched = try config.resolveRootForUrlWithConfigFile(gpa, io, sentinel_url, base, config_path);
     defer gpa.free(unmatched);
     try testing.expectEqualStrings("/fallback/root", unmatched);
 }
@@ -1335,22 +1263,11 @@ test "config: resolveRootForUrl prefers matching gitstore.<url>.root urlmatch" {
     const test_url = "https://gitstore-urlmatch-test.invalid/acme/widget";
     const pattern_key = "gitstore.https://gitstore-urlmatch-test.invalid/acme/.root";
 
-    // Snapshot and restore around the test.
-    const before = try ex.exec(gpa, io, &.{ "git", "config", "--global", "--get", pattern_key }, null);
-    defer gpa.free(before.stderr);
-    const had = before.succeeded();
-    const saved: ?[]const u8 = if (had)
-        try gpa.dupe(u8, ex.trimTrailingNewline(before.stdout))
-    else
-        null;
-    gpa.free(before.stdout);
-    defer if (saved) |s| gpa.free(s);
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
 
-    try gitSet(gpa, io, pattern_key, "/per-org/acme");
-    defer {
-        gitUnset(gpa, io, pattern_key);
-        if (saved) |s| gitSet(gpa, io, pattern_key, s) catch {};
-    }
+    try gitSetFile(gpa, io, config_path, pattern_key, "/per-org/acme");
 
     var owned: std.ArrayList([]const u8) = .empty;
     defer owned.deinit(gpa);
@@ -1365,7 +1282,7 @@ test "config: resolveRootForUrl prefers matching gitstore.<url>.root urlmatch" {
         .owned_strings = owned,
     };
 
-    const matched = try config.resolveRootForUrl(gpa, io, test_url, base);
+    const matched = try config.resolveRootForUrlWithConfigFile(gpa, io, test_url, base, config_path);
     defer gpa.free(matched);
     try testing.expectEqualStrings("/per-org/acme", matched);
 }

@@ -1,0 +1,8 @@
+{
+  "violations": [
+    {
+      "kind": "top-level-var",
+      "line": 3
+    }
+  ]
+}

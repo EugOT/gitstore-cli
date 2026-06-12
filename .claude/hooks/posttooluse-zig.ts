@@ -34,7 +34,7 @@ const BANNED_API: Array<{ re: RegExp; fix: string }> = [
 	},
 	{
 		re: /std\.io\.getStdOut\s*\(\)/,
-		fix: "Use std.fs.File.stdout() returning a writer that takes Io in 0.16",
+		fix: "Use std.Io.File.stdout() returning a writer that takes Io in 0.16",
 	},
 	{
 		re: /\bThread\.Pool\b/,

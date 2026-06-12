@@ -1,0 +1,5 @@
+{
+  "zig-quality": {
+    "min_pass_rate": 1.0
+  }
+}

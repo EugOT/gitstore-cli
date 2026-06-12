@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Dir = std.Io.Dir;
 const File = std.Io.File;
@@ -17,11 +18,8 @@ pub const Error = error{
     Dir.DeleteTreeError || Dir.OpenError || Dir.CreateDirPathError ||
     File.OpenError || File.StatError || Dir.ReadFileAllocError;
 
-/// Set to true to suppress stdout output (used during tests).
-pub var quiet: bool = false;
-
 fn info(io: Io, comptime fmt: []const u8, args: anytype) void {
-    if (quiet) return;
+    if (builtin.is_test) return;
     var buf: [8192]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &buf);
     w.interface.print(fmt, args) catch {};

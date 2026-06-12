@@ -1,33 +1,50 @@
 name: release
 
-# This workflow is intentionally `workflow_dispatch`-only until the real
-# Tier 4 release verification (verify-release.ts: clean rebuild,
-# reproducibility check, deep fuzz, SBOM, signed-tag dry-run) is wired in.
-# Auto-running on tag pushes used to greenlight every `v*.*.*` tag with a
-# no-op success check, which weakened the release signal exactly where the
-# repo claims it is strongest. Re-enable the `push.tags` trigger only after
-# `verify-release` runs as a real step here.
-
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to verify (informational only; the workflow does not push or sign)."
+        description: "Tag to verify (informational only; the workflow does not push or publish)."
         required: false
+        type: string
+      fuzz_budget_seconds:
+        description: "Deep-fuzz wall-clock budget for verify-release."
+        required: false
+        default: "7200"
         type: string
 
 jobs:
-  release-placeholder:
-    name: Release placeholder
+  verify-release:
+    name: Tier 4 release verification
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 180
+    env:
+      FUZZ_BUDGET_SECONDS: ${{ inputs.fuzz_budget_seconds }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Announce deferred release flow
-        run: |
-          echo "Release is handled in a separate flow per plan section 0.12."
-          echo "This workflow is a skeleton only — no signing, no SBOM, no publish."
-          echo "To ship a release, run verify-release locally through the release skill."
-          exit 0
+      - name: Install mise
+        uses: jdx/mise-action@v2
+        with:
+          cache: true
+          install: true
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.0
+
+      - name: Install Zig 0.16.0 via mise
+        run: mise install zig@0.16.0
+
+      - name: Verify Zig toolchain resolves
+        run: mise x zig@0.16.0 -- zig version
+
+      - name: Bun install
+        run: bun ci
+
+      - name: Run verify-release gate
+        run: bun scripts/verify-release.ts

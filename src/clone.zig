@@ -439,9 +439,6 @@ test "clone: cloneOne clones from a file:// bare fixture" {
     var spec = try url.parse(gpa, input, .{});
     defer spec.deinit(gpa);
 
-    gitstore.quiet = true;
-    defer gitstore.quiet = false;
-
     const report = try cloneOne(gpa, io, spec, ghq_root, store, .{
         .no_adopt = true, // keep .git in-tree for easy assertion
         .recursive = false,
@@ -482,9 +479,6 @@ test "clone: cloneOne with update_if_exists refreshes an existing clone" {
 
     var spec = try url.parse(gpa, input, .{});
     defer spec.deinit(gpa);
-
-    gitstore.quiet = true;
-    defer gitstore.quiet = false;
 
     // First pass: initial clone (no adopt so a plain .git remains).
     const r1 = try cloneOne(gpa, io, spec, ghq_root, store, .{
@@ -540,9 +534,6 @@ test "clone: cloneOne without update on existing path returns skipped" {
     var spec = try url.parse(gpa, input, .{});
     defer spec.deinit(gpa);
 
-    gitstore.quiet = true;
-    defer gitstore.quiet = false;
-
     const r1 = try cloneOne(gpa, io, spec, ghq_root, store, .{
         .no_adopt = true,
         .recursive = false,
@@ -585,9 +576,6 @@ test "clone: cloneOne against a non-existent remote reports failure" {
 
     var spec = try url.parse(gpa, input, .{});
     defer spec.deinit(gpa);
-
-    gitstore.quiet = true;
-    defer gitstore.quiet = false;
 
     const report = try cloneOne(gpa, io, spec, ghq_root, store, .{
         .no_adopt = true,
@@ -640,9 +628,6 @@ test "clone: cloneMany runs three file:// clones with parallelism=2" {
         bare_paths[i] = bare;
         made = i + 1;
     }
-
-    gitstore.quiet = true;
-    defer gitstore.quiet = false;
 
     const reports = try cloneMany(gpa, io, &specs, ghq_root, store, .{
         .parallelism = 2,
