@@ -49,6 +49,44 @@ pub const RepoSpec = struct {
             self.name,
         });
     }
+
+    /// Reconstruct the URL `git clone` should target.
+    ///
+    /// Some forges serve git from a host that differs from their web UI
+    /// host (e.g. SourceCraft: web `sourcecraft.dev`, git
+    /// `git.sourcecraft.dev`). The storage path stays on the *web* host
+    /// (`self.host`, via `toStoragePath`); only the clone URL is
+    /// rewritten to the git host returned by `cloneHost`.
+    ///
+    /// The transport scheme is preserved:
+    ///   * `https`/`http` → `"<scheme>://<git-host>/<owner>/<name>.git"`
+    ///   * `git`          → `"git://<git-host>/<owner>/<name>.git"`
+    ///   * `ssh`          → scp form `"git@<git-host>:<owner>/<name>.git"`
+    ///   * `file`         → a dupe of `orig_url` (no host to rewrite)
+    ///
+    /// Caller owns the returned slice.
+    pub fn cloneUrl(self: RepoSpec, gpa: Allocator) CloneUrlError![]u8 {
+        if (self.scheme == .file) {
+            return gpa.dupe(u8, self.orig_url);
+        }
+
+        const git_host = cloneHost(self.host);
+        return switch (self.scheme) {
+            .https => std.fmt.allocPrint(gpa, "https://{s}/{s}/{s}.git", .{
+                git_host, self.owner, self.name,
+            }),
+            .http => std.fmt.allocPrint(gpa, "http://{s}/{s}/{s}.git", .{
+                git_host, self.owner, self.name,
+            }),
+            .git => std.fmt.allocPrint(gpa, "git://{s}/{s}/{s}.git", .{
+                git_host, self.owner, self.name,
+            }),
+            .ssh => std.fmt.allocPrint(gpa, "git@{s}:{s}/{s}.git", .{
+                git_host, self.owner, self.name,
+            }),
+            .file => unreachable, // handled above
+        };
+    }
 };
 
 /// Defaults used when parsing short inputs (`repo` or `owner/repo`).
@@ -65,6 +103,36 @@ pub const ParseError = error{
     InvalidHost,
     OutOfMemory,
 };
+
+/// Errors `RepoSpec.cloneUrl` may return. Allocation is the only failure
+/// mode — host rewriting and scheme handling are total over a valid
+/// `RepoSpec`.
+pub const CloneUrlError = error{OutOfMemory};
+
+/// Maps a forge's web-UI host to the host that actually serves git.
+///
+/// Most forges serve git from the same host as their web UI (identity).
+/// SourceCraft is the known exception: its web UI lives at
+/// `sourcecraft.dev` but git/jj clones must target `git.sourcecraft.dev`
+/// (empirically verified — clones against the web host fail).
+const CloneHostOverride = struct { web: []const u8, git: []const u8 };
+
+const clone_host_overrides = [_]CloneHostOverride{
+    .{ .web = "sourcecraft.dev", .git = "git.sourcecraft.dev" },
+};
+
+/// Return the git-serving host for a given web host.
+///
+/// Identity for any host without a registered override; otherwise the
+/// override's git host. The returned slice points either into the input
+/// (`web_host`) or into the static `clone_host_overrides` table, so it
+/// never needs freeing.
+pub fn cloneHost(web_host: []const u8) []const u8 {
+    for (clone_host_overrides) |o| {
+        if (std.mem.eql(u8, web_host, o.web)) return o.git;
+    }
+    return web_host;
+}
 
 /// Parse any of the shapes documented in libgitstore-v2.md into a
 /// `RepoSpec`. The returned struct owns its strings via `gpa`.
@@ -547,6 +615,115 @@ test "url: https with port in host-part path works" {
     defer spec.deinit(gpa);
     try testing.expectEqualStrings("team", spec.owner);
     try testing.expectEqualStrings("repo", spec.name);
+}
+
+// ---- clone-host rewrite (SourceCraft git host != web host) ----
+
+test "url: cloneHost identity for hosts without override" {
+    try testing.expectEqualStrings("github.com", cloneHost("github.com"));
+    try testing.expectEqualStrings("gitlab.com", cloneHost("gitlab.com"));
+    try testing.expectEqualStrings("codeberg.org", cloneHost("codeberg.org"));
+    try testing.expectEqualStrings("dagshub.com", cloneHost("dagshub.com"));
+    try testing.expectEqualStrings("example.com", cloneHost("example.com"));
+}
+
+test "url: cloneHost rewrites sourcecraft web host to git host" {
+    try testing.expectEqualStrings("git.sourcecraft.dev", cloneHost("sourcecraft.dev"));
+}
+
+test "url: cloneUrl rewrites https sourcecraft to git host" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "https://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("https://git.sourcecraft.dev/owner/repo.git", u);
+}
+
+test "url: cloneUrl keeps storage path on the web host after rewrite" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "https://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    // The clone URL targets the git host…
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("https://git.sourcecraft.dev/owner/repo.git", u);
+    // …but the storage path must stay on the web host.
+    const p = try spec.toStoragePath(gpa, "/ghq");
+    defer gpa.free(p);
+    try testing.expectEqualStrings("/ghq/sourcecraft.dev/owner/repo", p);
+}
+
+test "url: cloneUrl is identity for https github" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "https://github.com/a/b", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("https://github.com/a/b.git", u);
+}
+
+test "url: cloneUrl preserves http scheme" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "http://example.com/a/b", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("http://example.com/a/b.git", u);
+}
+
+test "url: cloneUrl ssh scp-form rewrites sourcecraft git host" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "git@sourcecraft.dev:owner/repo.git", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git@git.sourcecraft.dev:owner/repo.git", u);
+}
+
+test "url: cloneUrl ssh scp-form is identity for github" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "git@github.com:a/b.git", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git@github.com:a/b.git", u);
+}
+
+test "url: cloneUrl file scheme passes orig_url through unchanged" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "file:///tmp/repos/myproj", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("file:///tmp/repos/myproj", u);
+}
+
+test "url: cloneUrl git scheme rewrites sourcecraft git host" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "git://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git://git.sourcecraft.dev/owner/repo.git", u);
+}
+
+test "url: cloneUrl git scheme is identity for non-override host" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "git://example.com/a/b", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git://example.com/a/b.git", u);
+}
+
+test "url: cloneUrl ssh:// URL emits scp-form with override" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "ssh://git@sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git@git.sourcecraft.dev:owner/repo.git", u);
 }
 
 fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
