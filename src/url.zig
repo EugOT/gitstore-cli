@@ -128,9 +128,19 @@ fn cloneSshUrl(
     name: []const u8,
 ) CloneUrlError![]u8 {
     const user = if (auth.userinfo.len > 0) auth.userinfo else "git";
-    if (auth.port.len > 0) {
-        return std.fmt.allocPrint(gpa, "ssh://{s}@{s}:{s}/{s}/{s}.git", .{
-            user, host, auth.port, owner, name,
+    // scp form (`user@host:path`) cannot represent a port, and its single
+    // userinfo field is ambiguous once it contains a ':'. Fall back to the
+    // hierarchical `ssh://` form whenever either is present.
+    const needs_hierarchical = auth.port.len > 0 or
+        std.mem.indexOfScalar(u8, user, ':') != null;
+    if (needs_hierarchical) {
+        if (auth.port.len > 0) {
+            return std.fmt.allocPrint(gpa, "ssh://{s}@{s}:{s}/{s}/{s}.git", .{
+                user, host, auth.port, owner, name,
+            });
+        }
+        return std.fmt.allocPrint(gpa, "ssh://{s}@{s}/{s}/{s}.git", .{
+            user, host, owner, name,
         });
     }
     return std.fmt.allocPrint(gpa, "{s}@{s}:{s}/{s}.git", .{
@@ -300,9 +310,16 @@ fn parseUrl(gpa: Allocator, rest: []const u8, scheme: Scheme, orig: []u8) ParseE
     }
     if (host_with_port.len == 0) return error.InvalidHost;
 
-    // Strip optional `:port` from host.
+    // Strip optional `:port` from host. Reject a malformed port (empty or
+    // non-digit) rather than silently dropping it, matching the short-host
+    // parser's behavior.
     if (std.mem.indexOfScalar(u8, host_with_port, ':')) |colon| {
-        auth.port = host_with_port[colon + 1 ..];
+        const port = host_with_port[colon + 1 ..];
+        if (port.len == 0) return error.InvalidHost;
+        for (port) |c| {
+            if (c < '0' or c > '9') return error.InvalidHost;
+        }
+        auth.port = port;
         host_with_port = host_with_port[0..colon];
     }
     if (host_with_port.len == 0) return error.InvalidHost;
@@ -816,6 +833,27 @@ test "url: cloneUrl ssh:// URL preserves userinfo and explicit port with overrid
     const u = try spec.cloneUrl(gpa);
     defer gpa.free(u);
     try testing.expectEqualStrings("ssh://deploy@git.sourcecraft.dev:2222/owner/repo.git", u);
+}
+
+test "url: cloneUrl ssh userinfo with ':' forces hierarchical form" {
+    const gpa = testing.allocator;
+    // scp form cannot carry a colon in userinfo unambiguously; the rewrite
+    // must emit the hierarchical ssh:// form instead.
+    var spec = try parse(gpa, "ssh://deploy:token@sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("ssh://deploy:token@git.sourcecraft.dev/owner/repo.git", u);
+}
+
+test "url: parse rejects empty port" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidHost, parse(gpa, "https://example.com:/a/b", .{}));
+}
+
+test "url: parse rejects non-digit port" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidHost, parse(gpa, "https://example.com:80x/a/b", .{}));
 }
 
 fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
