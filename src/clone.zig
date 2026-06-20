@@ -171,11 +171,18 @@ pub fn cloneOne(
     } else {
         try argv.append(gpa, "--no-recursive");
     }
-    // Terminate option parsing before the URL so a crafted spec.orig_url
+    // Reconstruct the clone target. For most forges this equals
+    // `spec.orig_url`, but some serve git from a different host than their
+    // web UI (e.g. SourceCraft: web `sourcecraft.dev`, git
+    // `git.sourcecraft.dev`). The user-facing report keeps `orig_url`
+    // (see `url_dup`); only the git argv targets the git host.
+    const clone_target = try spec.cloneUrl(gpa);
+    defer gpa.free(clone_target);
+    // Terminate option parsing before the URL so a crafted clone target
     // starting with "--" cannot be misinterpreted by `git clone` as an
     // option (e.g. --upload-pack=/path/to/evil). Round-5 hardening.
     try argv.append(gpa, "--");
-    try argv.append(gpa, spec.orig_url);
+    try argv.append(gpa, clone_target);
     try argv.append(gpa, storage_path);
 
     var clone_res = try ex.exec(gpa, io, argv.items, null);

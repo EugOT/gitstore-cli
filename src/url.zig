@@ -13,15 +13,26 @@ const Allocator = std.mem.Allocator;
 /// Transport scheme that produced the `RepoSpec`.
 pub const Scheme = enum { https, http, ssh, file, git };
 
+/// URL authority details that should survive clone-target rewriting.
+///
+/// Non-empty slices borrow from `RepoSpec.orig_url`; they are not freed
+/// separately.
+const Authority = struct {
+    userinfo: []const u8 = "",
+    port: []const u8 = "",
+};
+
 /// A parsed repository reference.
 ///
 /// `host`, `owner`, `name`, and `orig_url` are heap-allocated by the
-/// allocator passed to `parse()`. Call `deinit()` to free them.
+/// allocator passed to `parse()`. `auth` borrows from `orig_url`. Call
+/// `deinit()` to free owned memory.
 pub const RepoSpec = struct {
     host: []const u8,
     owner: []const u8,
     name: []const u8,
     scheme: Scheme,
+    auth: Authority = .{},
     orig_url: []const u8,
 
     pub fn deinit(self: *RepoSpec, gpa: Allocator) void {
@@ -49,7 +60,93 @@ pub const RepoSpec = struct {
             self.name,
         });
     }
+
+    /// Reconstruct the URL `git clone` should target.
+    ///
+    /// Some forges serve git from a host that differs from their web UI
+    /// host (e.g. SourceCraft: web `sourcecraft.dev`, git
+    /// `git.sourcecraft.dev`). The storage path stays on the *web* host
+    /// (`self.host`, via `toStoragePath`); only the clone URL is
+    /// rewritten to the git host returned by `cloneHost`.
+    ///
+    /// The transport scheme is preserved:
+    ///   * `https`/`http` → `"<scheme>://[userinfo@]<git-host>[:port]/<owner>/<name>.git"`
+    ///   * `git`          → `"git://[userinfo@]<git-host>[:port]/<owner>/<name>.git"`
+    ///   * `ssh`          → scp form when possible; `ssh://` form when a port must be preserved
+    ///   * `file`         → a dupe of `orig_url` (no host to rewrite)
+    ///
+    /// Caller owns the returned slice.
+    pub fn cloneUrl(self: RepoSpec, gpa: Allocator) CloneUrlError![]u8 {
+        if (self.scheme == .file) {
+            return gpa.dupe(u8, self.orig_url);
+        }
+
+        const git_host = cloneHost(self.host);
+        return switch (self.scheme) {
+            .https => cloneHierUrl(gpa, "https", self.auth, git_host, self.owner, self.name),
+            .http => cloneHierUrl(gpa, "http", self.auth, git_host, self.owner, self.name),
+            .git => cloneHierUrl(gpa, "git", self.auth, git_host, self.owner, self.name),
+            .ssh => cloneSshUrl(gpa, self.auth, git_host, self.owner, self.name),
+            .file => unreachable, // handled above
+        };
+    }
 };
+
+fn cloneHierUrl(
+    gpa: Allocator,
+    scheme: []const u8,
+    auth: Authority,
+    host: []const u8,
+    owner: []const u8,
+    name: []const u8,
+) CloneUrlError![]u8 {
+    if (auth.userinfo.len > 0) {
+        if (auth.port.len > 0) {
+            return std.fmt.allocPrint(gpa, "{s}://{s}@{s}:{s}/{s}/{s}.git", .{
+                scheme, auth.userinfo, host, auth.port, owner, name,
+            });
+        }
+        return std.fmt.allocPrint(gpa, "{s}://{s}@{s}/{s}/{s}.git", .{
+            scheme, auth.userinfo, host, owner, name,
+        });
+    }
+    if (auth.port.len > 0) {
+        return std.fmt.allocPrint(gpa, "{s}://{s}:{s}/{s}/{s}.git", .{
+            scheme, host, auth.port, owner, name,
+        });
+    }
+    return std.fmt.allocPrint(gpa, "{s}://{s}/{s}/{s}.git", .{
+        scheme, host, owner, name,
+    });
+}
+
+fn cloneSshUrl(
+    gpa: Allocator,
+    auth: Authority,
+    host: []const u8,
+    owner: []const u8,
+    name: []const u8,
+) CloneUrlError![]u8 {
+    const user = if (auth.userinfo.len > 0) auth.userinfo else "git";
+    // scp form (`user@host:path`) cannot represent a port, and its single
+    // userinfo field is ambiguous once it contains a ':'. Fall back to the
+    // hierarchical `ssh://` form whenever either is present.
+    const needs_hierarchical = auth.port.len > 0 or
+        std.mem.indexOfScalar(u8, user, ':') != null;
+    if (needs_hierarchical) {
+        if (auth.port.len > 0) {
+            return std.fmt.allocPrint(gpa, "ssh://{s}@{s}:{s}/{s}/{s}.git", .{
+                user, host, auth.port, owner, name,
+            });
+        }
+        return std.fmt.allocPrint(gpa, "ssh://{s}@{s}/{s}/{s}.git", .{
+            user, host, owner, name,
+        });
+    }
+    return std.fmt.allocPrint(gpa, "{s}@{s}:{s}/{s}.git", .{
+        user, host, owner, name,
+    });
+}
 
 /// Defaults used when parsing short inputs (`repo` or `owner/repo`).
 pub const Defaults = struct {
@@ -66,6 +163,36 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+/// Errors `RepoSpec.cloneUrl` may return. Allocation is the only failure
+/// mode — host rewriting and scheme handling are total over a valid
+/// `RepoSpec`.
+pub const CloneUrlError = error{OutOfMemory};
+
+/// Maps a forge's web-UI host to the host that actually serves git.
+///
+/// Most forges serve git from the same host as their web UI (identity).
+/// SourceCraft is the known exception: its web UI lives at
+/// `sourcecraft.dev` but git/jj clones must target `git.sourcecraft.dev`
+/// (empirically verified — clones against the web host fail).
+const CloneHostOverride = struct { web: []const u8, git: []const u8 };
+
+const clone_host_overrides = [_]CloneHostOverride{
+    .{ .web = "sourcecraft.dev", .git = "git.sourcecraft.dev" },
+};
+
+/// Return the git-serving host for a given web host.
+///
+/// Identity for any host without a registered override; otherwise the
+/// override's git host. The returned slice points either into the input
+/// (`web_host`) or into the static `clone_host_overrides` table, so it
+/// never needs freeing.
+pub fn cloneHost(web_host: []const u8) []const u8 {
+    for (clone_host_overrides) |o| {
+        if (std.ascii.eqlIgnoreCase(web_host, o.web)) return o.git;
+    }
+    return web_host;
+}
+
 /// Parse any of the shapes documented in libgitstore-v2.md into a
 /// `RepoSpec`. The returned struct owns its strings via `gpa`.
 ///
@@ -79,7 +206,7 @@ pub fn parse(gpa: Allocator, input: []const u8, defaults: Defaults) ParseError!R
     const orig = try gpa.dupe(u8, input);
 
     // Working copy: trim trailing '/' characters.
-    var work = input;
+    var work: []const u8 = orig;
     while (work.len > 0 and work[work.len - 1] == '/') {
         work = work[0 .. work.len - 1];
     }
@@ -162,29 +289,37 @@ fn parseFile(gpa: Allocator, work: []const u8, orig: []u8) ParseError!RepoSpec {
     };
 }
 
-/// Parse `host[:port]/owner/repo[.git]` (after the scheme prefix has been
-/// stripped). Optional `user@` prefix is permitted for ssh.
+/// Parse `[userinfo@]host[:port]/owner/repo[.git]` after the scheme prefix
+/// has been stripped.
 fn parseUrl(gpa: Allocator, rest: []const u8, scheme: Scheme, orig: []u8) ParseError!RepoSpec {
     errdefer gpa.free(orig);
     if (rest.len == 0) return error.InvalidFormat;
 
-    // Strip optional `user@` (informational only — we drop the user).
-    var tail = rest;
-    if (std.mem.indexOfScalar(u8, tail, '@')) |at| {
-        // Only treat as userinfo if '@' appears before the first '/'.
-        const slash = std.mem.indexOfScalar(u8, tail, '/') orelse tail.len;
-        if (at < slash) tail = tail[at + 1 ..];
-    }
-
-    // Split host from path.
-    const slash = std.mem.indexOfScalar(u8, tail, '/') orelse return error.InvalidFormat;
-    var host_with_port = tail[0..slash];
-    const path = tail[slash + 1 ..];
-    if (host_with_port.len == 0) return error.InvalidHost;
+    // Split authority from path.
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidFormat;
+    const authority = rest[0..slash];
+    const path = rest[slash + 1 ..];
+    if (authority.len == 0) return error.InvalidHost;
     if (path.len == 0) return error.InvalidFormat;
 
-    // Strip optional `:port` from host.
+    var auth: Authority = .{};
+    var host_with_port = authority;
+    if (std.mem.indexOfScalar(u8, authority, '@')) |at| {
+        auth.userinfo = authority[0..at];
+        host_with_port = authority[at + 1 ..];
+    }
+    if (host_with_port.len == 0) return error.InvalidHost;
+
+    // Strip optional `:port` from host. Reject a malformed port (empty or
+    // non-digit) rather than silently dropping it, matching the short-host
+    // parser's behavior.
     if (std.mem.indexOfScalar(u8, host_with_port, ':')) |colon| {
+        const port = host_with_port[colon + 1 ..];
+        if (port.len == 0) return error.InvalidHost;
+        for (port) |c| {
+            if (c < '0' or c > '9') return error.InvalidHost;
+        }
+        auth.port = port;
         host_with_port = host_with_port[0..colon];
     }
     if (host_with_port.len == 0) return error.InvalidHost;
@@ -219,6 +354,7 @@ fn parseUrl(gpa: Allocator, rest: []const u8, scheme: Scheme, orig: []u8) ParseE
         .owner = owner_dup,
         .name = name_dup,
         .scheme = scheme,
+        .auth = auth,
         .orig_url = orig,
     };
 }
@@ -237,6 +373,7 @@ fn parseScpLike(
     if (host.len == 0) return error.InvalidHost;
     if (colon_idx + 1 >= work.len) return error.InvalidFormat;
     const path = work[colon_idx + 1 ..];
+    const auth: Authority = .{ .userinfo = work[0..at_idx] };
 
     var segs: std.ArrayList([]const u8) = .empty;
     defer segs.deinit(gpa);
@@ -263,6 +400,7 @@ fn parseScpLike(
         .owner = owner_dup,
         .name = name_dup,
         .scheme = .ssh,
+        .auth = auth,
         .orig_url = orig,
     };
 }
@@ -292,6 +430,7 @@ fn parseShort(
     if (n == 0) return error.EmptyInput;
 
     var host: []const u8 = defaults.host;
+    var auth: Authority = .{};
     var owner: []const u8 = undefined;
     var name_raw: []const u8 = undefined;
 
@@ -310,6 +449,7 @@ fn parseShort(
             // `[A-Za-z0-9]+\.[A-Za-z]+(:port)?$`.
             if (!looksLikeHost(segs.items[0])) return error.InvalidFormat;
             host = stripHostPort(segs.items[0]);
+            auth.port = hostPort(segs.items[0]);
             owner = segs.items[1];
             name_raw = segs.items[2];
         },
@@ -333,6 +473,7 @@ fn parseShort(
         .owner = owner_dup,
         .name = name_dup,
         .scheme = .https,
+        .auth = auth,
         .orig_url = orig,
     };
 }
@@ -345,6 +486,11 @@ fn stripDotGit(s: []const u8) []const u8 {
 fn stripHostPort(s: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, s, ':')) |c| return s[0..c];
     return s;
+}
+
+fn hostPort(s: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, s, ':')) |c| return s[c + 1 ..];
+    return "";
 }
 
 /// Returns true if `s` matches `[A-Za-z0-9]+\.[A-Za-z]+(:[0-9]+)?$`.
@@ -547,6 +693,167 @@ test "url: https with port in host-part path works" {
     defer spec.deinit(gpa);
     try testing.expectEqualStrings("team", spec.owner);
     try testing.expectEqualStrings("repo", spec.name);
+}
+
+// ---- clone-host rewrite (SourceCraft git host != web host) ----
+
+test "url: cloneHost identity for hosts without override" {
+    try testing.expectEqualStrings("github.com", cloneHost("github.com"));
+    try testing.expectEqualStrings("gitlab.com", cloneHost("gitlab.com"));
+    try testing.expectEqualStrings("codeberg.org", cloneHost("codeberg.org"));
+    try testing.expectEqualStrings("dagshub.com", cloneHost("dagshub.com"));
+    try testing.expectEqualStrings("example.com", cloneHost("example.com"));
+}
+
+test "url: cloneHost rewrites sourcecraft web host to git host" {
+    try testing.expectEqualStrings("git.sourcecraft.dev", cloneHost("sourcecraft.dev"));
+}
+
+test "url: cloneHost rewrites sourcecraft web host case-insensitively" {
+    try testing.expectEqualStrings("git.sourcecraft.dev", cloneHost("SourceCraft.Dev"));
+}
+
+test "url: cloneUrl rewrites https sourcecraft to git host" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "https://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("https://git.sourcecraft.dev/owner/repo.git", u);
+}
+
+test "url: cloneUrl preserves https userinfo and explicit port during rewrite" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "https://bot:token@SourceCraft.Dev:8443/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("https://bot:token@git.sourcecraft.dev:8443/owner/repo.git", u);
+}
+
+test "url: cloneUrl keeps storage path on the web host after rewrite" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "https://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    // The clone URL targets the git host…
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("https://git.sourcecraft.dev/owner/repo.git", u);
+    // …but the storage path must stay on the web host.
+    const p = try spec.toStoragePath(gpa, "/ghq");
+    defer gpa.free(p);
+    try testing.expectEqualStrings("/ghq/sourcecraft.dev/owner/repo", p);
+}
+
+test "url: cloneUrl is identity for https github" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "https://github.com/a/b", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("https://github.com/a/b.git", u);
+}
+
+test "url: cloneUrl preserves http scheme" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "http://example.com/a/b", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("http://example.com/a/b.git", u);
+}
+
+test "url: cloneUrl ssh scp-form rewrites sourcecraft git host" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "git@sourcecraft.dev:owner/repo.git", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git@git.sourcecraft.dev:owner/repo.git", u);
+}
+
+test "url: cloneUrl ssh scp-form preserves userinfo with override" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "deploy@SourceCraft.Dev:owner/repo.git", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("deploy@git.sourcecraft.dev:owner/repo.git", u);
+}
+
+test "url: cloneUrl ssh scp-form is identity for github" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "git@github.com:a/b.git", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git@github.com:a/b.git", u);
+}
+
+test "url: cloneUrl file scheme passes orig_url through unchanged" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "file:///tmp/repos/myproj", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("file:///tmp/repos/myproj", u);
+}
+
+test "url: cloneUrl git scheme rewrites sourcecraft git host" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "git://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git://git.sourcecraft.dev/owner/repo.git", u);
+}
+
+test "url: cloneUrl git scheme is identity for non-override host" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "git://example.com/a/b", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git://example.com/a/b.git", u);
+}
+
+test "url: cloneUrl ssh:// URL emits scp-form with override" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "ssh://git@sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("git@git.sourcecraft.dev:owner/repo.git", u);
+}
+
+test "url: cloneUrl ssh:// URL preserves userinfo and explicit port with override" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "ssh://deploy@SourceCraft.Dev:2222/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("ssh://deploy@git.sourcecraft.dev:2222/owner/repo.git", u);
+}
+
+test "url: cloneUrl ssh userinfo with ':' forces hierarchical form" {
+    const gpa = testing.allocator;
+    // scp form cannot carry a colon in userinfo unambiguously; the rewrite
+    // must emit the hierarchical ssh:// form instead.
+    var spec = try parse(gpa, "ssh://deploy:token@sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("ssh://deploy:token@git.sourcecraft.dev/owner/repo.git", u);
+}
+
+test "url: parse rejects empty port" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidHost, parse(gpa, "https://example.com:/a/b", .{}));
+}
+
+test "url: parse rejects non-digit port" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidHost, parse(gpa, "https://example.com:80x/a/b", .{}));
 }
 
 fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
