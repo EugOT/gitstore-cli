@@ -1,6 +1,6 @@
 .{
     .name = .gitstore_cli,
-    .version = "0.1.0",
+    .version = "0.2.3",
     .fingerprint = 0x5c0f51ec08453179,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
