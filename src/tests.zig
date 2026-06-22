@@ -21,6 +21,13 @@ comptime {
     _ = @import("list.zig");
     _ = @import("cache.zig");
     _ = @import("clone.zig");
+    // main.zig hosts inline unit tests for its private dispatcher helpers
+    // (getGitstoreRoot / getGhqRoot / resolveGhqRootOrHome) and e2e tests
+    // that spawn the built gitstore binary. Force-importing it here makes the
+    // integration test runner collect those `test` blocks. main.zig is
+    // path-relative and transitively imports the co-located src/ modules, so
+    // no extra build.zig wiring is needed beyond the `build_options` seam.
+    _ = @import("main.zig");
 }
 
 const config = @import("config.zig");
@@ -1612,4 +1619,337 @@ test "adopt rejects repo_path with '.' segment under storage path" {
 
     const r = gitstore.adopt(gpa, io, "/foo/./bar", env.ghq_root, env.gitstore_root, false);
     try testing.expectError(error.GitDirMalformed, r);
+}
+
+// =========================================================
+// G3 — CLI end-to-end tests: spawn the BUILT `gitstore` binary
+// =========================================================
+//
+// These tests exercise the real argument dispatcher in src/main.zig by
+// spawning the compiled executable in a child process and asserting its
+// exit code and a substring of the chosen output stream. The binary path is
+// baked in hermetically at build time:
+//
+//   build.zig:
+//     integration_tests.step.dependOn(&exe.step);   // build gitstore first
+//     e2e_opts.addOptionPath("gitstore_bin", exe.getEmittedBin());
+//     integration_mod.addOptions("build_options", e2e_opts);
+//
+// `addOptionPath` takes the emitted-bin LazyPath and resolves it lazily inside
+// the Options step's own make() (an eager getPath2() during graph construction
+// panics with "misconfigured build script"), writing the absolute path into
+// the generated `build_options` module where it surfaces as a `[]const u8`.
+// `gitstore_bin` is therefore an absolute path to the just-built binary —
+// no cwd-relative guessing, no reliance on the install prefix.
+//
+// stdout vs stderr routing (load-bearing, verified against main.zig):
+//   * printUsage / printErr → File.stderr() — usage text + all error lines
+//   * printOut              → File.stdout() — every `<cmd> --help` body
+// So `--help` substrings are asserted in STDOUT; usage/error substrings in
+// STDERR.
+//
+// Exit-code matrix (verified against every `return N` in main.zig):
+//   * exit 0  — success, usage on no-args, all `--help`
+//   * exit 1  — `filter <unexpected>` ONLY among bad-arg paths (main.zig:682)
+//   * exit 2  — every other argument-rejection path
+//   * != 0    — `migrate <path>` real-mode returns error.MigrationNotImplemented
+//               (main.zig:1218), which the Zig runtime reports as a non-zero
+//               process exit.
+//
+// Each test runs with a controlled environment (HOME + GIT_CONFIG_GLOBAL
+// pointed at throwaway temp paths, plus the real PATH) so no test can touch
+// the operator's real HOME, ghq config, or gitstore root.
+
+const build_options = @import("build_options");
+
+/// Which captured stream a substring assertion targets.
+const Stream = enum { stdout, stderr };
+
+/// Expected process termination for an e2e case.
+const ExpectExit = union(enum) {
+    /// Exact `Exited` code.
+    code: u8,
+    /// Any non-zero `Exited` code (used for the migrate real-mode error
+    /// return, whose precise code is runtime-defined).
+    nonzero,
+};
+
+const E2eCase = struct {
+    argv_tail: []const []const u8,
+    expect: ExpectExit,
+    stream: Stream,
+    needle: []const u8,
+};
+
+/// Build a controlled child environment. HOME and GIT_CONFIG_GLOBAL point at
+/// the supplied throwaway paths; PATH is copied from the test environ so the
+/// child can still resolve git/jj if a code path reaches an exec (the
+/// argument-rejection cases return before any exec, but happy-path help does
+/// not, and keeping PATH makes the harness reusable).
+fn controlledEnv(
+    gpa: Allocator,
+    home: []const u8,
+    git_config_global: []const u8,
+) !std.process.Environ.Map {
+    var map: std.process.Environ.Map = .init(gpa);
+    errdefer map.deinit();
+    try map.put("HOME", home);
+    try map.put("GIT_CONFIG_GLOBAL", git_config_global);
+    // Copy PATH from the portable testing environ view if present.
+    var parent = try std.testing.environ.createMap(gpa);
+    defer parent.deinit();
+    if (parent.get("PATH")) |path| {
+        try map.put("PATH", path);
+    }
+    return map;
+}
+
+/// Spawn the built gitstore binary with `argv_tail` and a controlled env,
+/// then assert the expected exit code and that `needle` appears in the
+/// selected stream. Uses std.process.run (the same high-level spawn API
+/// exec.zig builds on) so pipe wiring and full-output capture are handled.
+fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
+    // Throwaway HOME dir + empty global gitconfig, unique per invocation so
+    // parallel test execution cannot collide.
+    const home = try uniqueTempDir(gpa, io, "/tmp/gitstore_e2e_home");
+    defer {
+        Dir.cwd().deleteTree(io, home) catch {};
+        gpa.free(home);
+    }
+    const git_config = try uniqueTempFile(gpa, io, "/tmp/gitstore_e2e", ".gitconfig");
+    defer {
+        Dir.cwd().deleteFile(io, git_config) catch {};
+        gpa.free(git_config);
+    }
+
+    // argv = [binary, tail...]
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, build_options.gitstore_bin);
+    for (case.argv_tail) |a| try argv.append(gpa, a);
+
+    // Space-joined tail for diagnostics. In Zig 0.16 `{s}` only formats a
+    // single `[]const u8`, so a `[]const []const u8` must be joined first.
+    const argv_desc = try std.mem.join(gpa, " ", case.argv_tail);
+    defer gpa.free(argv_desc);
+
+    var env_map = try controlledEnv(gpa, home, git_config);
+    defer env_map.deinit();
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    // Exit-code assertion.
+    try testing.expect(result.term == .exited);
+    switch (case.expect) {
+        .code => |c| testing.expectEqual(c, result.term.exited) catch |err| {
+            std.debug.print(
+                "e2e argv={s} expected exit {d}, got {d}\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
+                .{ argv_desc, c, result.term.exited, result.stdout, result.stderr },
+            );
+            return err;
+        },
+        .nonzero => testing.expect(result.term.exited != 0) catch |err| {
+            std.debug.print(
+                "e2e argv={s} expected non-zero exit, got 0\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
+                .{ argv_desc, result.stdout, result.stderr },
+            );
+            return err;
+        },
+    }
+
+    // Substring assertion on the selected stream (skip when needle is empty —
+    // e.g. `--help` cases whose body content is not pinned, only exit code).
+    if (case.needle.len > 0) {
+        const haystack = switch (case.stream) {
+            .stdout => result.stdout,
+            .stderr => result.stderr,
+        };
+        testing.expect(std.mem.indexOf(u8, haystack, case.needle) != null) catch |err| {
+            std.debug.print(
+                "e2e argv={s} missing needle <<{s}>> in {s}\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
+                .{ argv_desc, case.needle, @tagName(case.stream), result.stdout, result.stderr },
+            );
+            return err;
+        };
+    }
+}
+
+// --- usage / global help (printUsage → stderr) ---
+
+test "e2e (no args) prints usage to stderr, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{},
+        .expect = .{ .code = 0 },
+        .stream = .stderr,
+        .needle = "Usage: gitstore",
+    });
+}
+
+test "e2e --help prints usage to stderr, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"--help"},
+        .expect = .{ .code = 0 },
+        .stream = .stderr,
+        .needle = "Usage: gitstore",
+    });
+}
+
+test "e2e -h prints usage to stderr, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"-h"},
+        .expect = .{ .code = 0 },
+        .stream = .stderr,
+        .needle = "Usage: gitstore",
+    });
+}
+
+test "e2e unknown command exits 2 with error on stderr" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"frobnicator"},
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: unknown command 'frobnicator'",
+    });
+}
+
+// --- init ---
+
+test "e2e init --unknown rejects unknown flag, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "init", "--unknown" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: unknown flag for init: --unknown",
+    });
+}
+
+test "e2e init with two paths rejects extra path, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "init", "/a", "/b" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: init takes at most one path: /b",
+    });
+}
+
+test "e2e init --help prints sub-help to stdout, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "init", "--help" },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "gitstore init",
+    });
+}
+
+// --- hook (scan-all flag handling) ---
+
+test "e2e hook with no shell flag errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"hook"},
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: hook requires --zsh, --bash, or --nu",
+    });
+}
+
+test "e2e hook with conflicting shells errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "hook", "--zsh", "--bash" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: hook accepts only one of --zsh/--bash/--nu",
+    });
+}
+
+test "e2e hook --zsh --help surfaces help to stdout, exit 0" {
+    // Scan-all: --help wins even after a valid shell flag (main.zig round-6).
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "hook", "--zsh", "--help" },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "gitstore hook",
+    });
+}
+
+// --- filter (exit-1 anomaly) ---
+
+test "e2e filter unexpected arg exits 1 (NOT 2), error on stderr" {
+    // Load-bearing: this is the ONLY bad-arg path that returns 1 (main.zig:682).
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "filter", "unexpected" },
+        .expect = .{ .code = 1 },
+        .stream = .stderr,
+        .needle = "error: unexpected argument: unexpected",
+    });
+}
+
+test "e2e filter foo -h surfaces help to stdout, exit 0" {
+    // Scan-all: -h anywhere wins over the otherwise-unexpected `foo`.
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "filter", "foo", "-h" },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "",
+    });
+}
+
+// --- get ---
+
+test "e2e get with no url errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"get"},
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: get requires at least one <url>",
+    });
+}
+
+test "e2e get -P with non-integer value errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "get", "-P", "foo", "https://example.com/o/r" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: -P argument must be a positive integer",
+    });
+}
+
+// --- create ---
+
+test "e2e create --vcs with bad value errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "create", "--vcs", "hg", "owner/repo" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: --vcs must be 'git' or 'jj'",
+    });
+}
+
+// --- migrate (exit 2 on missing arg; non-zero error on real-mode) ---
+
+test "e2e migrate with no new-root errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"migrate"},
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: migrate requires <new-root>",
+    });
+}
+
+test "e2e migrate real-mode is unimplemented, non-zero exit with stderr" {
+    // `migrate <path>` without --dry-run prints the not-implemented error and
+    // returns error.MigrationNotImplemented (main.zig:1218); the Zig runtime
+    // turns that into a non-zero process exit.
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "migrate", "/tmp/gitstore_e2e_new_root" },
+        .expect = .nonzero,
+        .stream = .stderr,
+        .needle = "real-mode not implemented",
+    });
 }
