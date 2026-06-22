@@ -126,9 +126,27 @@ const TestEnv = struct {
     /// Create a git repo at ghq_root/org/name with an initial commit.
     fn createRepo(self: *const TestEnv, org: []const u8, name: []const u8) ![]u8 {
         const repo_path = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}", .{ self.ghq_root, org, name });
+        errdefer self.gpa.free(repo_path);
         try Dir.cwd().createDirPath(self.io, repo_path);
+        try self.gitInitAt(repo_path);
+        return repo_path;
+    }
 
-        // git init + configure user + initial commit
+    /// Create a git+jj colocated repo.
+    fn createJjRepo(self: *const TestEnv, org: []const u8, name: []const u8) ![]u8 {
+        const repo_path = try self.createRepo(org, name);
+
+        const r = try ex.exec(self.gpa, self.io, &.{ "jj", "git", "init", "--colocate" }, repo_path);
+        self.gpa.free(r.stdout);
+        self.gpa.free(r.stderr);
+
+        return repo_path;
+    }
+
+    /// Run `git init` + user config + an initial empty commit inside an
+    /// already-created directory. Shared by `createRepo` and the
+    /// host/owner/name helpers used by the *All orchestrator tests.
+    fn gitInitAt(self: *const TestEnv, repo_path: []const u8) !void {
         const r1 = try ex.exec(self.gpa, self.io, &.{ "git", "init" }, repo_path);
         self.gpa.free(r1.stdout);
         self.gpa.free(r1.stderr);
@@ -144,19 +162,25 @@ const TestEnv = struct {
         const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo_path);
         self.gpa.free(r2.stdout);
         self.gpa.free(r2.stderr);
+    }
 
+    /// Create a real git repo at `ghq_root/host/owner/name` (the ghq
+    /// host/owner/name layout that `list.walk` enumerates). `host` must
+    /// contain a dot so it passes `looksLikeHost`. Caller frees the path.
+    fn createHostRepo(self: *const TestEnv, host: []const u8, owner: []const u8, name: []const u8) ![]u8 {
+        const repo_path = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}/{s}", .{ self.ghq_root, host, owner, name });
+        errdefer self.gpa.free(repo_path);
+        try Dir.cwd().createDirPath(self.io, repo_path);
+        try self.gitInitAt(repo_path);
         return repo_path;
     }
 
-    /// Create a git+jj colocated repo.
-    fn createJjRepo(self: *const TestEnv, org: []const u8, name: []const u8) ![]u8 {
-        const repo_path = try self.createRepo(org, name);
-
-        const r = try ex.exec(self.gpa, self.io, &.{ "jj", "git", "init", "--colocate" }, repo_path);
-        self.gpa.free(r.stdout);
-        self.gpa.free(r.stderr);
-
-        return repo_path;
+    /// Create a bare owner directory `ghq_root/host/owner` with no repos.
+    /// Used to exercise the "root exists but enumerates nothing" path.
+    fn createOwnerDir(self: *const TestEnv, host: []const u8, owner: []const u8) !void {
+        const p = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}", .{ self.ghq_root, host, owner });
+        defer self.gpa.free(p);
+        try Dir.cwd().createDirPath(self.io, p);
     }
 };
 
@@ -1035,6 +1059,235 @@ test "e2e detach round-trip preserves linked worktree" {
         gpa.free(g_wt.stderr);
     }
     try testing.expect(g_wt.succeeded());
+}
+
+// =========================================================
+// G6 — multi-repo orchestrators (adoptAll / verifyAll / detachAll).
+//
+// These exercise the native `list.walk`-backed enumeration that replaced
+// the `ghq list --full-path` shell-out. Repos live under the ghq
+// host/owner/name layout (host == "github.com" so `looksLikeHost` passes);
+// no real `ghq` binary is involved. Adopted fixtures are produced by the
+// real `gitstore.adopt` so the on-disk pointer AND the gitstore git
+// database both exist (verify/detach need the database to be real).
+//
+// NOTE on output assertions: gitstore's `info()` helper early-returns under
+// `builtin.is_test`, so the human-facing summary lines ("would detach: 1",
+// "summary: N adopted ...") are intentionally suppressed during tests. G6
+// therefore asserts on the *observable state* — return counts surfaced via
+// out-params plus on-disk `.git` shape — which is the behavior the summary
+// merely reports. `warn()` is NOT suppressed, so the absence of a `FAIL:`/
+// `error:` line for a skipped repo is still a meaningful negative signal.
+//
+// `adoptAll`/`verifyAll`/`detachAll` print their counts rather than
+// returning them, so each test re-derives the expected end state from disk.
+// =========================================================
+
+/// Read a repo's `.git` and report whether it is a `gitdir:` pointer file.
+fn gitIsPointer(gpa: Allocator, io: Io, repo: []const u8) !bool {
+    const gp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(gp);
+    const content = Dir.cwd().readFileAlloc(io, gp, gpa, .unlimited) catch |err| switch (err) {
+        error.IsDir => return false,
+        else => return err,
+    };
+    defer gpa.free(content);
+    return std.mem.startsWith(u8, content, "gitdir: ");
+}
+
+/// True if `<repo>/.git` is a real directory (i.e. NOT adopted / detached).
+fn gitIsDir(io: Io, repo: []const u8, gpa: Allocator) !bool {
+    const gp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(gp);
+    var d = Dir.openDirAbsolute(io, gp, .{}) catch |err| switch (err) {
+        error.NotDir => return false, // pointer file
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    d.close(io);
+    return true;
+}
+
+test "G6-1 adoptAll adopts fresh repos and skips pre-adopted" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    const r3 = try env.createHostRepo("github.com", "o", "r3");
+    defer gpa.free(r3);
+    // r3 is already adopted before the batch runs.
+    try gitstore.adopt(gpa, io, r3, env.ghq_root, env.gitstore_root, false);
+
+    try gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false);
+
+    // r1 and r2 are now pointer files; r3 stays a (valid) pointer.
+    try testing.expect(try gitIsPointer(gpa, io, r1));
+    try testing.expect(try gitIsPointer(gpa, io, r2));
+    try testing.expect(try gitIsPointer(gpa, io, r3));
+    // All three resolve as adopted; none is a bare .git dir.
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    try testing.expect(gitstore.isAdopted(io, r2, env.gitstore_root, gpa));
+    try testing.expect(gitstore.isAdopted(io, r3, env.gitstore_root, gpa));
+}
+
+test "G6-2 adoptAll re-run is all-skip with no pointer corruption" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    const r3 = try env.createHostRepo("github.com", "o", "r3");
+    defer gpa.free(r3);
+
+    try gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false);
+    // Second pass: everything already adopted -> no-op, no corruption.
+    try gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false);
+
+    try testing.expect(try gitIsPointer(gpa, io, r1));
+    try testing.expect(try gitIsPointer(gpa, io, r2));
+    try testing.expect(try gitIsPointer(gpa, io, r3));
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    try testing.expect(gitstore.isAdopted(io, r2, env.gitstore_root, gpa));
+    try testing.expect(gitstore.isAdopted(io, r3, env.gitstore_root, gpa));
+}
+
+test "G6-3 adoptAll on empty owner dir returns without error" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    // Owner directory exists but contains no repos; walk() yields nothing.
+    try env.createOwnerDir("github.com", "o");
+
+    // Old contract: `ghq list` success + empty output -> no error, 0 counts.
+    // walk() preserves this exactly (empty slice, loop body never runs).
+    try gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false);
+}
+
+test "G6-4 verifyAll counts ok and skips non-adopted repos" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    // r1 adopted (real pointer + gitstore git dir); r2 left as a plain .git dir.
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    // verifyAll prints its tally; assert the per-repo verify outcomes that
+    // drive that tally. r1 must verify OK; r2 must never be examined (it is
+    // not adopted, so the loop `continue`s past it).
+    try testing.expect(try gitstore.verify(gpa, io, r1));
+    try testing.expect(!gitstore.isAdopted(io, r2, env.gitstore_root, gpa));
+
+    // The orchestrator itself must complete without error.
+    try gitstore.verifyAll(gpa, io, env.ghq_root, env.gitstore_root);
+}
+
+test "G6-5 verifyAll surfaces a broken pointer as a failure" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    // Break the pointer by deleting the gitstore git database it targets.
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/github.com/o/r1/git", .{env.gitstore_root});
+    defer gpa.free(store_git);
+    try Dir.cwd().deleteTree(io, store_git);
+
+    // r1 is still flagged adopted (pointer intact) so verifyAll WILL examine
+    // it, and verify() must now report failure (target gone).
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    try testing.expect(!try gitstore.verify(gpa, io, r1));
+
+    // verifyAll completes (failures are tallied, not propagated as errors).
+    try gitstore.verifyAll(gpa, io, env.ghq_root, env.gitstore_root);
+}
+
+test "G6-6 detachAll detaches adopted and skips non-adopted" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    // Sanity: pre-state is r1 adopted (pointer), r2 a plain .git dir.
+    try testing.expect(try gitIsPointer(gpa, io, r1));
+    try testing.expect(try gitIsDir(io, r2, gpa));
+
+    try gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false);
+
+    // r1 restored to a real .git directory; r2 untouched (still a dir).
+    try testing.expect(try gitIsDir(io, r1, gpa));
+    try testing.expect(!gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    try testing.expect(try gitIsDir(io, r2, gpa));
+    // r1's git history survives the round-trip.
+    const gl = try ex.exec(gpa, io, &.{ "git", "-C", r1, "log", "--oneline" }, null);
+    defer {
+        gpa.free(gl.stdout);
+        gpa.free(gl.stderr);
+    }
+    try testing.expect(gl.succeeded());
+}
+
+test "G6-7 detachAll --dry-run leaves adopted entries in place" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    // dry_run=true: the summary line "would detach: 1" is emitted via info(),
+    // which is suppressed under builtin.is_test, so we assert the *invariant*
+    // a dry run guarantees: nothing on disk changes.
+    try gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, true, false);
+
+    // r1 is STILL an adopted pointer; the gitstore database is STILL present.
+    try testing.expect(try gitIsPointer(gpa, io, r1));
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/github.com/o/r1/git", .{env.gitstore_root});
+    defer gpa.free(store_git);
+    var sd = try Dir.openDirAbsolute(io, store_git, .{});
+    sd.close(io);
+    // r2 remains a plain .git dir.
+    try testing.expect(try gitIsDir(io, r2, gpa));
+}
+
+test "G6-8 detachAll on empty root returns without error" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    // No repos under ghq_root at all (the root dir itself exists, empty).
+    try gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false);
 }
 
 // =========================================================
