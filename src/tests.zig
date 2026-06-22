@@ -1102,7 +1102,7 @@ fn gitIsPointer(gpa: Allocator, io: Io, repo: []const u8) !bool {
 }
 
 /// True if `<repo>/.git` is a real directory (i.e. NOT adopted / detached).
-fn gitIsDir(io: Io, repo: []const u8, gpa: Allocator) !bool {
+fn gitIsDir(gpa: Allocator, io: Io, repo: []const u8) !bool {
     const gp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
     defer gpa.free(gp);
     var d = Dir.openDirAbsolute(io, gp, .{}) catch |err| switch (err) {
@@ -1241,14 +1241,14 @@ test "G6-6 detachAll detaches adopted and skips non-adopted" {
 
     // Sanity: pre-state is r1 adopted (pointer), r2 a plain .git dir.
     try testing.expect(try gitIsPointer(gpa, io, r1));
-    try testing.expect(try gitIsDir(io, r2, gpa));
+    try testing.expect(try gitIsDir(gpa, io, r2));
 
     try gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false);
 
     // r1 restored to a real .git directory; r2 untouched (still a dir).
-    try testing.expect(try gitIsDir(io, r1, gpa));
+    try testing.expect(try gitIsDir(gpa, io, r1));
     try testing.expect(!gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
-    try testing.expect(try gitIsDir(io, r2, gpa));
+    try testing.expect(try gitIsDir(gpa, io, r2));
     // r1's git history survives the round-trip.
     const gl = try ex.exec(gpa, io, &.{ "git", "-C", r1, "log", "--oneline" }, null);
     defer {
@@ -1283,7 +1283,7 @@ test "G6-7 detachAll --dry-run leaves adopted entries in place" {
     var sd = try Dir.openDirAbsolute(io, store_git, .{});
     sd.close(io);
     // r2 remains a plain .git dir.
-    try testing.expect(try gitIsDir(io, r2, gpa));
+    try testing.expect(try gitIsDir(gpa, io, r2));
 }
 
 test "G6-8 detachAll on empty root returns without error" {

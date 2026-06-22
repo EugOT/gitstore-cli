@@ -117,39 +117,44 @@ function runKcov(
 }
 
 /**
- * Parse kcov's `<outDir>/<binary>/coverage.json` (the per-run report). kcov
- * writes a top-level object with a `percent_covered` string and a `files`
- * array; we sum covered/total lines across files for a stable number.
+ * Parse kcov's per-run report. kcov usually writes `coverage.json` directly in
+ * `outDir`, but some versions/configurations nest it one directory deep under a
+ * binary-named child. Try the direct report first, then fall back to nested
+ * reports. The JSON contains a `files` array; we sum covered/total lines across
+ * files for a stable number.
  */
 async function readKcovRun(
 	outDir: string,
 ): Promise<{ covered: number; total: number; percent: number } | null> {
-	// kcov nests the report one directory deep (named after the binary). Scan.
-	let dir: string;
+	const candidates = [resolve(outDir, "coverage.json")];
 	try {
 		const entries = readdirSync(outDir);
-		const sub = entries.find((e) => e !== "kcov-merged");
-		dir = sub ? resolve(outDir, sub) : outDir;
-	} catch {
-		return null;
-	}
-	const jsonPath = resolve(dir, "coverage.json");
-	try {
-		const data = (await Bun.file(jsonPath).json()) as {
-			files?: Array<{ covered_lines?: number; total_lines?: number }>;
-			percent_covered?: string;
-		};
-		let covered = 0;
-		let total = 0;
-		for (const f of data.files ?? []) {
-			covered += Number(f.covered_lines ?? 0);
-			total += Number(f.total_lines ?? 0);
+		for (const entry of entries) {
+			if (entry === "coverage.json" || entry === "kcov-merged") continue;
+			candidates.push(resolve(outDir, entry, "coverage.json"));
 		}
-		const percent = total > 0 ? (covered / total) * 100 : 0;
-		return { covered, total, percent };
 	} catch {
-		return null;
+		// Fall through to the direct candidate; Bun.file().json() reports absence.
 	}
+	for (const jsonPath of candidates) {
+		try {
+			const data = (await Bun.file(jsonPath).json()) as {
+				files?: Array<{ covered_lines?: number; total_lines?: number }>;
+				percent_covered?: string;
+			};
+			let covered = 0;
+			let total = 0;
+			for (const f of data.files ?? []) {
+				covered += Number(f.covered_lines ?? 0);
+				total += Number(f.total_lines ?? 0);
+			}
+			const percent = total > 0 ? (covered / total) * 100 : 0;
+			return { covered, total, percent };
+		} catch {
+			// Try the next candidate.
+		}
+	}
+	return null;
 }
 
 export async function measure(): Promise<CoverageSummary> {
