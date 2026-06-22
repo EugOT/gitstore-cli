@@ -116,6 +116,14 @@ function runKcov(
 	return { code: r.code ?? 1, log: `${r.stdout}\n${r.stderr}` };
 }
 
+function mergeKcovRuns(
+	outDir: string,
+	inputs: string[],
+): { code: number; log: string } {
+	const r = spawnSync(["kcov", "--merge", outDir, ...inputs]);
+	return { code: r.code ?? 1, log: `${r.stdout}\n${r.stderr}` };
+}
+
 /**
  * Parse kcov's per-run report. kcov usually writes `coverage.json` directly in
  * `outDir`, but some versions/configurations nest it one directory deep under a
@@ -179,8 +187,7 @@ export async function measure(): Promise<CoverageSummary> {
 		string,
 		{ percent: number; covered: number; total: number }
 	> = {};
-	let totalCovered = 0;
-	let totalLines = 0;
+	const runDirs: string[] = [];
 
 	for (const step of TEST_STEPS) {
 		const { binary, log } = buildTestBinary(step);
@@ -193,6 +200,7 @@ export async function measure(): Promise<CoverageSummary> {
 		if (code !== 0) {
 			throw new Error(`kcov failed on ${step} (exit ${code}):\n${tail(klog)}`);
 		}
+		runDirs.push(outDir);
 		const run = await readKcovRun(outDir);
 		if (!run) {
 			throw new Error(
@@ -204,16 +212,27 @@ export async function measure(): Promise<CoverageSummary> {
 			covered: run.covered,
 			total: run.total,
 		};
-		totalCovered += run.covered;
-		totalLines += run.total;
 	}
 
-	const percent = totalLines > 0 ? (totalCovered / totalLines) * 100 : 0;
+	const mergedDir = resolve(covRoot, "kcov-merged");
+	const { code: mergeCode, log: mergeLog } = mergeKcovRuns(mergedDir, runDirs);
+	if (mergeCode !== 0) {
+		throw new Error(
+			`kcov merge failed (exit ${mergeCode}):\n${tail(mergeLog)}`,
+		);
+	}
+	const merged = await readKcovRun(mergedDir);
+	if (!merged) {
+		throw new Error(
+			`kcov merge completed but no readable coverage.json was found in ${mergedDir}`,
+		);
+	}
+
 	return {
 		status: "measured",
-		percent_covered: Number(percent.toFixed(2)),
-		lines_covered: totalCovered,
-		lines_total: totalLines,
+		percent_covered: Number(merged.percent.toFixed(2)),
+		lines_covered: merged.covered,
+		lines_total: merged.total,
 		per_binary: perBinary,
 	};
 }

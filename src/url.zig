@@ -71,7 +71,7 @@ pub const RepoSpec = struct {
     /// The transport scheme is preserved:
     ///   * `https`/`http` → `"<scheme>://[userinfo@]<git-host>[:port]/<owner>/<name>.git"`
     ///   * `git`          → `"git://[userinfo@]<git-host>[:port]/<owner>/<name>.git"`
-    ///   * `ssh`          → scp form when possible; `ssh://` form when a port must be preserved
+    ///   * `ssh`          → preserve userless `ssh://`; otherwise scp form when possible
     ///   * `file`         → a dupe of `orig_url` (no host to rewrite)
     ///
     /// Caller owns the returned slice.
@@ -126,7 +126,18 @@ fn cloneSshUrl(
     owner: []const u8,
     name: []const u8,
 ) CloneUrlError![]u8 {
-    const user = if (auth.userinfo.len > 0) auth.userinfo else "git";
+    if (auth.userinfo.len == 0) {
+        if (auth.port.len > 0) {
+            return std.fmt.allocPrint(gpa, "ssh://{s}:{s}/{s}/{s}.git", .{
+                host, auth.port, owner, name,
+            });
+        }
+        return std.fmt.allocPrint(gpa, "ssh://{s}/{s}/{s}.git", .{
+            host, owner, name,
+        });
+    }
+
+    const user = auth.userinfo;
     // scp form (`user@host:path`) cannot represent a port, and its single
     // userinfo field is ambiguous once it contains a ':'. Fall back to the
     // hierarchical `ssh://` form whenever either is present.
@@ -823,6 +834,24 @@ test "url: cloneUrl ssh:// URL emits scp-form with override" {
     const u = try spec.cloneUrl(gpa);
     defer gpa.free(u);
     try testing.expectEqualStrings("git@git.sourcecraft.dev:owner/repo.git", u);
+}
+
+test "url: cloneUrl preserves userless ssh URL form" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "ssh://example.internal/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("ssh://example.internal/owner/repo.git", u);
+}
+
+test "url: cloneUrl userless ssh URL still rewrites host override" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "ssh://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("ssh://git.sourcecraft.dev/owner/repo.git", u);
 }
 
 test "url: cloneUrl ssh:// URL preserves userinfo and explicit port with override" {
