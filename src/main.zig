@@ -426,7 +426,10 @@ test "getGhqRoot trims the trailing newline from `ghq root` stdout" {
     // trailing newline/CR and that the failure path frees the owned stdout (a
     // leak there would trip the testing allocator). Skip cleanly if ghq is not
     // runnable in this environment so the suite stays green on minimal hosts.
-    const result = getGhqRoot(gpa, io) catch return error.SkipZigTest;
+    const result = getGhqRoot(gpa, io) catch |err| switch (err) {
+        error.FileNotFound, error.ProcessFailed => return error.SkipZigTest,
+        else => return err,
+    };
     defer gpa.free(result);
     try std.testing.expect(result.len > 0);
     try std.testing.expect(result[result.len - 1] != '\n' and result[result.len - 1] != '\r');

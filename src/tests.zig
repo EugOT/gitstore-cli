@@ -135,10 +135,12 @@ const TestEnv = struct {
     /// Create a git+jj colocated repo.
     fn createJjRepo(self: *const TestEnv, org: []const u8, name: []const u8) ![]u8 {
         const repo_path = try self.createRepo(org, name);
+        errdefer self.gpa.free(repo_path);
 
         const r = try ex.exec(self.gpa, self.io, &.{ "jj", "git", "init", "--colocate" }, repo_path);
-        self.gpa.free(r.stdout);
-        self.gpa.free(r.stderr);
+        defer self.gpa.free(r.stdout);
+        defer self.gpa.free(r.stderr);
+        if (!r.succeeded()) return error.ProcessFailed;
 
         return repo_path;
     }
@@ -148,20 +150,24 @@ const TestEnv = struct {
     /// host/owner/name helpers used by the *All orchestrator tests.
     fn gitInitAt(self: *const TestEnv, repo_path: []const u8) !void {
         const r1 = try ex.exec(self.gpa, self.io, &.{ "git", "init" }, repo_path);
-        self.gpa.free(r1.stdout);
-        self.gpa.free(r1.stderr);
+        defer self.gpa.free(r1.stdout);
+        defer self.gpa.free(r1.stderr);
+        if (!r1.succeeded()) return error.ProcessFailed;
 
         const r1b = try ex.exec(self.gpa, self.io, &.{ "git", "config", "user.email", "test@test.com" }, repo_path);
-        self.gpa.free(r1b.stdout);
-        self.gpa.free(r1b.stderr);
+        defer self.gpa.free(r1b.stdout);
+        defer self.gpa.free(r1b.stderr);
+        if (!r1b.succeeded()) return error.ProcessFailed;
 
         const r1c = try ex.exec(self.gpa, self.io, &.{ "git", "config", "user.name", "Test" }, repo_path);
-        self.gpa.free(r1c.stdout);
-        self.gpa.free(r1c.stderr);
+        defer self.gpa.free(r1c.stdout);
+        defer self.gpa.free(r1c.stderr);
+        if (!r1c.succeeded()) return error.ProcessFailed;
 
         const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo_path);
-        self.gpa.free(r2.stdout);
-        self.gpa.free(r2.stderr);
+        defer self.gpa.free(r2.stdout);
+        defer self.gpa.free(r2.stderr);
+        if (!r2.succeeded()) return error.ProcessFailed;
     }
 
     /// Create a real git repo at `ghq_root/host/owner/name` (the ghq

@@ -85,7 +85,9 @@ function newestTestArtifact(): string | null {
 			const candidate = resolve(oDir, hash, "test");
 			try {
 				const f = Bun.file(candidate);
-				// lastModified is ms epoch; 0 if missing.
+				// Bun has exposed lastModified on file handles since v0.6.0, but
+				// bun-types ^1.3.0 does not declare it yet; keep the cast until the
+				// type definitions catch up.
 				const st = (f as unknown as { lastModified: number }).lastModified;
 				if (st && (best === null || st > best.mtime)) {
 					best = { path: candidate, mtime: st };
@@ -187,15 +189,18 @@ export async function measure(): Promise<CoverageSummary> {
 			throw new Error(`kcov failed on ${step} (exit ${code}):\n${tail(klog)}`);
 		}
 		const run = await readKcovRun(outDir);
-		if (run) {
-			perBinary[step] = {
-				percent: Number(run.percent.toFixed(2)),
-				covered: run.covered,
-				total: run.total,
-			};
-			totalCovered += run.covered;
-			totalLines += run.total;
+		if (!run) {
+			throw new Error(
+				`kcov completed for ${step} but no readable coverage.json was found in ${outDir}`,
+			);
 		}
+		perBinary[step] = {
+			percent: Number(run.percent.toFixed(2)),
+			covered: run.covered,
+			total: run.total,
+		};
+		totalCovered += run.covered;
+		totalLines += run.total;
 	}
 
 	const percent = totalLines > 0 ? (totalCovered / totalLines) * 100 : 0;

@@ -4,8 +4,7 @@
 //! `RepoSpec` are owned by the allocator passed to `parse()` and must be
 //! released via `RepoSpec.deinit()`.
 //!
-//! See `/Users/etretiakov/.claude/plans/libgitstore-v2.md` for the URL
-//! shapes this module handles and their canonical storage layout.
+//! This module handles supported URL shapes and their canonical storage layout.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
