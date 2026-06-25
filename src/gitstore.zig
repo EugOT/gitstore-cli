@@ -6,6 +6,7 @@ const File = std.Io.File;
 const Allocator = std.mem.Allocator;
 const ex = @import("exec.zig");
 const oplog = @import("log.zig");
+const list_mod = @import("list.zig");
 
 pub const Error = error{
     ProcessFailed,
@@ -505,27 +506,21 @@ pub fn adoptAll(
     var skipped: usize = 0;
     var failed: usize = 0;
 
-    const list_result = try ex.exec(gpa, io, &.{ "ghq", "list", "--full-path" }, null);
-    defer {
-        gpa.free(list_result.stdout);
-        gpa.free(list_result.stderr);
-    }
-    if (!list_result.succeeded()) {
-        warn(io, "error: ghq list failed\n", .{});
+    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch |err| {
+        warn(io, "error: ghq enumeration failed: {s}\n", .{@errorName(err)});
         return error.ProcessFailed;
-    }
+    };
+    defer list_mod.freeEntries(gpa, entries);
 
-    var lines = std.mem.splitScalar(u8, ex.trimTrailingNewline(list_result.stdout), '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-
-        if (isAdopted(io, line, gitstore_root, gpa)) {
+    for (entries) |e| {
+        // `e.is_adopted` is precomputed by walk(); no redundant isAdopted() call.
+        if (e.is_adopted) {
             skipped += 1;
             continue;
         }
 
-        adopt(gpa, io, line, ghq_root, gitstore_root, dry_run) catch |err| {
-            warn(io, "error: failed to adopt {s}: {s}\n", .{ line, @errorName(err) });
+        adopt(gpa, io, e.abs_path, ghq_root, gitstore_root, dry_run) catch |err| {
+            warn(io, "error: failed to adopt {s}: {s}\n", .{ e.abs_path, @errorName(err) });
             failed += 1;
             continue;
         };
@@ -631,23 +626,17 @@ pub fn verifyAll(
     ghq_root: []const u8,
     gitstore_root: []const u8,
 ) !void {
-    _ = ghq_root;
     var ok_count: usize = 0;
     var fail_count: usize = 0;
 
-    const list_result = try ex.exec(gpa, io, &.{ "ghq", "list", "--full-path" }, null);
-    defer {
-        gpa.free(list_result.stdout);
-        gpa.free(list_result.stderr);
-    }
-    if (!list_result.succeeded()) return error.ProcessFailed;
+    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch return error.ProcessFailed;
+    defer list_mod.freeEntries(gpa, entries);
 
-    var lines = std.mem.splitScalar(u8, ex.trimTrailingNewline(list_result.stdout), '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (!isAdopted(io, line, gitstore_root, gpa)) continue;
+    for (entries) |e| {
+        // `e.is_adopted` is precomputed by walk(); skip non-adopted repos.
+        if (!e.is_adopted) continue;
 
-        const is_ok = try verify(gpa, io, line);
+        const is_ok = try verify(gpa, io, e.abs_path);
         if (is_ok) ok_count += 1 else fail_count += 1;
     }
 
@@ -1130,22 +1119,17 @@ pub fn detachAll(
     var skipped: usize = 0;
     var failed: usize = 0;
 
-    const list_result = try ex.exec(gpa, io, &.{ "ghq", "list", "--full-path" }, null);
-    defer {
-        gpa.free(list_result.stdout);
-        gpa.free(list_result.stderr);
-    }
-    if (!list_result.succeeded()) return error.ProcessFailed;
+    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch return error.ProcessFailed;
+    defer list_mod.freeEntries(gpa, entries);
 
-    var lines = std.mem.splitScalar(u8, ex.trimTrailingNewline(list_result.stdout), '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (!isAdopted(io, line, gitstore_root, gpa)) {
+    for (entries) |e| {
+        // `e.is_adopted` is precomputed by walk(); skip non-adopted repos.
+        if (!e.is_adopted) {
             skipped += 1;
             continue;
         }
-        detach(gpa, io, line, ghq_root, gitstore_root, dry_run, keep_backup) catch |err| {
-            warn(io, "error: failed to detach {s}: {s}\n", .{ line, @errorName(err) });
+        detach(gpa, io, e.abs_path, ghq_root, gitstore_root, dry_run, keep_backup) catch |err| {
+            warn(io, "error: failed to detach {s}: {s}\n", .{ e.abs_path, @errorName(err) });
             failed += 1;
             continue;
         };

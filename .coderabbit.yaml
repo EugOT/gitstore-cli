@@ -79,6 +79,10 @@ reviews:
   path_instructions:
     - path: "**/*.{zig,zon}"
       instructions: "Check allocator ownership, error propagation, build.zig.zon package hygiene, and version compatibility. Flag silent catch blocks, plaintext secrets, and generated/vendor edits."
+    - path: "scripts/**/*.ts"
+      instructions: "TypeScript scripts under scripts/ contain agent runtime logic for Bun. Apply the repo coding guidelines: explicit IO/error handling, no secret logging, focused functions, and only used imports."
+    - path: "scripts/**/*.sh"
+      instructions: "Shell scripts under scripts/ are thin exec-bun shims for stable CLI surfaces. Apply the repo coding guidelines: strict error handling, argument pass-through, and no duplicated business logic."
     - path: "**/{AGENTS.md,CLAUDE.md,GEMINI.md,WARP.md,PROMPT.md,.github/copilot-instructions.md}"
       instructions: "Treat agent instructions as technical debt. Prefer short repo-specific contracts, explicit commands, and deletion of stale or duplicated prompt text."
   tools:

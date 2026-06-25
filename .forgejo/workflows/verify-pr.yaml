@@ -63,3 +63,48 @@ jobs:
 
       - name: Run eval structural check
         run: bun scripts/eval.ts --check
+
+  coverage:
+    name: kcov line coverage (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: zig-gate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install mise
+        uses: jdx/mise-action@v2
+        with:
+          cache: true
+          install: true
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.0
+
+      - name: Install Zig 0.16.0 via mise
+        run: mise install zig@0.16.0
+
+      - name: Install kcov
+        run: sudo apt-get update && sudo apt-get install -y kcov
+
+      - name: Bun install
+        run: bun ci
+
+      - name: Measure coverage
+        run: bun scripts/kcov-coverage.ts --print
+
+      - name: Enforce coverage threshold
+        run: bun scripts/check-coverage.ts
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
