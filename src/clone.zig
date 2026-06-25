@@ -171,12 +171,11 @@ pub fn cloneOne(
     } else {
         try argv.append(gpa, "--no-recursive");
     }
-    // Reconstruct the clone target. For most forges this equals
-    // `spec.orig_url`, but some serve git from a different host than their
-    // web UI (e.g. SourceCraft: web `sourcecraft.dev`, git
-    // `git.sourcecraft.dev`). The user-facing report keeps `orig_url`
-    // (see `url_dup`); only the git argv targets the git host.
-    const clone_target = try spec.cloneUrl(gpa);
+    // Preserve explicit clone inputs for identity-host clones. Short forms
+    // still need a concrete URL, and forge host overrides still need to
+    // rewrite the clone target (e.g. SourceCraft web host differs from its
+    // git host).
+    const clone_target = try cloneTarget(gpa, spec);
     defer gpa.free(clone_target);
     // Terminate option parsing before the URL so a crafted clone target
     // starting with "--" cannot be misinterpreted by `git clone` as an
@@ -349,6 +348,38 @@ fn workerOne(ctx: *WorkerCtx) Io.Cancelable!void {
 // Helpers
 // =========================================================
 
+fn cloneTarget(gpa: Allocator, spec: url.RepoSpec) CloneError![]u8 {
+    if (shouldPreserveExplicitCloneInput(spec)) {
+        return gpa.dupe(u8, spec.orig_url);
+    }
+    return spec.cloneUrl(gpa);
+}
+
+fn shouldPreserveExplicitCloneInput(spec: url.RepoSpec) bool {
+    if (!std.ascii.eqlIgnoreCase(url.cloneHost(spec.host), spec.host)) return false;
+    return isExplicitCloneInput(spec.orig_url);
+}
+
+fn isExplicitCloneInput(input: []const u8) bool {
+    const schemes = [_][]const u8{
+        "https://",
+        "http://",
+        "ssh://",
+        "git://",
+        "file://",
+    };
+    for (schemes) |scheme| {
+        if (std.mem.startsWith(u8, input, scheme)) return true;
+    }
+    return isScpLikeCloneInput(input);
+}
+
+fn isScpLikeCloneInput(input: []const u8) bool {
+    const at_idx = std.mem.indexOfScalar(u8, input, '@') orelse return false;
+    const colon_idx = std.mem.indexOfScalar(u8, input, ':') orelse return false;
+    return colon_idx > at_idx and std.mem.indexOf(u8, input[0..colon_idx], "://") == null;
+}
+
 /// Return a slice of `path` ending at (but not including) the final `/`.
 /// Returns null if there is no slash.
 fn parentOf(path: []const u8) ?[]const u8 {
@@ -373,6 +404,61 @@ fn dirExists(io: Io, path: []const u8) bool {
 // =========================================================
 
 const testing = std.testing;
+
+test "clone: cloneTarget preserves explicit https identity URL" {
+    const gpa = testing.allocator;
+    var spec = try url.parse(gpa, "https://git.example.com/team/repo", .{});
+    defer spec.deinit(gpa);
+
+    const target = try cloneTarget(gpa, spec);
+    defer gpa.free(target);
+
+    try testing.expectEqualStrings("https://git.example.com/team/repo", target);
+}
+
+test "clone: cloneTarget preserves explicit scp-like identity URL" {
+    const gpa = testing.allocator;
+    var spec = try url.parse(gpa, "git@example.com:team/repo", .{});
+    defer spec.deinit(gpa);
+
+    const target = try cloneTarget(gpa, spec);
+    defer gpa.free(target);
+
+    try testing.expectEqualStrings("git@example.com:team/repo", target);
+}
+
+test "clone: cloneTarget preserves explicit userless ssh identity URL" {
+    const gpa = testing.allocator;
+    var spec = try url.parse(gpa, "ssh://example.internal/owner/repo", .{});
+    defer spec.deinit(gpa);
+
+    const target = try cloneTarget(gpa, spec);
+    defer gpa.free(target);
+
+    try testing.expectEqualStrings("ssh://example.internal/owner/repo", target);
+}
+
+test "clone: cloneTarget builds concrete URL for short input" {
+    const gpa = testing.allocator;
+    var spec = try url.parse(gpa, "github.com/owner/repo", .{});
+    defer spec.deinit(gpa);
+
+    const target = try cloneTarget(gpa, spec);
+    defer gpa.free(target);
+
+    try testing.expectEqualStrings("https://github.com/owner/repo.git", target);
+}
+
+test "clone: cloneTarget rewrites explicit sourcecraft URL" {
+    const gpa = testing.allocator;
+    var spec = try url.parse(gpa, "https://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+
+    const target = try cloneTarget(gpa, spec);
+    defer gpa.free(target);
+
+    try testing.expectEqualStrings("https://git.sourcecraft.dev/owner/repo.git", target);
+}
 
 /// Initialize a bare git repo at `bare_path` with at least one commit.
 /// Mirrors the seeded-repo helper in tests.zig but writes to any path.
