@@ -21,6 +21,13 @@ comptime {
     _ = @import("list.zig");
     _ = @import("cache.zig");
     _ = @import("clone.zig");
+    // main.zig hosts inline unit tests for its private dispatcher helpers
+    // (getGitstoreRoot / getGhqRoot / resolveGhqRootOrHome) and e2e tests
+    // that spawn the built gitstore binary. Force-importing it here makes the
+    // integration test runner collect those `test` blocks. main.zig is
+    // path-relative and transitively imports the co-located src/ modules, so
+    // no extra build.zig wiring is needed beyond the `build_options` seam.
+    _ = @import("main.zig");
 }
 
 const config = @import("config.zig");
@@ -119,37 +126,67 @@ const TestEnv = struct {
     /// Create a git repo at ghq_root/org/name with an initial commit.
     fn createRepo(self: *const TestEnv, org: []const u8, name: []const u8) ![]u8 {
         const repo_path = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}", .{ self.ghq_root, org, name });
+        errdefer self.gpa.free(repo_path);
         try Dir.cwd().createDirPath(self.io, repo_path);
-
-        // git init + configure user + initial commit
-        const r1 = try ex.exec(self.gpa, self.io, &.{ "git", "init" }, repo_path);
-        self.gpa.free(r1.stdout);
-        self.gpa.free(r1.stderr);
-
-        const r1b = try ex.exec(self.gpa, self.io, &.{ "git", "config", "user.email", "test@test.com" }, repo_path);
-        self.gpa.free(r1b.stdout);
-        self.gpa.free(r1b.stderr);
-
-        const r1c = try ex.exec(self.gpa, self.io, &.{ "git", "config", "user.name", "Test" }, repo_path);
-        self.gpa.free(r1c.stdout);
-        self.gpa.free(r1c.stderr);
-
-        const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo_path);
-        self.gpa.free(r2.stdout);
-        self.gpa.free(r2.stderr);
-
+        try self.gitInitAt(repo_path);
         return repo_path;
     }
 
     /// Create a git+jj colocated repo.
     fn createJjRepo(self: *const TestEnv, org: []const u8, name: []const u8) ![]u8 {
         const repo_path = try self.createRepo(org, name);
+        errdefer self.gpa.free(repo_path);
 
         const r = try ex.exec(self.gpa, self.io, &.{ "jj", "git", "init", "--colocate" }, repo_path);
-        self.gpa.free(r.stdout);
-        self.gpa.free(r.stderr);
+        defer self.gpa.free(r.stdout);
+        defer self.gpa.free(r.stderr);
+        if (!r.succeeded()) return error.ProcessFailed;
 
         return repo_path;
+    }
+
+    /// Run `git init` + user config + an initial empty commit inside an
+    /// already-created directory. Shared by `createRepo` and the
+    /// host/owner/name helpers used by the *All orchestrator tests.
+    fn gitInitAt(self: *const TestEnv, repo_path: []const u8) !void {
+        const r1 = try ex.exec(self.gpa, self.io, &.{ "git", "init" }, repo_path);
+        defer self.gpa.free(r1.stdout);
+        defer self.gpa.free(r1.stderr);
+        if (!r1.succeeded()) return error.ProcessFailed;
+
+        const r1b = try ex.exec(self.gpa, self.io, &.{ "git", "config", "user.email", "test@test.com" }, repo_path);
+        defer self.gpa.free(r1b.stdout);
+        defer self.gpa.free(r1b.stderr);
+        if (!r1b.succeeded()) return error.ProcessFailed;
+
+        const r1c = try ex.exec(self.gpa, self.io, &.{ "git", "config", "user.name", "Test" }, repo_path);
+        defer self.gpa.free(r1c.stdout);
+        defer self.gpa.free(r1c.stderr);
+        if (!r1c.succeeded()) return error.ProcessFailed;
+
+        const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo_path);
+        defer self.gpa.free(r2.stdout);
+        defer self.gpa.free(r2.stderr);
+        if (!r2.succeeded()) return error.ProcessFailed;
+    }
+
+    /// Create a real git repo at `ghq_root/host/owner/name` (the ghq
+    /// host/owner/name layout that `list.walk` enumerates). `host` must
+    /// contain a dot so it passes `looksLikeHost`. Caller frees the path.
+    fn createHostRepo(self: *const TestEnv, host: []const u8, owner: []const u8, name: []const u8) ![]u8 {
+        const repo_path = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}/{s}", .{ self.ghq_root, host, owner, name });
+        errdefer self.gpa.free(repo_path);
+        try Dir.cwd().createDirPath(self.io, repo_path);
+        try self.gitInitAt(repo_path);
+        return repo_path;
+    }
+
+    /// Create a bare owner directory `ghq_root/host/owner` with no repos.
+    /// Used to exercise the "root exists but enumerates nothing" path.
+    fn createOwnerDir(self: *const TestEnv, host: []const u8, owner: []const u8) !void {
+        const p = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}", .{ self.ghq_root, host, owner });
+        defer self.gpa.free(p);
+        try Dir.cwd().createDirPath(self.io, p);
     }
 };
 
@@ -1031,6 +1068,235 @@ test "e2e detach round-trip preserves linked worktree" {
 }
 
 // =========================================================
+// G6 — multi-repo orchestrators (adoptAll / verifyAll / detachAll).
+//
+// These exercise the native `list.walk`-backed enumeration that replaced
+// the `ghq list --full-path` shell-out. Repos live under the ghq
+// host/owner/name layout (host == "github.com" so `looksLikeHost` passes);
+// no real `ghq` binary is involved. Adopted fixtures are produced by the
+// real `gitstore.adopt` so the on-disk pointer AND the gitstore git
+// database both exist (verify/detach need the database to be real).
+//
+// NOTE on output assertions: gitstore's `info()` helper early-returns under
+// `builtin.is_test`, so the human-facing summary lines ("would detach: 1",
+// "summary: N adopted ...") are intentionally suppressed during tests. G6
+// therefore asserts on the *observable state* — return counts surfaced via
+// out-params plus on-disk `.git` shape — which is the behavior the summary
+// merely reports. `warn()` is NOT suppressed, so the absence of a `FAIL:`/
+// `error:` line for a skipped repo is still a meaningful negative signal.
+//
+// `adoptAll`/`verifyAll`/`detachAll` print their counts rather than
+// returning them, so each test re-derives the expected end state from disk.
+// =========================================================
+
+/// Read a repo's `.git` and report whether it is a `gitdir:` pointer file.
+fn gitIsPointer(gpa: Allocator, io: Io, repo: []const u8) !bool {
+    const gp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(gp);
+    const content = Dir.cwd().readFileAlloc(io, gp, gpa, .unlimited) catch |err| switch (err) {
+        error.IsDir => return false,
+        else => return err,
+    };
+    defer gpa.free(content);
+    return std.mem.startsWith(u8, content, "gitdir: ");
+}
+
+/// True if `<repo>/.git` is a real directory (i.e. NOT adopted / detached).
+fn gitIsDir(gpa: Allocator, io: Io, repo: []const u8) !bool {
+    const gp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(gp);
+    var d = Dir.openDirAbsolute(io, gp, .{}) catch |err| switch (err) {
+        error.NotDir => return false, // pointer file
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    d.close(io);
+    return true;
+}
+
+test "G6-1 adoptAll adopts fresh repos and skips pre-adopted" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    const r3 = try env.createHostRepo("github.com", "o", "r3");
+    defer gpa.free(r3);
+    // r3 is already adopted before the batch runs.
+    try gitstore.adopt(gpa, io, r3, env.ghq_root, env.gitstore_root, false);
+
+    try gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false);
+
+    // r1 and r2 are now pointer files; r3 stays a (valid) pointer.
+    try testing.expect(try gitIsPointer(gpa, io, r1));
+    try testing.expect(try gitIsPointer(gpa, io, r2));
+    try testing.expect(try gitIsPointer(gpa, io, r3));
+    // All three resolve as adopted; none is a bare .git dir.
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    try testing.expect(gitstore.isAdopted(io, r2, env.gitstore_root, gpa));
+    try testing.expect(gitstore.isAdopted(io, r3, env.gitstore_root, gpa));
+}
+
+test "G6-2 adoptAll re-run is all-skip with no pointer corruption" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    const r3 = try env.createHostRepo("github.com", "o", "r3");
+    defer gpa.free(r3);
+
+    try gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false);
+    // Second pass: everything already adopted -> no-op, no corruption.
+    try gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false);
+
+    try testing.expect(try gitIsPointer(gpa, io, r1));
+    try testing.expect(try gitIsPointer(gpa, io, r2));
+    try testing.expect(try gitIsPointer(gpa, io, r3));
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    try testing.expect(gitstore.isAdopted(io, r2, env.gitstore_root, gpa));
+    try testing.expect(gitstore.isAdopted(io, r3, env.gitstore_root, gpa));
+}
+
+test "G6-3 adoptAll on empty owner dir returns without error" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    // Owner directory exists but contains no repos; walk() yields nothing.
+    try env.createOwnerDir("github.com", "o");
+
+    // Old contract: `ghq list` success + empty output -> no error, 0 counts.
+    // walk() preserves this exactly (empty slice, loop body never runs).
+    try gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false);
+}
+
+test "G6-4 verifyAll counts ok and skips non-adopted repos" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    // r1 adopted (real pointer + gitstore git dir); r2 left as a plain .git dir.
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    // verifyAll prints its tally; assert the per-repo verify outcomes that
+    // drive that tally. r1 must verify OK; r2 must never be examined (it is
+    // not adopted, so the loop `continue`s past it).
+    try testing.expect(try gitstore.verify(gpa, io, r1));
+    try testing.expect(!gitstore.isAdopted(io, r2, env.gitstore_root, gpa));
+
+    // The orchestrator itself must complete without error.
+    try gitstore.verifyAll(gpa, io, env.ghq_root, env.gitstore_root);
+}
+
+test "G6-5 verifyAll surfaces a broken pointer as a failure" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    // Break the pointer by deleting the gitstore git database it targets.
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/github.com/o/r1/git", .{env.gitstore_root});
+    defer gpa.free(store_git);
+    try Dir.cwd().deleteTree(io, store_git);
+
+    // r1 is still flagged adopted (pointer intact) so verifyAll WILL examine
+    // it, and verify() must now report failure (target gone).
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    try testing.expect(!try gitstore.verify(gpa, io, r1));
+
+    // verifyAll completes (failures are tallied, not propagated as errors).
+    try gitstore.verifyAll(gpa, io, env.ghq_root, env.gitstore_root);
+}
+
+test "G6-6 detachAll detaches adopted and skips non-adopted" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    // Sanity: pre-state is r1 adopted (pointer), r2 a plain .git dir.
+    try testing.expect(try gitIsPointer(gpa, io, r1));
+    try testing.expect(try gitIsDir(gpa, io, r2));
+
+    try gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false);
+
+    // r1 restored to a real .git directory; r2 untouched (still a dir).
+    try testing.expect(try gitIsDir(gpa, io, r1));
+    try testing.expect(!gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    try testing.expect(try gitIsDir(gpa, io, r2));
+    // r1's git history survives the round-trip.
+    const gl = try ex.exec(gpa, io, &.{ "git", "-C", r1, "log", "--oneline" }, null);
+    defer {
+        gpa.free(gl.stdout);
+        gpa.free(gl.stderr);
+    }
+    try testing.expect(gl.succeeded());
+}
+
+test "G6-7 detachAll --dry-run leaves adopted entries in place" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    const r2 = try env.createHostRepo("github.com", "o", "r2");
+    defer gpa.free(r2);
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    // dry_run=true: the summary line "would detach: 1" is emitted via info(),
+    // which is suppressed under builtin.is_test, so we assert the *invariant*
+    // a dry run guarantees: nothing on disk changes.
+    try gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, true, false);
+
+    // r1 is STILL an adopted pointer; the gitstore database is STILL present.
+    try testing.expect(try gitIsPointer(gpa, io, r1));
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/github.com/o/r1/git", .{env.gitstore_root});
+    defer gpa.free(store_git);
+    var sd = try Dir.openDirAbsolute(io, store_git, .{});
+    sd.close(io);
+    // r2 remains a plain .git dir.
+    try testing.expect(try gitIsDir(gpa, io, r2));
+}
+
+test "G6-8 detachAll on empty root returns without error" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    // No repos under ghq_root at all (the root dir itself exists, empty).
+    try gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false);
+}
+
+// =========================================================
 // config: resolvePrecedence — pure, Io.failing-testable
 // =========================================================
 
@@ -1612,4 +1878,337 @@ test "adopt rejects repo_path with '.' segment under storage path" {
 
     const r = gitstore.adopt(gpa, io, "/foo/./bar", env.ghq_root, env.gitstore_root, false);
     try testing.expectError(error.GitDirMalformed, r);
+}
+
+// =========================================================
+// G3 — CLI end-to-end tests: spawn the BUILT `gitstore` binary
+// =========================================================
+//
+// These tests exercise the real argument dispatcher in src/main.zig by
+// spawning the compiled executable in a child process and asserting its
+// exit code and a substring of the chosen output stream. The binary path is
+// baked in hermetically at build time:
+//
+//   build.zig:
+//     integration_tests.step.dependOn(&exe.step);   // build gitstore first
+//     e2e_opts.addOptionPath("gitstore_bin", exe.getEmittedBin());
+//     integration_mod.addOptions("build_options", e2e_opts);
+//
+// `addOptionPath` takes the emitted-bin LazyPath and resolves it lazily inside
+// the Options step's own make() (an eager getPath2() during graph construction
+// panics with "misconfigured build script"), writing the absolute path into
+// the generated `build_options` module where it surfaces as a `[]const u8`.
+// `gitstore_bin` is therefore an absolute path to the just-built binary —
+// no cwd-relative guessing, no reliance on the install prefix.
+//
+// stdout vs stderr routing (load-bearing, verified against main.zig):
+//   * printUsage / printErr → File.stderr() — usage text + all error lines
+//   * printOut              → File.stdout() — every `<cmd> --help` body
+// So `--help` substrings are asserted in STDOUT; usage/error substrings in
+// STDERR.
+//
+// Exit-code matrix (verified against every `return N` in main.zig):
+//   * exit 0  — success, usage on no-args, all `--help`
+//   * exit 1  — `filter <unexpected>` ONLY among bad-arg paths (main.zig:682)
+//   * exit 2  — every other argument-rejection path
+//   * != 0    — `migrate <path>` real-mode returns error.MigrationNotImplemented
+//               (main.zig:1218), which the Zig runtime reports as a non-zero
+//               process exit.
+//
+// Each test runs with a controlled environment (HOME + GIT_CONFIG_GLOBAL
+// pointed at throwaway temp paths, plus the real PATH) so no test can touch
+// the operator's real HOME, ghq config, or gitstore root.
+
+const build_options = @import("build_options");
+
+/// Which captured stream a substring assertion targets.
+const Stream = enum { stdout, stderr };
+
+/// Expected process termination for an e2e case.
+const ExpectExit = union(enum) {
+    /// Exact `Exited` code.
+    code: u8,
+    /// Any non-zero `Exited` code (used for the migrate real-mode error
+    /// return, whose precise code is runtime-defined).
+    nonzero,
+};
+
+const E2eCase = struct {
+    argv_tail: []const []const u8,
+    expect: ExpectExit,
+    stream: Stream,
+    needle: []const u8,
+};
+
+/// Build a controlled child environment. HOME and GIT_CONFIG_GLOBAL point at
+/// the supplied throwaway paths; PATH is copied from the test environ so the
+/// child can still resolve git/jj if a code path reaches an exec (the
+/// argument-rejection cases return before any exec, but happy-path help does
+/// not, and keeping PATH makes the harness reusable).
+fn controlledEnv(
+    gpa: Allocator,
+    home: []const u8,
+    git_config_global: []const u8,
+) !std.process.Environ.Map {
+    var map: std.process.Environ.Map = .init(gpa);
+    errdefer map.deinit();
+    try map.put("HOME", home);
+    try map.put("GIT_CONFIG_GLOBAL", git_config_global);
+    // Copy PATH from the portable testing environ view if present.
+    var parent = try std.testing.environ.createMap(gpa);
+    defer parent.deinit();
+    if (parent.get("PATH")) |path| {
+        try map.put("PATH", path);
+    }
+    return map;
+}
+
+/// Spawn the built gitstore binary with `argv_tail` and a controlled env,
+/// then assert the expected exit code and that `needle` appears in the
+/// selected stream. Uses std.process.run (the same high-level spawn API
+/// exec.zig builds on) so pipe wiring and full-output capture are handled.
+fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
+    // Throwaway HOME dir + empty global gitconfig, unique per invocation so
+    // parallel test execution cannot collide.
+    const home = try uniqueTempDir(gpa, io, "/tmp/gitstore_e2e_home");
+    defer {
+        Dir.cwd().deleteTree(io, home) catch {};
+        gpa.free(home);
+    }
+    const git_config = try uniqueTempFile(gpa, io, "/tmp/gitstore_e2e", ".gitconfig");
+    defer {
+        Dir.cwd().deleteFile(io, git_config) catch {};
+        gpa.free(git_config);
+    }
+
+    // argv = [binary, tail...]
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, build_options.gitstore_bin);
+    for (case.argv_tail) |a| try argv.append(gpa, a);
+
+    // Space-joined tail for diagnostics. In Zig 0.16 `{s}` only formats a
+    // single `[]const u8`, so a `[]const []const u8` must be joined first.
+    const argv_desc = try std.mem.join(gpa, " ", case.argv_tail);
+    defer gpa.free(argv_desc);
+
+    var env_map = try controlledEnv(gpa, home, git_config);
+    defer env_map.deinit();
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    // Exit-code assertion.
+    try testing.expect(result.term == .exited);
+    switch (case.expect) {
+        .code => |c| testing.expectEqual(c, result.term.exited) catch |err| {
+            std.debug.print(
+                "e2e argv={s} expected exit {d}, got {d}\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
+                .{ argv_desc, c, result.term.exited, result.stdout, result.stderr },
+            );
+            return err;
+        },
+        .nonzero => testing.expect(result.term.exited != 0) catch |err| {
+            std.debug.print(
+                "e2e argv={s} expected non-zero exit, got 0\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
+                .{ argv_desc, result.stdout, result.stderr },
+            );
+            return err;
+        },
+    }
+
+    // Substring assertion on the selected stream (skip when needle is empty —
+    // e.g. `--help` cases whose body content is not pinned, only exit code).
+    if (case.needle.len > 0) {
+        const haystack = switch (case.stream) {
+            .stdout => result.stdout,
+            .stderr => result.stderr,
+        };
+        testing.expect(std.mem.indexOf(u8, haystack, case.needle) != null) catch |err| {
+            std.debug.print(
+                "e2e argv={s} missing needle <<{s}>> in {s}\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
+                .{ argv_desc, case.needle, @tagName(case.stream), result.stdout, result.stderr },
+            );
+            return err;
+        };
+    }
+}
+
+// --- usage / global help (printUsage → stderr) ---
+
+test "e2e (no args) prints usage to stderr, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{},
+        .expect = .{ .code = 0 },
+        .stream = .stderr,
+        .needle = "Usage: gitstore",
+    });
+}
+
+test "e2e --help prints usage to stderr, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"--help"},
+        .expect = .{ .code = 0 },
+        .stream = .stderr,
+        .needle = "Usage: gitstore",
+    });
+}
+
+test "e2e -h prints usage to stderr, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"-h"},
+        .expect = .{ .code = 0 },
+        .stream = .stderr,
+        .needle = "Usage: gitstore",
+    });
+}
+
+test "e2e unknown command exits 2 with error on stderr" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"frobnicator"},
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: unknown command 'frobnicator'",
+    });
+}
+
+// --- init ---
+
+test "e2e init --unknown rejects unknown flag, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "init", "--unknown" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: unknown flag for init: --unknown",
+    });
+}
+
+test "e2e init with two paths rejects extra path, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "init", "/a", "/b" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: init takes at most one path: /b",
+    });
+}
+
+test "e2e init --help prints sub-help to stdout, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "init", "--help" },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "gitstore init",
+    });
+}
+
+// --- hook (scan-all flag handling) ---
+
+test "e2e hook with no shell flag errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"hook"},
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: hook requires --zsh, --bash, or --nu",
+    });
+}
+
+test "e2e hook with conflicting shells errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "hook", "--zsh", "--bash" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: hook accepts only one of --zsh/--bash/--nu",
+    });
+}
+
+test "e2e hook --zsh --help surfaces help to stdout, exit 0" {
+    // Scan-all: --help wins even after a valid shell flag (main.zig round-6).
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "hook", "--zsh", "--help" },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "gitstore hook",
+    });
+}
+
+// --- filter (exit-1 anomaly) ---
+
+test "e2e filter unexpected arg exits 1 (NOT 2), error on stderr" {
+    // Load-bearing: this is the ONLY bad-arg path that returns 1 (main.zig:682).
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "filter", "unexpected" },
+        .expect = .{ .code = 1 },
+        .stream = .stderr,
+        .needle = "error: unexpected argument: unexpected",
+    });
+}
+
+test "e2e filter foo -h surfaces help to stdout, exit 0" {
+    // Scan-all: -h anywhere wins over the otherwise-unexpected `foo`.
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "filter", "foo", "-h" },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "",
+    });
+}
+
+// --- get ---
+
+test "e2e get with no url errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"get"},
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: get requires at least one <url>",
+    });
+}
+
+test "e2e get -P with non-integer value errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "get", "-P", "foo", "https://example.com/o/r" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: -P argument must be a positive integer",
+    });
+}
+
+// --- create ---
+
+test "e2e create --vcs with bad value errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "create", "--vcs", "hg", "owner/repo" },
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: --vcs must be 'git' or 'jj'",
+    });
+}
+
+// --- migrate (exit 2 on missing arg; non-zero error on real-mode) ---
+
+test "e2e migrate with no new-root errors, exit 2" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{"migrate"},
+        .expect = .{ .code = 2 },
+        .stream = .stderr,
+        .needle = "error: migrate requires <new-root>",
+    });
+}
+
+test "e2e migrate real-mode is unimplemented, non-zero exit with stderr" {
+    // `migrate <path>` without --dry-run prints the not-implemented error and
+    // returns error.MigrationNotImplemented (main.zig:1218); the Zig runtime
+    // turns that into a non-zero process exit.
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "migrate", "/tmp/gitstore_e2e_new_root" },
+        .expect = .nonzero,
+        .stream = .stderr,
+        .needle = "real-mode not implemented",
+    });
 }
