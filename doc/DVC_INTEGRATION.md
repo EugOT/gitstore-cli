@@ -33,7 +33,7 @@ CLI help and dispatch live in `src/main.zig`: top-level usage (`src/main.zig:14`
 
 Subprocess execution is security-sensitive. `exec.zig` whitelists subprocess environment variables (`src/exec.zig:35`) and documents that children inherit a scrubbed environment rather than the full parent environment (`src/exec.zig:103`, `src/exec.zig:106`). A DVC runner should extend this narrowly instead of widening the global whitelist.
 
-`gitstore sync` writes `hooks.rclone_filter` and calls `rclone sync` (`src/gitstore.zig:767`, `src/gitstore.zig:785`). The filter excludes VCS internals, build/cache outputs, secrets, env files, and logs (`src/hooks.zig:87`). DVC-specific filter additions belong in `src/hooks.zig`, with tests near the existing rclone filter assertions (`src/hooks.zig:275`).
+`gitstore sync` starts at `src/gitstore.zig:756`, writes `hooks.rclone_filter` (`src/gitstore.zig:774`, `src/gitstore.zig:777`), and calls `rclone sync` for dry-run and real sync paths (`src/gitstore.zig:790`, `src/gitstore.zig:808`). The filter excludes VCS internals, build/cache outputs, secrets, env files, and logs (`src/hooks.zig:87`). DVC-specific filter additions belong in `src/hooks.zig`, with tests near the existing rclone filter assertions (`src/hooks.zig:275`).
 
 DagShub Git host identity should stay unchanged. Current URL rewriting only has a SourceCraft override (`src/url.zig:179`), and `cloneHost()` returns identity for all non-overridden hosts (`src/url.zig:189`). The existing tests explicitly pin `dagshub.com` identity (`src/url.zig:700`).
 
@@ -53,7 +53,7 @@ DagShub's DVC integration provides DVC-managed storage, supports S3-compatible s
 
 Git uses `GIT_ASKPASS` by invoking the configured program to answer credential prompts before falling back to other askpass/config/terminal options ([Git credentials](https://git-scm.com/docs/gitcredentials)).
 
-Local shell evidence on 2026-06-25: `dvc` was not on `PATH`; `pixi` was available; this repository did not expose DVC via a repo-local pixi environment. Prior empirical facts to preserve from the investigation are: `dvc version` had been verified in the observed environment, DagShub native DVC storage worked, `dvc pull` previously fetched 481 files, DagShub auth should use username/token HTTP basic auth via `GIT_ASKPASS`, and credentials must not be embedded in URLs because email-like usernames break URL parsing.
+Local shell evidence on 2026-06-25: `dvc` was not on `PATH`; `pixi` was available; this repository did not expose DVC via a repo-local pixi environment. Separate prior empirical evidence from the earlier observed environment was that `dvc version` had been verified there, but the exact activation path was not preserved in this repo branch. Treat that as a reproduction requirement: the implementation must document whether DVC came from pixi, PATH, Nix, or another managed environment before enabling live DVC tests. Other prior empirical facts to preserve are: DagShub native DVC storage worked, `dvc pull` previously fetched 481 files, DagShub auth should use username/token HTTP basic auth via `GIT_ASKPASS`, and credentials must not be embedded in URLs because email-like usernames break URL parsing.
 
 DagShub DVC remote URL forms to support without rewriting the Git host include S3-style remotes such as `s3://dvc@dagshub.com/<org>/<repo>.s3` and HTTP-style remotes such as `https://dagshub.com/<org>/<repo>.dvc`.
 
@@ -111,7 +111,9 @@ DVC cache and temp state should be excluded to avoid double-syncing large data t
 - .dvc/tmp/**
 ```
 
-Do not try to exclude all DVC outputs from `gitstore sync`; gitstore cannot reliably know DVC outs without asking DVC, and large-data movement is explicitly DVC's job. The documented safe pattern is Git for code/metadata, DVC for data cache/remotes, and gitstore/rclone only for non-DVC working tree backup semantics.
+Do not silently sync DVC workspace outputs. Excluding `.dvc/cache` and `.dvc/tmp` is necessary but not sufficient when `dvc pull` has materialized large outputs into the working tree. The minimal safe guard is: if `gitstore sync` detects a DVC repo under the sync source, it must warn and refuse by default unless a future explicit flag acknowledges that DVC-managed workspace outputs may be copied. A later implementation can derive DVC outs through `dvc status --json` or DVC metadata and add generated rclone excludes, but that should be a separate tested feature.
+
+The documented safe pattern is Git for code/metadata, DVC for data cache/remotes, and gitstore/rclone only for non-DVC working tree backup semantics.
 
 ## Implementation Tasks
 
@@ -150,7 +152,8 @@ Do not try to exclude all DVC outputs from `gitstore sync`; gitstore cannot reli
 
 - Add `.dvc/cache/**`, `.dvc/cache/runs/**`, and `.dvc/tmp/**` excludes.
 - Add tests in `src/hooks.zig` near existing rclone filter tests.
-- Acceptance: filter excludes DVC cache/tmp and does not exclude `.dvc/config`, `.dvcignore`, `dvc.yaml`, `dvc.lock`, or `*.dvc`.
+- Add a sync guard that warns and refuses by default when a DVC repo is inside the rclone sync source unless a future explicit override is provided.
+- Acceptance: filter excludes DVC cache/tmp, does not exclude `.dvc/config`, `.dvcignore`, `dvc.yaml`, `dvc.lock`, or `*.dvc`, and sync cannot silently copy materialized DVC workspace outputs.
 
 ### 7. Optional DagShub E2E
 
