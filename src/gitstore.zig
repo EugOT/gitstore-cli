@@ -585,7 +585,7 @@ pub fn verify(
     defer gpa.free(jj_path);
 
     var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const link_len = Dir.readLinkAbsolute(io, jj_path, &link_buf) catch |err| switch (err) {
+    const link_len = Dir.cwd().readLink(io, jj_path, &link_buf) catch |err| switch (err) {
         error.FileNotFound => {
             if (ok) info(io, "OK: {s} (no .jj)\n", .{repo_path});
             return ok;
