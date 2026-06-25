@@ -623,6 +623,30 @@ test "e2e verify passes on correctly adopted repo" {
     const ok = try gitstore.verify(gpa, io, repo);
     try testing.expect(ok);
 }
+// =========================================================
+// E2E: verify accepts relative repo path
+// =========================================================
+
+test "e2e verify accepts relative adopted repo path" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "verify_relative");
+    defer gpa.free(repo);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+
+    const relative_repo = try uniqueTempFile(gpa, io, "gitstore_verify_relative_link", "");
+    defer gpa.free(relative_repo);
+    try Dir.cwd().deleteFile(io, relative_repo);
+    defer Dir.cwd().deleteFile(io, relative_repo) catch {};
+    try Dir.cwd().symLink(io, repo, relative_repo, .{ .is_directory = true });
+
+    const ok = try gitstore.verify(gpa, io, relative_repo);
+    try testing.expect(ok);
+}
 
 // =========================================================
 // E2E: verify fails on non-adopted repo
