@@ -641,7 +641,7 @@ test "e2e verify accepts relative adopted repo path" {
     const relative_repo = try uniqueTempFile(gpa, io, "gitstore_verify_relative_link", "");
     defer gpa.free(relative_repo);
     try Dir.cwd().deleteFile(io, relative_repo);
-    defer Dir.cwd().deleteFile(io, relative_repo) catch {};
+    defer Dir.cwd().deleteFile(io, relative_repo) catch unreachable;
     try Dir.cwd().symLink(io, repo, relative_repo, .{ .is_directory = true });
 
     const ok = try gitstore.verify(gpa, io, relative_repo);
