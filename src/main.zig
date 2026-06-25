@@ -305,6 +305,140 @@ fn resolveGhqRootOrHome(gpa: Allocator, io: Io, environ_map: *const std.process.
     };
 }
 
+// =========================================================
+// Unit tests for the private dispatcher helpers (G2).
+//
+// These live inline in main.zig because the helpers are private — only test
+// blocks in the same file can see them, so no `pub` wrapper or seam function
+// is needed. The integration test runner collects these via
+// `comptime { _ = @import("main.zig"); }` in src/tests.zig. They MUST NOT
+// reference `@import("build_options")`: that module is added only to the
+// integration module, not to exe_mod (whose root is also main.zig), so a
+// build_options import here would break the `gitstore` executable build.
+//
+// Every test uses std.testing.allocator and frees on the success path so the
+// testing allocator's leak detector pins any allocPrint that is not released.
+// =========================================================
+
+test "getGitstoreRoot returns <HOME>/.local/share/gitstore" {
+    const gpa = std.testing.allocator;
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/test/home");
+
+    const root = try getGitstoreRoot(gpa, &env_map);
+    defer gpa.free(root);
+    try std.testing.expectEqualStrings("/test/home/.local/share/gitstore", root);
+}
+
+test "getGitstoreRoot errors when HOME is absent" {
+    const gpa = std.testing.allocator;
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    // Intentionally leave HOME unset.
+
+    try std.testing.expectError(error.InvalidUserId, getGitstoreRoot(gpa, &env_map));
+}
+
+// DISCREPANCY vs the task's HELPERS testSpec: `std.testing.io` is a real
+// `Io.Threaded` instance (see std/testing.zig: `io_instance: Io.Threaded`).
+// It SPAWNS real processes under `zig build test` — exec.zig's own tests run
+// real `git`/`echo`/`pwd` through it. The spec assumed ghq exec would always
+// fail under testing.io and the HOME fallback would fire deterministically;
+// that is not the real behavior when ghq is installed. These tests therefore
+// branch on actual ghq availability (probed once via getGhqRoot) so they pin
+// the true contract whether or not ghq is on PATH, instead of asserting a
+// fallback that never executes on a host that has ghq. main.zig logic is
+// unchanged.
+
+/// Probe whether `ghq root` is runnable under the test io. Returns the owned
+/// real ghq-root slice on success (caller frees), or null when ghq is absent
+/// / fails to produce a clean zero-exit result.
+fn probeGhqRoot(gpa: Allocator, io: Io) ?[]u8 {
+    return getGhqRoot(gpa, io) catch return null;
+}
+
+test "resolveGhqRootOrHome: real ghq root when present, else <HOME>/ghq fallback" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/tmp/testhome");
+
+    const root = try resolveGhqRootOrHome(gpa, io, &env_map);
+    defer gpa.free(root);
+
+    if (probeGhqRoot(gpa, io)) |real| {
+        defer gpa.free(real);
+        // ghq present: resolveGhqRootOrHome must return the real ghq root and
+        // must NOT consult HOME, so it never equals the "/tmp/testhome/ghq"
+        // fallback.
+        try std.testing.expectEqualStrings(real, root);
+        try std.testing.expect(!std.mem.eql(u8, "/tmp/testhome/ghq", root));
+    } else {
+        // ghq absent: the HOME fallback branch fires deterministically.
+        try std.testing.expectEqualStrings("/tmp/testhome/ghq", root);
+    }
+}
+
+test "resolveGhqRootOrHome errors with InvalidUserId only when ghq fails AND HOME absent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    // No HOME set.
+
+    if (probeGhqRoot(gpa, io)) |real| {
+        // ghq present: success short-circuits before the HOME lookup, so the
+        // missing HOME is irrelevant and a real root is returned.
+        defer gpa.free(real);
+        const root = try resolveGhqRootOrHome(gpa, io, &env_map);
+        defer gpa.free(root);
+        try std.testing.expectEqualStrings(real, root);
+    } else {
+        // ghq absent + HOME absent → the only path that yields InvalidUserId.
+        try std.testing.expectError(error.InvalidUserId, resolveGhqRootOrHome(gpa, io, &env_map));
+    }
+}
+
+test "getGhqRoot returns an absolute newline-trimmed path when ghq is installed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // Success path: absolute, non-empty, trailing newline stripped (the trim
+    // contract). Failure path (ghq absent): a value is never returned.
+    const result = getGhqRoot(gpa, io) catch |err| {
+        try std.testing.expect(err == error.FileNotFound or
+            err == error.ProcessFailed or
+            err == error.Unexpected);
+        return;
+    };
+    defer gpa.free(result);
+    try std.testing.expect(result.len > 0);
+    try std.testing.expect(result[0] == '/');
+    try std.testing.expect(result[result.len - 1] != '\n');
+}
+
+test "getGhqRoot trims the trailing newline from `ghq root` stdout" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // The raw `ghq root` stdout ends in a newline; getGhqRoot must dupe-and-free
+    // to return the trimmed slice. Pin that the returned slice carries no
+    // trailing newline/CR and that the failure path frees the owned stdout (a
+    // leak there would trip the testing allocator). Skip cleanly if ghq is not
+    // runnable in this environment so the suite stays green on minimal hosts.
+    const result = getGhqRoot(gpa, io) catch |err| switch (err) {
+        error.FileNotFound, error.ProcessFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    defer gpa.free(result);
+    try std.testing.expect(result.len > 0);
+    try std.testing.expect(result[result.len - 1] != '\n' and result[result.len - 1] != '\r');
+    // Re-running yields an identical, independently-owned slice (no aliasing).
+    const again = try getGhqRoot(gpa, io);
+    defer gpa.free(again);
+    try std.testing.expectEqualStrings(result, again);
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const gpa = init.gpa;

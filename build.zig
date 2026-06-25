@@ -55,6 +55,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
+
+    // The integration suite includes e2e tests that spawn the real `gitstore`
+    // binary, so it must be built first. `dependOn(&exe.step)` guarantees the
+    // artifact exists before the test binary runs.
+    integration_tests.step.dependOn(&exe.step);
+
+    // Bake the gitstore binary path into `@import("build_options").gitstore_bin`.
+    // The emitted-bin path is a LazyPath that is only resolvable after `exe`'s
+    // make() runs, so it CANNOT be eagerly resolved with getPath2() during
+    // build-graph construction (that panics with "misconfigured build script").
+    // `addOptionPath` takes the LazyPath and resolves it lazily inside the
+    // Options step's own make() — writing the absolute path into the generated
+    // options module, where it surfaces as a plain `[]const u8` field. It also
+    // wires the produced dependency edge so the binary is built first.
+    const e2e_opts = b.addOptions();
+    e2e_opts.addOptionPath("gitstore_bin", exe.getEmittedBin());
+    integration_mod.addOptions("build_options", e2e_opts);
+
     const run_integration = b.addRunArtifact(integration_tests);
 
     // Public module smoke: catches regressions in the package surface that
