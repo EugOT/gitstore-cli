@@ -14,6 +14,8 @@
 		"verify-release": "bun scripts/verify-release.ts",
 		"eval": "bun scripts/eval.ts",
 		"eval:check": "bun scripts/eval.ts --check",
+		"coverage:orbstack": "bun scripts/kcov-orbstack.ts --print",
+		"coverage:check": "bun scripts/check-coverage.ts --require-measured",
 		"check-public-api": "bun scripts/check-public-api.ts",
 		"check-public-api:write": "bun scripts/check-public-api.ts --write"
 	},

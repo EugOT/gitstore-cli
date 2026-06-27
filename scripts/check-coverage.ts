@@ -2,16 +2,23 @@
  * Coverage threshold gate (G1). Reads coverage/summary.json (produced by
  * scripts/kcov-coverage.ts) and fails if percent_covered is below the
  * threshold. A `skipped` summary (non-Linux / no kcov) passes with a notice
- * so the gate never blocks on a platform that physically cannot measure.
+ * by default so the gate never blocks on a platform that physically cannot
+ * measure. CI-Linux and local Linux parity lanes must pass --require-measured
+ * so skipped summaries fail closed.
  *
  * Threshold sources, in precedence order:
  *   1. --threshold <n> CLI arg
  *   2. COVERAGE_THRESHOLD env var
  *   3. DEFAULT_THRESHOLD below (start at 85, ratchet up as groups land)
  *
+ * Require-measured sources:
+ *   1. --require-measured CLI arg
+ *   2. COVERAGE_REQUIRE_MEASURED=1
+ *
  * Usage:
  *   bun scripts/check-coverage.ts                 # default threshold
  *   bun scripts/check-coverage.ts --threshold 90
+ *   bun scripts/check-coverage.ts --require-measured
  */
 import { resolve } from "node:path";
 import type { CoverageSummary } from "./kcov-coverage.ts";
@@ -33,6 +40,13 @@ function resolveThreshold(): number {
 	return DEFAULT_THRESHOLD;
 }
 
+function requireMeasured(): boolean {
+	return (
+		process.argv.includes("--require-measured") ||
+		process.env.COVERAGE_REQUIRE_MEASURED === "1"
+	);
+}
+
 async function main(): Promise<number> {
 	const summaryPath = resolve(repoRoot(), "coverage", "summary.json");
 	let summary: CoverageSummary;
@@ -46,6 +60,12 @@ async function main(): Promise<number> {
 	}
 
 	if (summary.status === "skipped") {
+		if (requireMeasured()) {
+			console.error(
+				`check-coverage: FAIL — coverage was required but measurement was skipped: ${summary.reason}`,
+			);
+			return 1;
+		}
 		console.log(`check-coverage: SKIPPED — ${summary.reason}`);
 		return 0;
 	}

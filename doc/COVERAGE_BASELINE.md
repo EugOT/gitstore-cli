@@ -10,8 +10,19 @@ lands group by group.
 - **CI-Linux (authoritative):** the `coverage` job in
   `.forgejo/workflows/verify-pr.yaml` installs `kcov`, runs
   `bun scripts/kcov-coverage.ts --print`, and enforces a threshold via
-  `bun scripts/check-coverage.ts`. The report is uploaded as the `coverage`
-  artifact.
+  `bun scripts/check-coverage.ts --require-measured`. The report is uploaded
+  as the `coverage` artifact. CI must fail closed if the summary is skipped.
+- **Local Linux parity (OrbStack):** `bun scripts/kcov-orbstack.ts --print`
+  builds `docker/coverage.Dockerfile` and runs the same `bun ci`,
+  `bun scripts/kcov-coverage.ts --print`, and
+  `bun scripts/check-coverage.ts --require-measured` sequence in an ephemeral
+  Docker container. The image includes pinned Bun, Zig, kcov, `ghq`, and `jj`
+  because the integration suite exercises repo inventory and git+jj adoption.
+  The wrapper mounts only this repo at `/work`, uses temporary cache/home
+  directories, and grants only the ptrace/seccomp flags required by `kcov`.
+  When the worktree uses gitstore-externalized Git metadata, the wrapper also
+  mounts only that repo's Git metadata path read-only so Git discovery works
+  inside `/work`. This is a developer parity lane, not merge authority.
 - **Local (Darwin):** kcov is **Linux-only** — it relies on `ptrace`, which
   macOS SIP blocks even for signed binaries, and there is no arm64 build. On
   macOS the harness writes a `skipped` summary and exits 0. Use
@@ -55,3 +66,12 @@ Existing tests at plan start: **205** test blocks.
 3. When a milestone is crossed, raise the threshold in `check-coverage.ts`
    (or `COVERAGE_THRESHOLD`) and record the new per-module table here with
    the measured numbers + the commit/PR that achieved them.
+
+Local Linux parity check:
+
+```bash
+bun scripts/kcov-orbstack.ts --print
+```
+
+Use `--platform linux/arm64` or `--platform linux/amd64` when Docker does not
+select the desired OrbStack architecture automatically.

@@ -15,7 +15,13 @@
  *   bun scripts/kcov-coverage.ts            # build + measure, write summary
  *   bun scripts/kcov-coverage.ts --print    # also print the human summary
  */
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { resolve } from "node:path";
 import { repoRoot, spawnSync, tail } from "./lib/runtime.ts";
 import { zig } from "./lib/zig.ts";
@@ -107,12 +113,16 @@ function runKcov(
 	binary: string,
 ): { code: number; log: string } {
 	const args = [
+		`--include-pattern=${resolve(repoRoot(), "src")}`,
 		`--exclude-pattern=${EXCLUDE_PATTERNS.join(",")}`,
-		"--timeout=120000",
 		outDir,
 		binary,
 	];
-	const r = spawnSync(["kcov", ...args]);
+	const cmd =
+		Bun.which("timeout") !== null
+			? ["timeout", "120s", "kcov", ...args]
+			: ["kcov", ...args];
+	const r = spawnSync(cmd);
 	return { code: r.code ?? 1, log: `${r.stdout}\n${r.stderr}` };
 }
 
@@ -134,16 +144,7 @@ function mergeKcovRuns(
 async function readKcovRun(
 	outDir: string,
 ): Promise<{ covered: number; total: number; percent: number } | null> {
-	const candidates = [resolve(outDir, "coverage.json")];
-	try {
-		const entries = readdirSync(outDir);
-		for (const entry of entries) {
-			if (entry === "coverage.json" || entry === "kcov-merged") continue;
-			candidates.push(resolve(outDir, entry, "coverage.json"));
-		}
-	} catch {
-		// Fall through to the direct candidate; Bun.file().json() reports absence.
-	}
+	const candidates = findCoverageReports(outDir);
 	for (const jsonPath of candidates) {
 		try {
 			const data = (await Bun.file(jsonPath).json()) as {
@@ -163,6 +164,30 @@ async function readKcovRun(
 		}
 	}
 	return null;
+}
+
+function findCoverageReports(outDir: string): string[] {
+	const found: string[] = [];
+	function visit(dir: string, depth: number): void {
+		if (depth > 4) return;
+		const direct = resolve(dir, "coverage.json");
+		try {
+			if (statSync(direct).isFile()) found.push(direct);
+		} catch {
+			// No direct report at this level.
+		}
+		try {
+			for (const entry of readdirSync(dir)) {
+				if (entry === "data") continue;
+				const child = resolve(dir, entry);
+				if (statSync(child).isDirectory()) visit(child, depth + 1);
+			}
+		} catch {
+			// Missing/unreadable directory; caller will try any reports found so far.
+		}
+	}
+	visit(outDir, 0);
+	return found;
 }
 
 export async function measure(): Promise<CoverageSummary> {
