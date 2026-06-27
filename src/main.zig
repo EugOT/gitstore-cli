@@ -1019,6 +1019,20 @@ fn isExplicitLocalPath(arg: []const u8) bool {
         std.mem.startsWith(u8, arg, "/");
 }
 
+test "get: isExplicitLocalPath recognizes only filesystem path forms" {
+    try std.testing.expect(isExplicitLocalPath("."));
+    try std.testing.expect(isExplicitLocalPath(".."));
+    try std.testing.expect(isExplicitLocalPath("./repo"));
+    try std.testing.expect(isExplicitLocalPath("../repo"));
+    try std.testing.expect(isExplicitLocalPath("/tmp/repo"));
+
+    try std.testing.expect(!isExplicitLocalPath("repo"));
+    try std.testing.expect(!isExplicitLocalPath("owner/repo"));
+    try std.testing.expect(!isExplicitLocalPath("github.com/owner/repo"));
+    try std.testing.expect(!isExplicitLocalPath("https://github.com/owner/repo"));
+    try std.testing.expect(!isExplicitLocalPath("file:///tmp/owner/repo"));
+}
+
 fn printCloneReports(io: Io, reports: []const clone_mod.CloneReport) !bool {
     var any_failed = false;
     var out_buf: [4096]u8 = undefined;

@@ -1938,6 +1938,7 @@ const E2eCase = struct {
     expect: ExpectExit,
     stream: Stream,
     needle: []const u8,
+    extra_needle: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
 };
 
@@ -2047,6 +2048,19 @@ fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
             std.debug.print(
                 "e2e argv={s} missing needle <<{s}>> in {s}\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
                 .{ argv_desc, case.needle, @tagName(case.stream), result.stdout, result.stderr },
+            );
+            return err;
+        };
+    }
+    if (case.extra_needle) |extra| {
+        const haystack = switch (case.stream) {
+            .stdout => result.stdout,
+            .stderr => result.stderr,
+        };
+        testing.expect(std.mem.indexOf(u8, haystack, extra) != null) catch |err| {
+            std.debug.print(
+                "e2e argv={s} missing extra needle <<{s}>> in {s}\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
+                .{ argv_desc, extra, @tagName(case.stream), result.stdout, result.stderr },
             );
             return err;
         };
@@ -2215,6 +2229,134 @@ test "e2e get -u dot updates the current git worktree" {
         .stream = .stdout,
         .needle = repo,
         .cwd = repo,
+    });
+}
+
+test "e2e get dot without update skips the current git worktree" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const base = try uniqueTempDir(gpa, io, "/tmp/gitstore_get_dot_skip");
+    defer {
+        Dir.cwd().deleteTree(io, base) catch {};
+        gpa.free(base);
+    }
+    const repo = try std.fmt.allocPrint(gpa, "{s}/repo", .{base});
+    defer gpa.free(repo);
+    try Dir.cwd().createDirPath(io, repo);
+
+    var init_res = try ex.exec(gpa, io, &.{ "git", "init", "-q" }, repo);
+    defer init_res.deinit(gpa);
+    try testing.expect(init_res.succeeded());
+
+    try runE2eCase(gpa, io, .{
+        .argv_tail = &.{ "get", "." },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "skipped_exists",
+        .extra_needle = repo,
+        .cwd = repo,
+    });
+}
+
+test "e2e get -u relative subdir reports repository root" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const base = try uniqueTempDir(gpa, io, "/tmp/gitstore_get_dot_subdir");
+    defer {
+        Dir.cwd().deleteTree(io, base) catch {};
+        gpa.free(base);
+    }
+    const repo = try std.fmt.allocPrint(gpa, "{s}/repo", .{base});
+    defer gpa.free(repo);
+    const subdir = try std.fmt.allocPrint(gpa, "{s}/nested/path", .{repo});
+    defer gpa.free(subdir);
+    try Dir.cwd().createDirPath(io, subdir);
+
+    var init_res = try ex.exec(gpa, io, &.{ "git", "init", "-q" }, repo);
+    defer init_res.deinit(gpa);
+    try testing.expect(init_res.succeeded());
+
+    try runE2eCase(gpa, io, .{
+        .argv_tail = &.{ "get", "-u", "./nested/path" },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "updated",
+        .extra_needle = repo,
+        .cwd = repo,
+    });
+}
+
+test "e2e get -u dot reports non-git directory as failed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_get_dot_not_git");
+    defer {
+        Dir.cwd().deleteTree(io, dir) catch {};
+        gpa.free(dir);
+    }
+
+    try runE2eCase(gpa, io, .{
+        .argv_tail = &.{ "get", "-u", "." },
+        .expect = .{ .code = 1 },
+        .stream = .stdout,
+        .needle = "failed",
+        .extra_needle = "not a git repository",
+        .cwd = dir,
+    });
+}
+
+test "e2e get handles mixed local path and file url" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const base = try uniqueTempDir(gpa, io, "/tmp/gitstore_get_mixed");
+    defer {
+        Dir.cwd().deleteTree(io, base) catch {};
+        gpa.free(base);
+    }
+
+    const local = try std.fmt.allocPrint(gpa, "{s}/local", .{base});
+    defer gpa.free(local);
+    try Dir.cwd().createDirPath(io, local);
+    var local_init = try ex.exec(gpa, io, &.{ "git", "init", "-q" }, local);
+    defer local_init.deinit(gpa);
+    try testing.expect(local_init.succeeded());
+
+    const work = try std.fmt.allocPrint(gpa, "{s}/work", .{base});
+    defer gpa.free(work);
+    const bare = try std.fmt.allocPrint(gpa, "{s}/remote.git", .{base});
+    defer gpa.free(bare);
+    try Dir.cwd().createDirPath(io, work);
+
+    var work_init = try ex.exec(gpa, io, &.{ "git", "init", "-q" }, work);
+    defer work_init.deinit(gpa);
+    try testing.expect(work_init.succeeded());
+    var email = try ex.exec(gpa, io, &.{ "git", "config", "user.email", "test@test.com" }, work);
+    defer email.deinit(gpa);
+    try testing.expect(email.succeeded());
+    var name = try ex.exec(gpa, io, &.{ "git", "config", "user.name", "Test" }, work);
+    defer name.deinit(gpa);
+    try testing.expect(name.succeeded());
+    var commit = try ex.exec(gpa, io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init", "-q" }, work);
+    defer commit.deinit(gpa);
+    try testing.expect(commit.succeeded());
+    var clone_bare = try ex.exec(gpa, io, &.{ "git", "clone", "--bare", "-q", work, bare }, null);
+    defer clone_bare.deinit(gpa);
+    try testing.expect(clone_bare.succeeded());
+
+    const remote_url = try std.fmt.allocPrint(gpa, "file://{s}", .{bare});
+    defer gpa.free(remote_url);
+
+    try runE2eCase(gpa, io, .{
+        .argv_tail = &.{ "get", "--no-adopt", ".", remote_url },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "skipped_exists",
+        .extra_needle = "cloned",
+        .cwd = local,
     });
 }
 

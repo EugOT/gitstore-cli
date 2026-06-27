@@ -598,6 +598,10 @@ test "url: dot and dot-dot path atoms are rejected as repo names" {
     try testing.expectError(error.InvalidFormat, parse(gpa, "..", .{ .user = "eugot" }));
     try testing.expectError(error.InvalidFormat, parse(gpa, "owner/.", .{}));
     try testing.expectError(error.InvalidFormat, parse(gpa, "github.com/owner/..", .{}));
+    try testing.expectError(error.InvalidFormat, parse(gpa, "https://github.com/./repo", .{}));
+    try testing.expectError(error.InvalidFormat, parse(gpa, "git@github.com:owner/.", .{}));
+    try testing.expectError(error.InvalidFormat, parse(gpa, "file:///tmp/owner/.", .{}));
+    try testing.expectError(error.InvalidFormat, parse(gpa, "file:///tmp/../repo", .{}));
 }
 
 test "url: bare repo missing default user returns error" {

@@ -637,6 +637,142 @@ test "clone: updateExistingWorktree with update fetches current git repo" {
     try testing.expectEqualStrings(local_real, report.storage_path);
 }
 
+test "clone: updateExistingWorktree without update skips current git repo" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const base = "/tmp/gitstore_clone_test_local_skip";
+    const work = "/tmp/gitstore_clone_test_local_skip/wk";
+    const bare = "/tmp/gitstore_clone_test_local_skip/bare.git";
+    const local = "/tmp/gitstore_clone_test_local_skip/local";
+
+    Dir.cwd().deleteTree(io, base) catch {};
+    defer Dir.cwd().deleteTree(io, base) catch {};
+    try Dir.cwd().createDirPath(io, base);
+
+    try makeLocalBareFixture(gpa, io, work, bare);
+
+    const input = try std.fmt.allocPrint(gpa, "file://{s}", .{bare});
+    defer gpa.free(input);
+
+    var clone_res = try ex.exec(gpa, io, &.{ "git", "clone", "-q", "--", input, local }, null);
+    defer clone_res.deinit(gpa);
+    try testing.expect(clone_res.succeeded());
+
+    const report = try updateExistingWorktree(gpa, io, local, .{ .recursive = false });
+    defer {
+        gpa.free(report.url);
+        gpa.free(report.storage_path);
+        if (report.err) |e| gpa.free(e);
+    }
+
+    try testing.expectEqual(CloneReport.Status.skipped_exists, report.status);
+    try testing.expect(report.err == null);
+}
+
+test "clone: updateExistingWorktree resolves a subdirectory to repo root" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const base = "/tmp/gitstore_clone_test_local_subdir";
+    const work = "/tmp/gitstore_clone_test_local_subdir/wk";
+    const bare = "/tmp/gitstore_clone_test_local_subdir/bare.git";
+    const local = "/tmp/gitstore_clone_test_local_subdir/local";
+    const subdir = "/tmp/gitstore_clone_test_local_subdir/local/nested/path";
+
+    Dir.cwd().deleteTree(io, base) catch {};
+    defer Dir.cwd().deleteTree(io, base) catch {};
+    try Dir.cwd().createDirPath(io, base);
+
+    try makeLocalBareFixture(gpa, io, work, bare);
+
+    const input = try std.fmt.allocPrint(gpa, "file://{s}", .{bare});
+    defer gpa.free(input);
+
+    var clone_res = try ex.exec(gpa, io, &.{ "git", "clone", "-q", "--", input, local }, null);
+    defer clone_res.deinit(gpa);
+    try testing.expect(clone_res.succeeded());
+    try Dir.cwd().createDirPath(io, subdir);
+
+    const report = try updateExistingWorktree(gpa, io, subdir, .{
+        .update_if_exists = true,
+        .recursive = false,
+    });
+    defer {
+        gpa.free(report.url);
+        gpa.free(report.storage_path);
+        if (report.err) |e| gpa.free(e);
+    }
+
+    var local_real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const local_real_len = try Dir.cwd().realPathFile(io, local, &local_real_buf);
+    const local_real = local_real_buf[0..local_real_len];
+
+    try testing.expectEqual(CloneReport.Status.updated, report.status);
+    try testing.expectEqualStrings(local_real, report.storage_path);
+}
+
+test "clone: updateExistingWorktree reports non-git local path" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const dir = "/tmp/gitstore_clone_test_local_not_git";
+    Dir.cwd().deleteTree(io, dir) catch {};
+    defer Dir.cwd().deleteTree(io, dir) catch {};
+    try Dir.cwd().createDirPath(io, dir);
+
+    const report = try updateExistingWorktree(gpa, io, dir, .{
+        .update_if_exists = true,
+        .recursive = false,
+    });
+    defer {
+        gpa.free(report.url);
+        gpa.free(report.storage_path);
+        if (report.err) |e| gpa.free(e);
+    }
+
+    try testing.expectEqual(CloneReport.Status.failed, report.status);
+    try testing.expect(report.err != null);
+    try testing.expect(std.mem.indexOf(u8, report.err.?, "not a git repository") != null);
+}
+
+test "clone: updateExistingWorktree reports fetch failure" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const repo = "/tmp/gitstore_clone_test_local_fetch_fail";
+    Dir.cwd().deleteTree(io, repo) catch {};
+    defer Dir.cwd().deleteTree(io, repo) catch {};
+    try Dir.cwd().createDirPath(io, repo);
+
+    var init_res = try ex.exec(gpa, io, &.{ "git", "init", "-q" }, repo);
+    defer init_res.deinit(gpa);
+    try testing.expect(init_res.succeeded());
+
+    var remote_res = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "remote", "add", "origin", "file:///tmp/gitstore_clone_test_missing_remote.git" },
+        repo,
+    );
+    defer remote_res.deinit(gpa);
+    try testing.expect(remote_res.succeeded());
+
+    const report = try updateExistingWorktree(gpa, io, repo, .{
+        .update_if_exists = true,
+        .recursive = false,
+    });
+    defer {
+        gpa.free(report.url);
+        gpa.free(report.storage_path);
+        if (report.err) |e| gpa.free(e);
+    }
+
+    try testing.expectEqual(CloneReport.Status.failed, report.status);
+    try testing.expect(report.err != null);
+    try testing.expect(std.mem.indexOf(u8, report.err.?, "git fetch failed") != null);
+}
+
 test "clone: cloneOne without update on existing path returns skipped" {
     const gpa = testing.allocator;
     const io = testing.io;
