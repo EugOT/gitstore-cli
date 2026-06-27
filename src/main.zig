@@ -936,6 +936,50 @@ fn cmdGet(
         .host = cfg.default_host,
     };
 
+    var has_local_path = false;
+    for (urls.items) |u| {
+        if (isExplicitLocalPath(u)) {
+            has_local_path = true;
+            break;
+        }
+    }
+
+    if (has_local_path) {
+        var reports: std.ArrayList(clone_mod.CloneReport) = .empty;
+        defer {
+            for (reports.items) |r| {
+                gpa.free(r.url);
+                gpa.free(r.storage_path);
+                if (r.err) |msg| gpa.free(msg);
+            }
+            reports.deinit(gpa);
+        }
+
+        for (urls.items) |u| {
+            try reports.ensureUnusedCapacity(gpa, 1);
+            if (isExplicitLocalPath(u)) {
+                const report = try clone_mod.updateExistingWorktree(gpa, io, u, opts);
+                reports.appendAssumeCapacity(report);
+                continue;
+            }
+
+            var spec = url_mod.parse(gpa, u, defaults) catch |err| {
+                var buf: [1024]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: cannot parse url {s}: {s}\n", .{ u, @errorName(err) });
+                try w.flush();
+                return 2;
+            };
+            defer spec.deinit(gpa);
+
+            const report = try clone_mod.cloneOne(gpa, io, spec, cfg.root, gitstore_root, opts);
+            reports.appendAssumeCapacity(report);
+        }
+
+        const any_failed = try printCloneReports(io, reports.items);
+        return if (any_failed) @as(u8, 1) else 0;
+    }
+
     for (urls.items) |u| {
         const spec = url_mod.parse(gpa, u, defaults) catch |err| {
             var buf: [1024]u8 = undefined;
@@ -963,6 +1007,19 @@ fn cmdGet(
     };
     defer clone_mod.freeReports(gpa, reports);
 
+    const any_failed = try printCloneReports(io, reports);
+    return if (any_failed) @as(u8, 1) else 0;
+}
+
+fn isExplicitLocalPath(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, ".") or
+        std.mem.eql(u8, arg, "..") or
+        std.mem.startsWith(u8, arg, "./") or
+        std.mem.startsWith(u8, arg, "../") or
+        std.mem.startsWith(u8, arg, "/");
+}
+
+fn printCloneReports(io: Io, reports: []const clone_mod.CloneReport) !bool {
     var any_failed = false;
     var out_buf: [4096]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &out_buf);
@@ -985,8 +1042,7 @@ fn cmdGet(
         }
     }
     try w.flush();
-
-    return if (any_failed) @as(u8, 1) else 0;
+    return any_failed;
 }
 
 fn cmdList(

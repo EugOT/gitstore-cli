@@ -275,6 +275,7 @@ fn parseFile(gpa: Allocator, work: []const u8, orig: []u8) ParseError!RepoSpec {
     var it = std.mem.splitScalar(u8, trimmed, '/');
     while (it.next()) |seg| {
         if (seg.len == 0) return error.DoubleSlash;
+        if (isReservedPathSegment(seg)) return error.InvalidFormat;
         try segs.append(gpa, seg);
     }
     if (segs.items.len < 2) return error.InvalidFormat;
@@ -340,6 +341,7 @@ fn parseUrl(gpa: Allocator, rest: []const u8, scheme: Scheme, orig: []u8) ParseE
     var it = std.mem.splitScalar(u8, path, '/');
     while (it.next()) |seg| {
         if (seg.len == 0) return error.DoubleSlash;
+        if (isReservedPathSegment(seg)) return error.InvalidFormat;
         try segs.append(gpa, seg);
     }
     if (segs.items.len < 2) return error.InvalidFormat;
@@ -390,6 +392,7 @@ fn parseScpLike(
     var it = std.mem.splitScalar(u8, path, '/');
     while (it.next()) |seg| {
         if (seg.len == 0) return error.DoubleSlash;
+        if (isReservedPathSegment(seg)) return error.InvalidFormat;
         try segs.append(gpa, seg);
     }
     if (segs.items.len != 2) return error.InvalidFormat;
@@ -433,6 +436,7 @@ fn parseShort(
     var it = std.mem.splitScalar(u8, work, '/');
     while (it.next()) |seg| {
         if (seg.len == 0) return error.DoubleSlash;
+        if (isReservedPathSegment(seg)) return error.InvalidFormat;
         try segs.append(gpa, seg);
     }
 
@@ -491,6 +495,10 @@ fn parseShort(
 fn stripDotGit(s: []const u8) []const u8 {
     if (std.mem.endsWith(u8, s, ".git")) return s[0 .. s.len - ".git".len];
     return s;
+}
+
+fn isReservedPathSegment(s: []const u8) bool {
+    return std.mem.eql(u8, s, ".") or std.mem.eql(u8, s, "..");
 }
 
 fn stripHostPort(s: []const u8) []const u8 {
@@ -582,6 +590,14 @@ test "url: bare repo with default user" {
     var spec = try parse(gpa, "ghq", .{ .user = "eugot" });
     defer spec.deinit(gpa);
     try expectSpec(spec, "github.com", "eugot", "ghq", .https);
+}
+
+test "url: dot and dot-dot path atoms are rejected as repo names" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidFormat, parse(gpa, ".", .{ .user = "eugot" }));
+    try testing.expectError(error.InvalidFormat, parse(gpa, "..", .{ .user = "eugot" }));
+    try testing.expectError(error.InvalidFormat, parse(gpa, "owner/.", .{}));
+    try testing.expectError(error.InvalidFormat, parse(gpa, "github.com/owner/..", .{}));
 }
 
 test "url: bare repo missing default user returns error" {

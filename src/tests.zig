@@ -1938,6 +1938,7 @@ const E2eCase = struct {
     expect: ExpectExit,
     stream: Stream,
     needle: []const u8,
+    cwd: ?[]const u8 = null,
 };
 
 /// Build a controlled child environment. HOME and GIT_CONFIG_GLOBAL point at
@@ -1981,10 +1982,21 @@ fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
         gpa.free(git_config);
     }
 
-    // argv = [binary, tail...]
+    // argv = [binary, tail...]. `build_options.gitstore_bin` can be relative
+    // to the build working directory; resolve it before applying case.cwd so
+    // cwd-sensitive e2e cases still spawn the just-built binary.
+    const gitstore_bin = if (std.fs.path.isAbsolute(build_options.gitstore_bin)) blk: {
+        break :blk try gpa.dupe(u8, build_options.gitstore_bin);
+    } else blk: {
+        var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const real_len = try Dir.cwd().realPathFile(io, build_options.gitstore_bin, &real_buf);
+        break :blk try gpa.dupe(u8, real_buf[0..real_len]);
+    };
+    defer gpa.free(gitstore_bin);
+
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.append(gpa, build_options.gitstore_bin);
+    try argv.append(gpa, gitstore_bin);
     for (case.argv_tail) |a| try argv.append(gpa, a);
 
     // Space-joined tail for diagnostics. In Zig 0.16 `{s}` only formats a
@@ -1997,6 +2009,7 @@ fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
 
     const result = try std.process.run(gpa, io, .{
         .argv = argv.items,
+        .cwd = if (case.cwd) |cwd| .{ .path = cwd } else .inherit,
         .environ_map = &env_map,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
@@ -2176,6 +2189,32 @@ test "e2e get -P with non-integer value errors, exit 2" {
         .expect = .{ .code = 2 },
         .stream = .stderr,
         .needle = "error: -P argument must be a positive integer",
+    });
+}
+
+test "e2e get -u dot updates the current git worktree" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const base = try uniqueTempDir(gpa, io, "/tmp/gitstore_get_dot");
+    defer {
+        Dir.cwd().deleteTree(io, base) catch {};
+        gpa.free(base);
+    }
+    const repo = try std.fmt.allocPrint(gpa, "{s}/repo", .{base});
+    defer gpa.free(repo);
+    try Dir.cwd().createDirPath(io, repo);
+
+    var init_res = try ex.exec(gpa, io, &.{ "git", "init", "-q" }, repo);
+    defer init_res.deinit(gpa);
+    try testing.expect(init_res.succeeded());
+
+    try runE2eCase(gpa, io, .{
+        .argv_tail = &.{ "get", "-u", "." },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = repo,
+        .cwd = repo,
     });
 }
 

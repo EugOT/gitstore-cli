@@ -51,6 +51,85 @@ pub const CloneReport = struct {
     pub const Status = enum { cloned, updated, skipped_exists, failed };
 };
 
+/// Update or skip an explicitly supplied local git worktree.
+///
+/// This is intentionally separate from URL cloning. `gitstore get -u .`
+/// should not parse `.` as a repository slug and should not accidentally
+/// target an owner namespace directory such as `~/ghq/github.com/<user>`.
+pub fn updateExistingWorktree(
+    gpa: Allocator,
+    io: Io,
+    input_path: []const u8,
+    opts: CloneOptions,
+) CloneError!CloneReport {
+    const url_dup = try gpa.dupe(u8, input_path);
+    errdefer gpa.free(url_dup);
+
+    var top = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "-C", input_path, "rev-parse", "--show-toplevel" },
+        null,
+    );
+    defer top.deinit(gpa);
+    if (!top.succeeded()) {
+        const storage_path = try gpa.dupe(u8, input_path);
+        errdefer gpa.free(storage_path);
+        const msg = try std.fmt.allocPrint(
+            gpa,
+            "not a git repository: {s}",
+            .{ex.trimTrailingNewline(top.stderr)},
+        );
+        return .{
+            .url = url_dup,
+            .storage_path = storage_path,
+            .status = .failed,
+            .err = msg,
+        };
+    }
+
+    const top_trimmed = ex.trimTrailingNewline(top.stdout);
+    const storage_path = try gpa.dupe(u8, top_trimmed);
+    errdefer gpa.free(storage_path);
+
+    if (!opts.update_if_exists) {
+        return .{
+            .url = url_dup,
+            .storage_path = storage_path,
+            .status = .skipped_exists,
+            .err = null,
+        };
+    }
+
+    var fetch = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "-C", storage_path, "fetch", "--all", "--prune" },
+        null,
+    );
+    defer fetch.deinit(gpa);
+    if (!fetch.succeeded()) {
+        const msg = try std.fmt.allocPrint(
+            gpa,
+            "git fetch failed: {s}",
+            .{ex.trimTrailingNewline(fetch.stderr)},
+        );
+        return .{
+            .url = url_dup,
+            .storage_path = storage_path,
+            .status = .failed,
+            .err = msg,
+        };
+    }
+
+    return .{
+        .url = url_dup,
+        .storage_path = storage_path,
+        .status = .updated,
+        .err = null,
+    };
+}
+
 /// Free every string inside each `CloneReport` and the outer slice.
 pub fn freeReports(gpa: Allocator, reports: []CloneReport) void {
     for (reports) |r| {
@@ -516,6 +595,46 @@ test "clone: cloneOne with update_if_exists refreshes an existing clone" {
     var log = try ex.exec(gpa, io, &.{ "git", "-C", r2.storage_path, "log", "--oneline", "-1" }, null);
     defer log.deinit(gpa);
     try testing.expect(log.succeeded());
+}
+
+test "clone: updateExistingWorktree with update fetches current git repo" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const base = "/tmp/gitstore_clone_test_local_update";
+    const work = "/tmp/gitstore_clone_test_local_update/wk";
+    const bare = "/tmp/gitstore_clone_test_local_update/bare.git";
+    const local = "/tmp/gitstore_clone_test_local_update/local";
+
+    Dir.cwd().deleteTree(io, base) catch {};
+    defer Dir.cwd().deleteTree(io, base) catch {};
+    try Dir.cwd().createDirPath(io, base);
+
+    try makeLocalBareFixture(gpa, io, work, bare);
+
+    const input = try std.fmt.allocPrint(gpa, "file://{s}", .{bare});
+    defer gpa.free(input);
+
+    var clone_res = try ex.exec(gpa, io, &.{ "git", "clone", "-q", "--", input, local }, null);
+    defer clone_res.deinit(gpa);
+    try testing.expect(clone_res.succeeded());
+
+    const report = try updateExistingWorktree(gpa, io, local, .{
+        .update_if_exists = true,
+        .recursive = false,
+    });
+    defer {
+        gpa.free(report.url);
+        gpa.free(report.storage_path);
+        if (report.err) |e| gpa.free(e);
+    }
+
+    var local_real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const local_real_len = try Dir.cwd().realPathFile(io, local, &local_real_buf);
+    const local_real = local_real_buf[0..local_real_len];
+
+    try testing.expectEqual(CloneReport.Status.updated, report.status);
+    try testing.expectEqualStrings(local_real, report.storage_path);
 }
 
 test "clone: cloneOne without update on existing path returns skipped" {
