@@ -30,7 +30,7 @@ libgitstore v2 absorbs ghq's role — no more shell-side diff dance.
 | `ghq migrate` | `gitstore migrate <new-root> [--dry-run]` | Real-mode v1-pending; dry-run works |
 
 Additions with no ghq analogue: `gitstore init`, `adopt`, `detach`, `verify`,
-`status`, `sync`, `filter`, `hook`.
+`status`, `sync`, `filter`, `hook`, `gh-repo`.
 
 Parked (out of scope for v1): `--vcs hg`, `--vcs svn`, `--vcs bzr`.
 
@@ -102,6 +102,45 @@ git config --global gitstore.root "$ROOT"
 
 Env vars: `$GITSTORE_ROOT` takes precedence over `$GHQ_ROOT`.
 
+### Phase 4 — Make Drive-synced trees usable with `gh`
+
+Adopted repos keep normal Git metadata through their `.git` pointer, and the
+regular GitHub CLI can resolve the repository from `origin`:
+
+```sh
+gh repo view --json nameWithOwner,url
+```
+
+When a working tree is synced through `gitstore sync`, `.git` is intentionally
+excluded. In that no-`.git` case, GitHub CLI cannot infer the repository from
+Git metadata. `gitstore gh-repo` derives GitHub CLI's `GH_REPO` value from the
+configured gitstore root and the `host/owner/repo` path, so `gitstore.root` or
+`GITSTORE_ROOT` overrides are honored:
+
+```sh
+cd "$(gitstore root)/github.com/EugOT/gitstore-cli"
+GH_REPO="$(gitstore gh-repo)" gh pr status
+
+# Or print a shell-ready export:
+gitstore gh-repo --export
+
+# Or inspect the raw value:
+gitstore gh-repo
+```
+
+For an opt-in shell wrapper, source one of:
+
+```sh
+source <(gitstore hook --gh-zsh)
+source <(gitstore hook --gh-bash)
+gitstore hook --gh-nu | save -f ~/.cache/gitstore-gh.nu; source ~/.cache/gitstore-gh.nu
+```
+
+The wrapper leaves normal Git repositories alone and only sets `GH_REPO` when
+Git cannot see a work tree but `gitstore gh-repo` can derive one from the path.
+It is not installed automatically because shadowing `gh` globally changes a
+high-value CLI surface.
+
 ## Known gaps in v1
 
 - `gitstore migrate <new-root>` real-mode returns `error.MigrationNotImplemented`; only `--dry-run` works. Full implementation waits for the WAL replay design.
@@ -114,6 +153,7 @@ Env vars: `$GITSTORE_ROOT` takes precedence over `$GHQ_ROOT`.
 - **`ghq` still runs the Go binary after `chezmoi apply`** — restart your shell or `source ~/.config/zsh/functions.zsh` manually. Shell functions don't re-load automatically.
 - **`gitstore list` shows nothing** — check `gitstore root` matches where your repos live; if empty, `git config --global gitstore.root <path>`.
 - **Deprecation warning on every run** — indicates `ghq.*` keys are still authoritative; see Phase 3 above.
+- **`gh` says it cannot determine a repository inside a synced tree** — run `gitstore gh-repo` there. If it prints `OWNER/REPO` for github.com or `HOST/OWNER/REPO` for Enterprise/custom hosts, use `GH_REPO="$(gitstore gh-repo)" gh <command>` or source the opt-in wrapper with `source <(gitstore hook --gh-zsh)`, `source <(gitstore hook --gh-bash)`, or the Nushell save/source form from Phase 4.
 - **Want to fall back to real ghq for a single invocation** — use `command ghq <args>` (the `command` builtin bypasses the shell function).
 
 ## Related

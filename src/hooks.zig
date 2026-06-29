@@ -16,9 +16,9 @@ pub const zsh_hook =
     \\# If `gitstore` is absent from PATH, falls back to the real ghq binary.
     \\
     \\ghq() {
-    \\  if command -v gitstore >/dev/null 2>&1; then
+    \\  if whence -p gitstore >/dev/null 2>&1; then
     \\    command gitstore "$@"
-    \\  elif command -v ghq >/dev/null 2>&1; then
+    \\  elif whence -p ghq >/dev/null 2>&1; then
     \\    command ghq "$@"
     \\  else
     \\    echo "ghq(): neither gitstore nor ghq found on PATH" >&2
@@ -38,9 +38,9 @@ pub const bash_hook =
     \\# If `gitstore` is absent from PATH, falls back to the real ghq binary.
     \\
     \\ghq() {
-    \\  if command -v gitstore >/dev/null 2>&1; then
+    \\  if type -P gitstore >/dev/null 2>&1; then
     \\    command gitstore "$@"
-    \\  elif command -v ghq >/dev/null 2>&1; then
+    \\  elif type -P ghq >/dev/null 2>&1; then
     \\    command ghq "$@"
     \\  else
     \\    echo "ghq(): neither gitstore nor ghq found on PATH" >&2
@@ -78,6 +78,144 @@ pub const nu_hook =
     \\  }
     \\
     \\  $result.stdout | from json
+    \\}
+;
+
+pub const gh_zsh_hook =
+    \\# gitstore-gh-hook.zsh — opt-in GitHub CLI compatibility for synced trees
+    \\# Source this only when you want `gh` to derive GH_REPO from gitstore/ghq paths
+    \\# that no longer contain a .git file after rclone/Google Drive sync.
+    \\
+    \\gh() {
+    \\  if [ -n "${GH_REPO:-}" ]; then
+    \\    GH_REPO="$GH_REPO" command gh "$@"
+    \\    return $?
+    \\  fi
+    \\  if whence -p gitstore >/dev/null 2>&1; then
+    \\    local _gitstore_gh_repo
+    \\    local _gitstore_gh_error
+    \\    local _gitstore_gh_status=0
+    \\    local _gitstore_gh_stdout_file
+    \\    _gitstore_gh_stdout_file="$(mktemp "${TMPDIR:-/tmp}/gitstore-gh-repo.XXXXXX")" || {
+    \\      printf '%s\n' "gitstore gh-repo temp file creation failed" >&2
+    \\      return 1
+    \\    }
+    \\    _gitstore_gh_error="$(command gitstore gh-repo 2>&1 1>"$_gitstore_gh_stdout_file")" || _gitstore_gh_status=$?
+    \\    local _gitstore_read_status=0
+    \\    _gitstore_gh_repo="$(cat "$_gitstore_gh_stdout_file")" || _gitstore_read_status=$?
+    \\    if [ "$_gitstore_read_status" -ne 0 ]; then
+    \\      rm -f "$_gitstore_gh_stdout_file" || printf '%s\n' "gitstore gh-repo temp file cleanup failed" >&2
+    \\      printf '%s\n' "gitstore gh-repo stdout read failed" >&2
+    \\      return 1
+    \\    fi
+    \\    rm -f "$_gitstore_gh_stdout_file" || printf '%s\n' "gitstore gh-repo temp file cleanup failed" >&2
+    \\    if [ "$_gitstore_gh_status" -eq 0 ] && [ -n "$_gitstore_gh_repo" ]; then
+    \\      GH_REPO="$_gitstore_gh_repo" command gh "$@"
+    \\      return $?
+    \\    fi
+    \\    if [ "$_gitstore_gh_status" -eq 0 ]; then
+    \\      printf '%s\n' "gitstore gh-repo returned empty GH_REPO" >&2
+    \\      return 1
+    \\    fi
+    \\    if [ "$_gitstore_gh_status" -eq 1 ]; then
+    \\      case "$_gitstore_gh_error" in
+    \\        *"cannot derive GH_REPO"*)
+    \\          command gh "$@"
+    \\          return $?
+    \\          ;;
+    \\      esac
+    \\    fi
+    \\    printf '%s\n' "$_gitstore_gh_error" >&2
+    \\    return "$_gitstore_gh_status"
+    \\  fi
+    \\  command gh "$@"
+    \\}
+;
+
+pub const gh_bash_hook =
+    \\# gitstore-gh-hook.bash — opt-in GitHub CLI compatibility for synced trees
+    \\# Source this only when you want `gh` to derive GH_REPO from gitstore/ghq paths
+    \\# that no longer contain a .git file after rclone/Google Drive sync.
+    \\
+    \\gh() {
+    \\  if [ -n "${GH_REPO:-}" ]; then
+    \\    GH_REPO="$GH_REPO" command gh "$@"
+    \\    return $?
+    \\  fi
+    \\  if type -P gitstore >/dev/null 2>&1; then
+    \\    local _gitstore_gh_repo
+    \\    local _gitstore_gh_error
+    \\    local _gitstore_gh_status=0
+    \\    local _gitstore_gh_stdout_file
+    \\    _gitstore_gh_stdout_file="$(mktemp "${TMPDIR:-/tmp}/gitstore-gh-repo.XXXXXX")" || {
+    \\      printf '%s\n' "gitstore gh-repo temp file creation failed" >&2
+    \\      return 1
+    \\    }
+    \\    _gitstore_gh_error="$(command gitstore gh-repo 2>&1 1>"$_gitstore_gh_stdout_file")" || _gitstore_gh_status=$?
+    \\    local _gitstore_read_status=0
+    \\    _gitstore_gh_repo="$(cat "$_gitstore_gh_stdout_file")" || _gitstore_read_status=$?
+    \\    if [ "$_gitstore_read_status" -ne 0 ]; then
+    \\      rm -f "$_gitstore_gh_stdout_file" || printf '%s\n' "gitstore gh-repo temp file cleanup failed" >&2
+    \\      printf '%s\n' "gitstore gh-repo stdout read failed" >&2
+    \\      return 1
+    \\    fi
+    \\    rm -f "$_gitstore_gh_stdout_file" || printf '%s\n' "gitstore gh-repo temp file cleanup failed" >&2
+    \\    if [ "$_gitstore_gh_status" -eq 0 ] && [ -n "$_gitstore_gh_repo" ]; then
+    \\      GH_REPO="$_gitstore_gh_repo" command gh "$@"
+    \\      return $?
+    \\    fi
+    \\    if [ "$_gitstore_gh_status" -eq 0 ]; then
+    \\      printf '%s\n' "gitstore gh-repo returned empty GH_REPO" >&2
+    \\      return 1
+    \\    fi
+    \\    if [ "$_gitstore_gh_status" -eq 1 ]; then
+    \\      case "$_gitstore_gh_error" in
+    \\        *"cannot derive GH_REPO"*)
+    \\          command gh "$@"
+    \\          return $?
+    \\          ;;
+    \\      esac
+    \\    fi
+    \\    printf '%s\n' "$_gitstore_gh_error" >&2
+    \\    return "$_gitstore_gh_status"
+    \\  fi
+    \\  command gh "$@"
+    \\}
+;
+
+pub const gh_nu_hook =
+    \\# gitstore-gh.nu — opt-in GitHub CLI compatibility for synced trees
+    \\# Usage: use this module after confirming you want `gh` wrapped.
+    \\
+    \\def --wrapped _gitstore_run_gh [...args: string] {
+    \\  ^gh ...$args
+    \\}
+    \\
+    \\export def --wrapped gh [...args: string] {
+    \\  let explicit_gh_repo = ($env.GH_REPO? | default "")
+    \\  if ($explicit_gh_repo | is-not-empty) {
+    \\    _gitstore_run_gh ...$args
+    \\    return
+    \\  }
+    \\  if (which gitstore | is-not-empty) {
+    \\    let resolved = (do { ^gitstore gh-repo } | complete)
+    \\    let resolved_gh_repo = ($resolved.stdout | str trim)
+    \\    if $resolved.exit_code == 0 and ($resolved_gh_repo | is-not-empty) {
+    \\      with-env { GH_REPO: $resolved_gh_repo } { _gitstore_run_gh ...$args }
+    \\      return
+    \\    }
+    \\    if $resolved.exit_code == 0 {
+    \\      error make { msg: "gitstore gh-repo returned empty GH_REPO" }
+    \\    }
+    \\    if $resolved.exit_code == 1 and ($resolved.stderr | str contains "cannot derive GH_REPO") {
+    \\      _gitstore_run_gh ...$args
+    \\      return
+    \\    }
+    \\    if $resolved.exit_code != 0 {
+    \\      error make { msg: $resolved.stderr }
+    \\    }
+    \\  }
+    \\  _gitstore_run_gh ...$args
     \\}
 ;
 
@@ -194,16 +332,81 @@ pub const rclone_filter =
 // assertions (comm -13, before/after) which no longer apply.
 // =========================================================
 
-const testing = @import("std").testing;
-const mem = @import("std").mem;
+const std = @import("std");
+const testing = std.testing;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const Dir = std.Io.Dir;
+const Io = std.Io;
+const test_support = @import("test_support.zig");
+
+fn writeHookFixture(
+    io: Io,
+    gpa: Allocator,
+    namespace: []const u8,
+    suffix: []const u8,
+    hook: []const u8,
+) ![]u8 {
+    const path = try test_support.uniqueTempFile(gpa, io, namespace, suffix);
+    errdefer gpa.free(path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = hook });
+    return path;
+}
+
+fn expectShellSyntax(io: Io, gpa: Allocator, argv: []const []const u8) !void {
+    const result = std.process.run(gpa, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+}
+
+test "hook: gh zsh wrapper parses with zsh when available" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const path = try writeHookFixture(io, gpa, "gh_zsh_hook", ".zsh", gh_zsh_hook);
+    defer gpa.free(path);
+    defer Dir.cwd().deleteFile(io, path) catch |err| test_support.ignoreCleanupError("hooks", err);
+    try expectShellSyntax(io, gpa, &.{ "zsh", "-n", path });
+}
+
+test "hook: gh bash wrapper parses with bash when available" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const path = try writeHookFixture(io, gpa, "gh_bash_hook", ".bash", gh_bash_hook);
+    defer gpa.free(path);
+    defer Dir.cwd().deleteFile(io, path) catch |err| test_support.ignoreCleanupError("hooks", err);
+    try expectShellSyntax(io, gpa, &.{ "bash", "-n", path });
+}
+
+test "hook: gh nushell wrapper parses with nu when available" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const path = try writeHookFixture(io, gpa, "gh_nu_hook", ".nu", gh_nu_hook);
+    defer gpa.free(path);
+    defer Dir.cwd().deleteFile(io, path) catch |err| test_support.ignoreCleanupError("hooks", err);
+    const driver = try std.fmt.allocPrint(gpa, "use '{s}' *\n", .{path});
+    defer gpa.free(driver);
+    const driver_path = try writeHookFixture(io, gpa, "gh_nu_hook_driver", ".nu", driver);
+    defer gpa.free(driver_path);
+    defer Dir.cwd().deleteFile(io, driver_path) catch |err| test_support.ignoreCleanupError("hooks", err);
+    try expectShellSyntax(io, gpa, &.{ "nu", "--no-config-file", driver_path });
+}
 
 test "hook: zsh defines ghq() function" {
     try testing.expect(mem.indexOf(u8, zsh_hook, "ghq() {") != null);
 }
 
 test "hook: zsh prefers gitstore over ghq" {
-    const gs = mem.indexOf(u8, zsh_hook, "command -v gitstore").?;
-    const ghq = mem.indexOf(u8, zsh_hook, "command -v ghq").?;
+    const gs = mem.indexOf(u8, zsh_hook, "whence -p gitstore").?;
+    const ghq = mem.indexOf(u8, zsh_hook, "whence -p ghq").?;
     try testing.expect(gs < ghq);
 }
 
@@ -217,6 +420,85 @@ test "hook: zsh falls back to ghq when gitstore missing" {
 
 test "hook: zsh exits 127 when neither tool present" {
     try testing.expect(mem.indexOf(u8, zsh_hook, "return 127") != null);
+}
+
+test "hook: gh wrappers export GH_REPO only through gitstore gh-repo" {
+    inline for (.{ gh_zsh_hook, gh_bash_hook }) |hook| {
+        try testing.expect(mem.indexOf(u8, hook, "command gitstore gh-repo") != null);
+        try testing.expect(mem.indexOf(u8, hook, "GH_REPO=\"$_gitstore_gh_repo\" command gh \"$@\"") != null);
+    }
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "^gitstore gh-repo") != null);
+    try testing.expect(mem.indexOf(
+        u8,
+        gh_nu_hook,
+        "with-env { GH_REPO: $resolved_gh_repo } { _gitstore_run_gh ...$args }",
+    ) != null);
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "def --wrapped _gitstore_run_gh") != null);
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "do { ^gh ...$args } | complete") == null);
+    try testing.expectEqual(@as(usize, 4), mem.count(u8, gh_nu_hook, "_gitstore_run_gh ...$args"));
+}
+
+test "hook: gh wrappers ask gitstore before direct gh fallback" {
+    inline for (.{ gh_zsh_hook, gh_bash_hook }) |hook| {
+        try testing.expect(mem.indexOf(u8, hook, "git rev-parse --is-inside-work-tree") == null);
+        const derive = mem.indexOf(u8, hook, "command gitstore gh-repo").?;
+        const fallback = mem.lastIndexOf(u8, hook, "command gh \"$@\"").?;
+        try testing.expect(derive < fallback);
+    }
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "git rev-parse --is-inside-work-tree") == null);
+    const derive = mem.indexOf(u8, gh_nu_hook, "^gitstore gh-repo").?;
+    const fallback = mem.lastIndexOf(u8, gh_nu_hook, "_gitstore_run_gh ...$args").?;
+    try testing.expect(derive < fallback);
+}
+
+test "hook: gh wrappers honor explicit GH_REPO override" {
+    inline for (.{ gh_zsh_hook, gh_bash_hook }) |hook| {
+        const override = mem.indexOf(u8, hook, "[ -n \"${GH_REPO:-}\" ]").?;
+        const derive = mem.indexOf(u8, hook, "command gitstore gh-repo").?;
+        try testing.expect(mem.indexOf(u8, hook, "GH_REPO=\"$GH_REPO\" command gh \"$@\"") != null);
+        try testing.expect(override < derive);
+    }
+    const override = mem.indexOf(u8, gh_nu_hook, "$env.GH_REPO?").?;
+    const derive = mem.indexOf(u8, gh_nu_hook, "^gitstore gh-repo").?;
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "$env.GH_REPO? | default \"\" | str trim") == null);
+    try testing.expect(override < derive);
+}
+
+test "hook: gh wrappers surface unexpected gitstore gh-repo failures" {
+    inline for (.{ gh_zsh_hook, gh_bash_hook }) |hook| {
+        try testing.expect(mem.indexOf(
+            u8,
+            hook,
+            "command gitstore gh-repo 2>&1 1>\"$_gitstore_gh_stdout_file\"",
+        ) != null);
+        try testing.expect(mem.indexOf(u8, hook, "|| _gitstore_gh_status=$?") != null);
+        try testing.expect(mem.indexOf(u8, hook, "_gitstore_gh_error") != null);
+        try testing.expect(mem.indexOf(u8, hook, "cannot derive GH_REPO") != null);
+        try testing.expect(mem.indexOf(u8, hook, "gitstore gh-repo returned empty GH_REPO") != null);
+        try testing.expect(mem.indexOf(u8, hook, "gitstore gh-repo temp file creation failed") != null);
+        try testing.expect(mem.indexOf(u8, hook, "gitstore gh-repo stdout read failed") != null);
+        try testing.expect(mem.indexOf(u8, hook, "gitstore gh-repo temp file cleanup failed") != null);
+        try testing.expect(mem.indexOf(u8, hook,
+            \\    _gitstore_gh_stdout_file="$(mktemp "${TMPDIR:-/tmp}/gitstore-gh-repo.XXXXXX")" || {
+            \\      printf '%s\n' "gitstore gh-repo temp file creation failed" >&2
+            \\      return 1
+        ) != null);
+        try testing.expect(mem.indexOf(u8, hook,
+            \\    if [ "$_gitstore_read_status" -ne 0 ]; then
+            \\      rm -f "$_gitstore_gh_stdout_file" || printf '%s\n' "gitstore gh-repo temp file cleanup failed" >&2
+            \\      printf '%s\n' "gitstore gh-repo stdout read failed" >&2
+            \\      return 1
+        ) != null);
+        try testing.expect(mem.indexOf(u8, hook, "return \"$_gitstore_mktemp_status\"") == null);
+        try testing.expect(mem.indexOf(u8, hook, "return \"$_gitstore_read_status\"") == null);
+        try testing.expect(mem.indexOf(u8, hook, "return \"$_gitstore_rm_status\"") == null);
+        try testing.expect(mem.indexOf(u8, hook, ">&2") != null);
+        try testing.expect(mem.indexOf(u8, hook, "return \"$_gitstore_gh_status\"") != null);
+    }
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "cannot derive GH_REPO") != null);
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "resolved_gh_repo") != null);
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "gitstore gh-repo returned empty GH_REPO") != null);
+    try testing.expect(mem.indexOf(u8, gh_nu_hook, "error make { msg: $resolved.stderr }") != null);
 }
 
 test "hook: zsh has no legacy diff-dance" {

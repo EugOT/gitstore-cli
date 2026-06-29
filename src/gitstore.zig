@@ -267,21 +267,42 @@ pub fn repoStoragePath(repo_path: []const u8, ghq_root: []const u8) ?[]const u8 
 ///
 /// GitHub CLI accepts `[HOST/]OWNER/REPO`; omit the default public host so the
 /// common case matches `owner/repo`, but preserve Enterprise/custom hosts.
+/// Caller owns the returned slice and must free it with `gpa`.
+pub const FormatGhRepoError = error{
+    OutOfMemory,
+    InvalidGhRepoComponent,
+};
+
 pub fn formatGhRepo(
     gpa: Allocator,
     host: []const u8,
     owner: []const u8,
     name: []const u8,
-) Allocator.Error![]u8 {
+) FormatGhRepoError![]u8 {
+    if (!isValidGhRepoComponent(host) or
+        !isValidGhRepoComponent(owner) or
+        !isValidGhRepoComponent(name))
+    {
+        return error.InvalidGhRepoComponent;
+    }
     if (std.ascii.eqlIgnoreCase(host, "github.com")) {
         return std.fmt.allocPrint(gpa, "{s}/{s}", .{ owner, name });
     }
     return std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ host, owner, name });
 }
 
+fn isValidGhRepoComponent(component: []const u8) bool {
+    if (component.len == 0) return false;
+    for (component) |byte| {
+        if (byte == '/' or byte == '\\' or std.ascii.isWhitespace(byte) or std.ascii.isControl(byte)) return false;
+    }
+    return true;
+}
+
 /// Parse a git remote URL into GitHub CLI's GH_REPO format.
 /// Unsupported or malformed remotes return null instead of failing command
 /// dispatch; allocation failures still propagate.
+/// When non-null, caller owns the returned slice and must free it with `gpa`.
 pub fn ghRepoFromRemoteUrl(gpa: Allocator, remote_url: []const u8) !?[]u8 {
     var spec = url_mod.parse(gpa, remote_url, .{}) catch |err| switch (err) {
         error.EmptyInput,
@@ -294,15 +315,23 @@ pub fn ghRepoFromRemoteUrl(gpa: Allocator, remote_url: []const u8) !?[]u8 {
     };
     defer spec.deinit(gpa);
     if (spec.scheme == .file or spec.host.len == 0) return null;
-    const repo = try formatGhRepo(gpa, spec.host, spec.owner, spec.name);
-    return repo;
+    return formatGhRepo(gpa, spec.host, spec.owner, spec.name) catch |err| switch (err) {
+        error.InvalidGhRepoComponent => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 }
 
 /// Derive GH_REPO from an absolute path under the configured ghq/gitstore root.
 /// Subdirectories inside a repo are accepted; only the first host/owner/name
 /// components are used.
+/// When non-null, caller owns the returned slice and must free it with `gpa`.
 pub fn ghRepoFromGhqPath(gpa: Allocator, abs_path: []const u8, ghq_root: []const u8) !?[]u8 {
     const rel = repoRelativePath(abs_path, ghq_root) orelse return null;
+    var rel_segments = std.mem.splitScalar(u8, rel, '/');
+    while (rel_segments.next()) |seg| {
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return null;
+    }
+
     var parts = std.mem.splitScalar(u8, rel, '/');
     const host = parts.next() orelse return null;
     const owner = parts.next() orelse return null;
@@ -313,17 +342,25 @@ pub fn ghRepoFromGhqPath(gpa: Allocator, abs_path: []const u8, ghq_root: []const
     else
         name;
     if (repo_name.len == 0) return null;
-    const repo = try formatGhRepo(gpa, host, owner, repo_name);
-    return repo;
+    return formatGhRepo(gpa, host, owner, repo_name) catch |err| switch (err) {
+        error.InvalidGhRepoComponent => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 }
 
-fn pathUnderRootCanonical(io: Io, path: []const u8, root: []const u8) bool {
+fn realPathFileOrMissing(io: Io, path: []const u8, buf: []u8) !?[]const u8 {
+    const len = Dir.cwd().realPathFile(io, path, buf) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    return buf[0..len];
+}
+
+fn pathUnderRootCanonical(io: Io, path: []const u8, root: []const u8) !bool {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = Dir.cwd().realPathFile(io, path, &path_buf) catch return false;
-    const root_len = Dir.cwd().realPathFile(io, root, &root_buf) catch return false;
-    const canon_path = path_buf[0..path_len];
-    const canon_root = root_buf[0..root_len];
+    const canon_path = (try realPathFileOrMissing(io, path, &path_buf)) orelse return false;
+    const canon_root = (try realPathFileOrMissing(io, root, &root_buf)) orelse return false;
     if (canon_root.len == 1 and canon_root[0] == '/') {
         return canon_path.len > 1 and canon_path[0] == '/';
     }
@@ -332,17 +369,26 @@ fn pathUnderRootCanonical(io: Io, path: []const u8, root: []const u8) bool {
         canon_path[canon_root.len] == '/';
 }
 
+fn ghRepoFromCanonicalGhqPath(gpa: Allocator, io: Io, abs_path: []const u8, ghq_root: []const u8) !?[]u8 {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const canon_path = (try realPathFileOrMissing(io, abs_path, &path_buf)) orelse return null;
+    const canon_root = (try realPathFileOrMissing(io, ghq_root, &root_buf)) orelse return null;
+    return ghRepoFromGhqPath(gpa, canon_path, canon_root);
+}
+
 /// Resolve GH_REPO for GitHub CLI. Prefer real git metadata when available,
 /// then fall back to the ghq path shape. The fallback is what makes
 /// rclone/GDrive-synced working trees without a `.git` file still usable with
 /// `GH_REPO=$(gitstore gh-repo) gh ...`.
+/// When non-null, caller owns the returned slice and must free it with `gpa`.
 pub fn resolveGhRepo(
     gpa: Allocator,
     io: Io,
     abs_path: []const u8,
     ghq_root: []const u8,
 ) !?[]u8 {
-    const path_under_ghq = pathUnderRootCanonical(io, abs_path, ghq_root);
+    const path_under_ghq = try pathUnderRootCanonical(io, abs_path, ghq_root);
     var git_top = ex.exec(
         gpa,
         io,
@@ -352,15 +398,18 @@ pub fn resolveGhRepo(
         error.OutOfMemory => return err,
         else => {
             if (!path_under_ghq) return null;
-            return ghRepoFromGhqPath(gpa, abs_path, ghq_root);
+            return ghRepoFromCanonicalGhqPath(gpa, io, abs_path, ghq_root);
         },
     };
     defer git_top.deinit(gpa);
-    const top_under_ghq = git_top.succeeded() and pathUnderRootCanonical(
-        io,
-        ex.trimTrailingNewline(git_top.stdout),
-        ghq_root,
-    );
+    const top_under_ghq = if (git_top.succeeded())
+        try pathUnderRootCanonical(
+            io,
+            ex.trimTrailingNewline(git_top.stdout),
+            ghq_root,
+        )
+    else
+        false;
     if (git_top.succeeded() and (!path_under_ghq or top_under_ghq)) {
         var remote = ex.exec(
             gpa,
@@ -371,7 +420,7 @@ pub fn resolveGhRepo(
             error.OutOfMemory => return err,
             else => {
                 if (!path_under_ghq) return null;
-                return ghRepoFromGhqPath(gpa, abs_path, ghq_root);
+                return ghRepoFromCanonicalGhqPath(gpa, io, abs_path, ghq_root);
             },
         };
         defer remote.deinit(gpa);
@@ -381,11 +430,7 @@ pub fn resolveGhRepo(
         }
     }
     if (!path_under_ghq) return null;
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = Dir.cwd().realPathFile(io, abs_path, &path_buf) catch return null;
-    const root_len = Dir.cwd().realPathFile(io, ghq_root, &root_buf) catch return null;
-    return ghRepoFromGhqPath(gpa, path_buf[0..path_len], root_buf[0..root_len]);
+    return ghRepoFromCanonicalGhqPath(gpa, io, abs_path, ghq_root);
 }
 
 pub const AdoptionPaths = struct {
@@ -492,6 +537,11 @@ pub fn rewriteJjGitTarget(
     const new_content = try std.fmt.allocPrint(gpa, "{s}", .{git_dest});
     defer gpa.free(new_content);
 
+    _ = Dir.cwd().statFile(io, git_target_path, .{}) catch |err| {
+        warn(io, "warn: cannot inspect jj git_target at {s}: {s}\n", .{ git_target_path, @errorName(err) });
+        return err;
+    };
+
     Dir.cwd().writeFile(io, .{
         .sub_path = git_target_path,
         .data = new_content,
@@ -506,6 +556,10 @@ pub fn rewriteJjGitTarget(
 pub fn rewriteJjGitTargetRelative(gpa: Allocator, io: Io, jj_dir: []const u8) !void {
     const git_target_path = try std.fmt.allocPrint(gpa, "{s}/repo/store/git_target", .{jj_dir});
     defer gpa.free(git_target_path);
+    _ = Dir.cwd().statFile(io, git_target_path, .{}) catch |err| {
+        warn(io, "warn: cannot inspect jj git_target at {s}: {s}\n", .{ git_target_path, @errorName(err) });
+        return err;
+    };
     Dir.cwd().writeFile(io, .{
         .sub_path = git_target_path,
         .data = "../../../.git",
@@ -542,6 +596,7 @@ pub fn enumerateLinkedWorktrees(gpa: Allocator, io: Io, repo_path: []const u8) !
             continue;
         }
         const owned = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned);
         try list.append(gpa, owned);
     }
     return list.toOwnedSlice(gpa);
@@ -584,7 +639,28 @@ fn rewriteLinkedWorktreePointer(
 
     const new_pointer = try std.fmt.allocPrint(gpa, "gitdir: {s}/worktrees/{s}\n", .{ new_main_git, name });
     defer gpa.free(new_pointer);
-    try Dir.cwd().writeFile(io, .{ .sub_path = wt_git_file, .data = new_pointer });
+    const tmp_path = try std.fmt.allocPrint(
+        gpa,
+        "{s}.gitstore-tmp-{d}-{d}",
+        .{ wt_git_file, std.Thread.getCurrentId(), Io.Clock.real.now(io).nanoseconds },
+    );
+    defer {
+        Dir.cwd().deleteFile(io, tmp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => warnCleanupError(io, tmp_path, "linked worktree pointer temp", err),
+        };
+        gpa.free(tmp_path);
+    }
+    {
+        var tmp_file = try Dir.cwd().createFile(io, tmp_path, .{ .exclusive = true });
+        defer tmp_file.close(io);
+
+        var buf: [4096]u8 = undefined;
+        var writer = tmp_file.writerStreaming(io, &buf);
+        try writer.interface.writeAll(new_pointer);
+        try writer.flush();
+    }
+    try Dir.rename(Dir.cwd(), tmp_path, Dir.cwd(), wt_git_file, io);
 }
 
 /// Adopt a single repository: move .git and .jj into gitstore.
@@ -819,7 +895,13 @@ pub fn adopt(
 
         const jj_backup = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-old", .{repo_path});
         defer gpa.free(jj_backup);
-        try deleteTreeIfExists(io, jj_backup);
+        deleteTreeIfExists(io, jj_backup) catch |err| {
+            rollbackAdoptGitMove(gpa, io, log_path, git_src, git_dest, worktrees[0..rewritten_worktrees]);
+            Dir.cwd().deleteTree(io, jj_dest) catch |cleanup_err| {
+                warnCleanupError(io, jj_dest, "adopt stale jj backup rollback", cleanup_err);
+            };
+            return err;
+        };
         Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_backup, io) catch |err| {
             rollbackAdoptGitMove(gpa, io, log_path, git_src, git_dest, worktrees[0..rewritten_worktrees]);
             Dir.cwd().deleteTree(io, jj_dest) catch |cleanup_err| {
@@ -1487,9 +1569,15 @@ pub fn detach(
     if (has_jj_link) {
         const jj_new = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-new", .{repo_path});
         defer gpa.free(jj_new);
-        try deleteTreeIfExists(io, jj_new);
+        deleteTreeIfExists(io, jj_new) catch |err| {
+            rollbackDetachMainGitPointer(gpa, io, log_path, git_pointer_path, git_src, restored_pointer_content);
+            return err;
+        };
         info(io, "copy: {s} -> {s}\n", .{ jj_src, jj_new });
-        const jcp = try ex.exec(gpa, io, &.{ "cp", "-aL", jj_src, jj_new }, null);
+        const jcp = ex.exec(gpa, io, &.{ "cp", "-aL", jj_src, jj_new }, null) catch |err| {
+            rollbackDetachMainGitPointer(gpa, io, log_path, git_pointer_path, git_src, restored_pointer_content);
+            return err;
+        };
         gpa.free(jcp.stdout);
         gpa.free(jcp.stderr);
         if (jcp.succeeded()) {
@@ -1505,6 +1593,7 @@ pub fn detach(
                 Dir.cwd().deleteTree(io, jj_new) catch |cleanup_err| {
                     warnCleanupError(io, jj_new, "jj symlink rename rollback", cleanup_err);
                 };
+                rollbackDetachMainGitPointer(gpa, io, log_path, git_pointer_path, git_src, restored_pointer_content);
                 return err;
             };
             // Now rename staged copy into place. On failure restore the symlink.
@@ -1519,18 +1608,46 @@ pub fn detach(
                     Dir.cwd().deleteTree(io, jj_new) catch |cleanup_err| {
                         warnCleanupError(io, jj_new, "jj restore rollback", cleanup_err);
                     };
+                    rollbackDetachMainGitPointer(
+                        gpa,
+                        io,
+                        log_path,
+                        git_pointer_path,
+                        git_src,
+                        restored_pointer_content,
+                    );
                     return restore_err;
                 };
                 Dir.cwd().deleteTree(io, jj_new) catch |cleanup_err| {
                     warnCleanupError(io, jj_new, "jj staged rename rollback", cleanup_err);
                 };
+                rollbackDetachMainGitPointer(
+                    gpa,
+                    io,
+                    log_path,
+                    git_pointer_path,
+                    git_src,
+                    restored_pointer_content,
+                );
                 return err;
             };
-            // Success — delete the old symlink backup.
+            rewriteJjGitTargetRelative(gpa, io, jj_pointer_path) catch |err| {
+                Dir.cwd().deleteTree(io, jj_pointer_path) catch |cleanup_err| {
+                    warnCleanupError(io, jj_pointer_path, "jj rewrite rollback remove staged", cleanup_err);
+                };
+                Dir.rename(Dir.cwd(), jj_backup, Dir.cwd(), jj_pointer_path, io) catch |restore_err| {
+                    warn(
+                        io,
+                        "CRITICAL: could not restore .jj symlink {s} -> {s}: {s}\n",
+                        .{ jj_backup, jj_pointer_path, @errorName(restore_err) },
+                    );
+                };
+                rollbackDetachMainGitPointer(gpa, io, log_path, git_pointer_path, git_src, restored_pointer_content);
+                return err;
+            };
             Dir.cwd().deleteFile(io, jj_backup) catch |cleanup_err| {
                 warnCleanupError(io, jj_backup, "jj backup removal", cleanup_err);
             };
-            try rewriteJjGitTargetRelative(gpa, io, jj_pointer_path);
             oplog.logOperation(gpa, io, log_path, .create_symlink, jj_src, jj_pointer_path, "ok: detach restore .jj");
             info(io, "restored: {s}/.jj\n", .{repo_path});
         } else {
@@ -1539,6 +1656,7 @@ pub fn detach(
                 warnCleanupError(io, jj_new, "jj copy rollback", cleanup_err);
             };
             oplog.logOperation(gpa, io, log_path, .copy, jj_src, jj_new, "error: cp .jj failed (detach)");
+            rollbackDetachMainGitPointer(gpa, io, log_path, git_pointer_path, git_src, restored_pointer_content);
             return error.ProcessFailed;
         }
     }
@@ -1559,6 +1677,22 @@ pub fn detach(
                 restored_git,
                 "error: detach worktree rewrite failed",
             );
+            rewriteLinkedWorktreePointer(gpa, io, wt, git_src) catch |rollback_err| {
+                warn(
+                    io,
+                    "warn: could not roll back failed worktree pointer {s}: {s}\n",
+                    .{ wt, @errorName(rollback_err) },
+                );
+                oplog.logOperation(
+                    gpa,
+                    io,
+                    log_path,
+                    .write_pointer,
+                    wt,
+                    git_src,
+                    "error: detach failed worktree rollback failed",
+                );
+            };
             for (worktrees[0..restored_worktrees]) |done| {
                 rewriteLinkedWorktreePointer(gpa, io, done, git_src) catch |rollback_err| {
                     warn(

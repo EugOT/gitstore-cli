@@ -473,7 +473,7 @@ fn hasJj(gpa: Allocator, io: Io, abs_path: []const u8) !bool {
 }
 
 fn resolveHead(gpa: Allocator, io: Io, abs_path: []const u8) !HeadLookup {
-    const result = ex.exec(
+    var result = ex.exec(
         gpa,
         io,
         &.{ "git", "-C", abs_path, "rev-parse", "--verify", "--quiet", "HEAD" },
@@ -485,10 +485,7 @@ fn resolveHead(gpa: Allocator, io: Io, abs_path: []const u8) !HeadLookup {
             return .unavailable;
         },
     };
-    defer {
-        gpa.free(result.stdout);
-        gpa.free(result.stderr);
-    }
+    defer result.deinit(gpa);
     if (!result.succeeded()) {
         const stderr = ex.trimTrailingNewline(result.stderr);
         if (result.term == .exited and result.term.exited == 1 and stderr.len == 0) {

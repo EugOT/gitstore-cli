@@ -42,6 +42,10 @@ const usage_text =
     \\  filter            Print rclone filter rules to stdout
     \\  hook --zsh|--bash|--nu
     \\                    Print the shell wrapper for `ghq`->`gitstore`
+    \\  hook --gh-zsh|--gh-bash|--gh-nu
+    \\                    Print opt-in GitHub CLI compatibility wrapper
+    \\  gh-repo [--export] [path]
+    \\                    Print GH_REPO for GitHub CLI compatibility
     \\
     \\Global options:
     \\  --help, -h        Show this help message
@@ -71,6 +75,9 @@ const sub_help_hook =
     \\   gitstore hook --zsh          Print zsh wrapper (source from .zshrc)
     \\   gitstore hook --bash         Print bash wrapper (source from .bashrc)
     \\   gitstore hook --nu           Print nushell module (source from config.nu)
+    \\   gitstore hook --gh-zsh       Print opt-in zsh wrapper for `gh`
+    \\   gitstore hook --gh-bash      Print opt-in bash wrapper for `gh`
+    \\   gitstore hook --gh-nu        Print opt-in nushell wrapper for `gh`
     \\
     \\OPTIONS:
     \\   --help, -h                   Show this help
@@ -150,6 +157,26 @@ const sub_help_sync =
     \\
     \\NOTES:
     \\   Excludes .git/.jj internals + build artifacts; see `gitstore filter`.
+    \\
+;
+
+const sub_help_gh_repo =
+    \\NAME:
+    \\   gitstore gh-repo — Print GH_REPO for GitHub CLI compatibility
+    \\
+    \\USAGE:
+    \\   gitstore gh-repo             Resolve current directory
+    \\   gitstore gh-repo <path>      Resolve a repo path or subdirectory
+    \\   gitstore gh-repo --export    Print `export GH_REPO=...`
+    \\
+    \\OPTIONS:
+    \\   --export                     Emit a POSIX shell export line
+    \\   --help, -h                   Show this help
+    \\
+    \\NOTES:
+    \\   Real Git metadata wins when present. If `.git` is absent because a
+    \\   working tree was synced without VCS internals, the path must still be
+    \\   under the configured ghq/gitstore root as host/owner/repo.
     \\
 ;
 
@@ -286,6 +313,7 @@ fn getGhqRoot(gpa: Allocator, io: Io) ![]u8 {
     }
     // Trim trailing newline from the stdout
     const trimmed = exec_mod.trimTrailingNewline(result.stdout);
+    errdefer gpa.free(result.stdout);
     // We need to return owned memory of just the trimmed part
     if (trimmed.len < result.stdout.len) {
         const owned = try gpa.dupe(u8, trimmed);
@@ -515,13 +543,16 @@ pub fn main(init: std.process.Init) !u8 {
                 has_help = true;
             } else if (std.mem.eql(u8, arg, "--zsh") or
                 std.mem.eql(u8, arg, "--bash") or
-                std.mem.eql(u8, arg, "--nu"))
+                std.mem.eql(u8, arg, "--nu") or
+                std.mem.eql(u8, arg, "--gh-zsh") or
+                std.mem.eql(u8, arg, "--gh-bash") or
+                std.mem.eql(u8, arg, "--gh-nu"))
             {
                 if (shell != null and !std.mem.eql(u8, shell.?, arg)) {
                     var buf: [512]u8 = undefined;
                     var w = File.stderr().writerStreaming(io, &buf);
                     try w.interface.print(
-                        "error: hook accepts only one of --zsh/--bash/--nu (got {s} after {s})\n",
+                        "error: hook accepts only one shell flag (got {s} after {s})\n",
                         .{ arg, shell.? },
                     );
                     try w.flush();
@@ -544,15 +575,21 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
         const which = shell orelse {
-            try printErr(io, "error: hook requires --zsh, --bash, or --nu\n");
+            try printErr(io, "error: hook requires --zsh, --bash, --nu, --gh-zsh, --gh-bash, or --gh-nu\n");
             return 2;
         };
         if (std.mem.eql(u8, which, "--zsh")) {
             try printOut(io, hooks.zsh_hook);
         } else if (std.mem.eql(u8, which, "--bash")) {
             try printOut(io, hooks.bash_hook);
-        } else {
+        } else if (std.mem.eql(u8, which, "--nu")) {
             try printOut(io, hooks.nu_hook);
+        } else if (std.mem.eql(u8, which, "--gh-zsh")) {
+            try printOut(io, hooks.gh_zsh_hook);
+        } else if (std.mem.eql(u8, which, "--gh-bash")) {
+            try printOut(io, hooks.gh_bash_hook);
+        } else {
+            try printOut(io, hooks.gh_nu_hook);
         }
         return 0;
     }
@@ -825,6 +862,10 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
+    if (std.mem.eql(u8, command, "gh-repo")) {
+        return cmdGhRepo(gpa, io, init.environ_map, &args_iter);
+    }
+
     // --- libgitstore v2 subcommands ---
 
     if (std.mem.eql(u8, command, "get")) {
@@ -1072,6 +1113,126 @@ fn cmdList(
     }
     try w.flush();
     return 0;
+}
+
+fn cmdGhRepo(
+    gpa: Allocator,
+    io: Io,
+    environ_map: *std.process.Environ.Map,
+    args_iter: *std.process.Args.Iterator,
+) !u8 {
+    var export_mode = false;
+    var path: ?[]const u8 = null;
+
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printOut(io, sub_help_gh_repo);
+            return 0;
+        } else if (std.mem.eql(u8, arg, "--export")) {
+            export_mode = true;
+        } else if (arg.len != 0 and arg[0] == '-') {
+            var buf: [512]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: unknown flag for gh-repo: {s}\n", .{arg});
+            try w.flush();
+            return 2;
+        } else {
+            if (path != null) {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: gh-repo takes at most one path: {s}\n", .{arg});
+                try w.flush();
+                return 2;
+            }
+            path = arg;
+        }
+    }
+
+    const abs_path = realPathArg(gpa, io, path orelse ".") catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            var buf: [1024]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: cannot resolve path for gh-repo: {s}\n", .{@errorName(err)});
+            try w.flush();
+            return 1;
+        },
+    };
+    defer gpa.free(abs_path);
+    const configured_ghq_root = config_mod.loadRoot(gpa, io, environ_map) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            var buf: [1024]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: cannot resolve ghq root for gh-repo: {s}\n", .{@errorName(err)});
+            try w.flush();
+            return 1;
+        },
+    };
+    defer gpa.free(configured_ghq_root);
+    const ghq_root = realPathArg(gpa, io, configured_ghq_root) catch |err| switch (err) {
+        error.FileNotFound => try gpa.dupe(u8, configured_ghq_root),
+        error.OutOfMemory => return err,
+        else => {
+            var buf: [1024]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: cannot canonicalize ghq root for gh-repo: {s}\n", .{@errorName(err)});
+            try w.flush();
+            return 1;
+        },
+    };
+    defer gpa.free(ghq_root);
+
+    const gh_repo = (gitstore.resolveGhRepo(gpa, io, abs_path, ghq_root) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            var buf: [1024]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: GH_REPO resolution failed for {s}: {s}\n", .{ abs_path, @errorName(err) });
+            try w.flush();
+            return 1;
+        },
+    }) orelse {
+        var buf: [1024]u8 = undefined;
+        var w = File.stderr().writerStreaming(io, &buf);
+        try w.interface.print(
+            "error: cannot derive GH_REPO for {s}; expected git remote or path under {s}/host/owner/repo\n",
+            .{ abs_path, ghq_root },
+        );
+        try w.flush();
+        return 1;
+    };
+    defer gpa.free(gh_repo);
+
+    var buf: [1024]u8 = undefined;
+    var w = File.stdout().writerStreaming(io, &buf);
+    if (export_mode) {
+        try w.interface.writeAll("export GH_REPO=");
+        try writePosixSingleQuoted(&w.interface, gh_repo);
+        try w.interface.writeByte('\n');
+    } else {
+        try w.interface.print("{s}\n", .{gh_repo});
+    }
+    try w.flush();
+    return 0;
+}
+
+fn realPathArg(gpa: Allocator, io: Io, path: []const u8) ![]u8 {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try Dir.cwd().realPathFile(io, path, &buf);
+    return gpa.dupe(u8, buf[0..len]);
+}
+
+fn writePosixSingleQuoted(writer: anytype, value: []const u8) !void {
+    try writer.writeByte('\'');
+    for (value) |c| {
+        if (c == '\'') {
+            try writer.writeAll("'\\''");
+        } else {
+            try writer.writeByte(c);
+        }
+    }
+    try writer.writeByte('\'');
 }
 
 fn cmdRoot(

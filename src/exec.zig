@@ -147,6 +147,7 @@ pub fn execWithEnv(
     var scrubbed = try buildScrubbedEnv(gpa);
     defer scrubbed.deinit();
     for (caller_env_overrides) |key| {
+        _ = scrubbed.orderedRemove(key);
         if (env.get(key)) |value| {
             try scrubbed.put(key, value);
         }
@@ -185,6 +186,30 @@ test "execWithEnv forwards only config-discovery overrides" {
         "/tmp/gitstore-home|/tmp/gitstore-global.gitconfig|unset",
         result.stdout,
     );
+}
+
+test "execWithEnv clears inherited config-discovery variables unless provided" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+
+    const script =
+        \\printf '%s|' "${HOME-unset}"
+        \\printf '%s|' "${XDG_CONFIG_HOME-unset}"
+        \\printf '%s|' "${XDG_CACHE_HOME-unset}"
+        \\printf '%s' "${GIT_CONFIG_GLOBAL-unset}"
+    ;
+    var result = try execWithEnv(gpa, io, &.{
+        "sh",
+        "-c",
+        script,
+    }, null, &env);
+    defer result.deinit(gpa);
+
+    try testing.expect(result.succeeded());
+    try testing.expectEqualStrings("unset|unset|unset|unset", result.stdout);
 }
 
 /// Run a command, return stdout on success. Returns error on non-zero exit.

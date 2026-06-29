@@ -8,13 +8,7 @@ const Allocator = std.mem.Allocator;
 
 const gitstore = @import("gitstore.zig");
 const ex = @import("exec.zig");
-
-fn ignoreCleanupError(err: anyerror) void {
-    switch (err) {
-        error.FileNotFound => {},
-        else => std.debug.panic("unexpected cleanup error: {s}", .{@errorName(err)}),
-    }
-}
+const test_support = @import("test_support.zig");
 
 // Pull in tests from all modules
 comptime {
@@ -37,63 +31,6 @@ comptime {
 
 const config = @import("config.zig");
 
-// ===== Test helpers =====
-
-fn tempPathCandidate(gpa: Allocator, io: Io, prefix: []const u8, suffix: []const u8, attempt: u32) ![]u8 {
-    var entropy_marker: u8 = undefined;
-    const tid = std.Thread.getCurrentId();
-    const ns = Io.Clock.real.now(io).nanoseconds;
-    return std.fmt.allocPrint(
-        gpa,
-        "{s}_{d}_{d}_{x}{s}",
-        .{ prefix, attempt, tid ^ @as(u64, @intCast(ns)), @intFromPtr(&entropy_marker), suffix },
-    );
-}
-
-/// Reserve a collision-resistant `/tmp` directory. Exclusive creation is the
-/// load-bearing safety property: if another test process chooses the same path,
-/// it gets `PathAlreadyExists` and retries instead of deleting shared state.
-fn uniqueTempDir(gpa: Allocator, io: Io, prefix: []const u8) ![]u8 {
-    var attempt: u32 = 0;
-    while (attempt < 64) : (attempt += 1) {
-        const path = try tempPathCandidate(gpa, io, prefix, "", attempt);
-        Dir.cwd().createDir(io, path, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                gpa.free(path);
-                continue;
-            },
-            else => |e| {
-                gpa.free(path);
-                return e;
-            },
-        };
-        return path;
-    }
-    return error.PathAlreadyExists;
-}
-
-/// Reserve a collision-resistant empty file and return its path. The caller may
-/// write through normal APIs and is responsible for deleting the file.
-fn uniqueTempFile(gpa: Allocator, io: Io, prefix: []const u8, suffix: []const u8) ![]u8 {
-    var attempt: u32 = 0;
-    while (attempt < 64) : (attempt += 1) {
-        const path = try tempPathCandidate(gpa, io, prefix, suffix, attempt);
-        var file = Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                gpa.free(path);
-                continue;
-            },
-            else => |e| {
-                gpa.free(path);
-                return e;
-            },
-        };
-        file.close(io);
-        return path;
-    }
-    return error.PathAlreadyExists;
-}
-
 const TestEnv = struct {
     base: []const u8,
     ghq_root: []const u8,
@@ -102,7 +39,7 @@ const TestEnv = struct {
     io: Io,
 
     fn setup(gpa: Allocator, io: Io) !TestEnv {
-        const base = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_env");
+        const base = try test_support.uniqueTempDir(gpa, io, "test_env");
         errdefer gpa.free(base);
         const ghq = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
         errdefer gpa.free(ghq);
@@ -122,7 +59,7 @@ const TestEnv = struct {
     }
 
     fn teardown(self: *const TestEnv) void {
-        Dir.cwd().deleteTree(self.io, self.base) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(self.io, self.base) catch |err| test_support.ignoreCleanupError("tests", err);
         self.gpa.free(self.base);
         self.gpa.free(self.ghq_root);
         self.gpa.free(self.gitstore_root);
@@ -268,7 +205,7 @@ test "repoRelativePath empty root returns null" {
 test "isAdopted returns false for nonexistent path" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_no_such_path");
+    const dir = try test_support.uniqueTempDir(gpa, io, "test_no_such_path");
     defer gpa.free(dir);
     try Dir.cwd().deleteTree(io, dir);
     try testing.expect(!gitstore.isAdoptedPaths(gpa, io, .{ .repo_path = dir, .gitstore_root = "/any" }));
@@ -277,9 +214,9 @@ test "isAdopted returns false for nonexistent path" {
 test "isAdopted returns true when pointer targets gitstore_root" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_adopted");
+    const dir = try test_support.uniqueTempDir(gpa, io, "test_adopted");
     defer {
-        Dir.cwd().deleteTree(io, dir) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(io, dir) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(dir);
     }
     const git_file = try std.fmt.allocPrint(gpa, "{s}/.git", .{dir});
@@ -297,9 +234,9 @@ test "isAdopted returns true when pointer targets gitstore_root" {
 test "isAdopted returns false when pointer targets non-gitstore path (linked worktree)" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_linked_wt");
+    const dir = try test_support.uniqueTempDir(gpa, io, "test_linked_wt");
     defer {
-        Dir.cwd().deleteTree(io, dir) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(io, dir) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(dir);
     }
     const git_file = try std.fmt.allocPrint(gpa, "{s}/.git", .{dir});
@@ -317,9 +254,9 @@ test "isAdopted returns false when pointer targets non-gitstore path (linked wor
 test "isAdopted returns false for .git directory" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_not_adopted");
+    const dir = try test_support.uniqueTempDir(gpa, io, "test_not_adopted");
     defer {
-        Dir.cwd().deleteTree(io, dir) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(io, dir) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(dir);
     }
     const git_dir = try std.fmt.allocPrint(gpa, "{s}/.git", .{dir});
@@ -332,9 +269,9 @@ test "isAdopted returns false for .git directory" {
 test "isAdopted returns false for non-gitdir file content" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_bad_pointer");
+    const dir = try test_support.uniqueTempDir(gpa, io, "test_bad_pointer");
     defer {
-        Dir.cwd().deleteTree(io, dir) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(io, dir) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(dir);
     }
     const git_file = try std.fmt.allocPrint(gpa, "{s}/.git", .{dir});
@@ -375,10 +312,7 @@ test "resolveGhRepo ignores parent git repo outside ghq root" {
         &.{ "git", "remote", "add", "origin", "https://github.com/wrong/parent.git" },
         env.base,
     );
-    defer {
-        gpa.free(add_remote.stdout);
-        gpa.free(add_remote.stderr);
-    }
+    defer add_remote.deinit(gpa);
     if (!add_remote.succeeded()) return error.ProcessFailed;
 
     const repo_path = try std.fmt.allocPrint(gpa, "{s}/github.com/right/repo", .{env.ghq_root});
@@ -454,6 +388,114 @@ test "ghRepoFromGhqPath strips optional .git suffix from repo directory" {
     try testing.expectEqualStrings("EugOT/gitstore-cli", resolved);
 }
 
+test "gh: formatGhRepo omits default github.com host" {
+    const gpa = testing.allocator;
+    const repo = try gitstore.formatGhRepo(gpa, "github.com", "Owner", "Repo");
+    defer gpa.free(repo);
+    try testing.expectEqualStrings("Owner/Repo", repo);
+}
+
+test "gh: formatGhRepo preserves enterprise host" {
+    const gpa = testing.allocator;
+    const repo = try gitstore.formatGhRepo(gpa, "github.corp.example", "Owner", "Repo");
+    defer gpa.free(repo);
+    try testing.expectEqualStrings("github.corp.example/Owner/Repo", repo);
+}
+
+test "gh: formatGhRepo rejects empty and unsafe components" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidGhRepoComponent, gitstore.formatGhRepo(gpa, "", "Owner", "Repo"));
+    try testing.expectError(
+        error.InvalidGhRepoComponent,
+        gitstore.formatGhRepo(gpa, "github.com", "Bad Owner", "Repo"),
+    );
+    try testing.expectError(
+        error.InvalidGhRepoComponent,
+        gitstore.formatGhRepo(gpa, "github.com", "Owner", "Bad\nRepo"),
+    );
+    try testing.expectError(
+        error.InvalidGhRepoComponent,
+        gitstore.formatGhRepo(gpa, "github.com", "Bad/Owner", "Repo"),
+    );
+    try testing.expectError(
+        error.InvalidGhRepoComponent,
+        gitstore.formatGhRepo(gpa, "github.com", "Owner", "Bad\\Repo"),
+    );
+}
+
+test "gh: parses remote URL into GH_REPO" {
+    const gpa = testing.allocator;
+    const repo = (try gitstore.ghRepoFromRemoteUrl(gpa, "git@github.com:EugOT/gitstore-cli.git")).?;
+    defer gpa.free(repo);
+    try testing.expectEqualStrings("EugOT/gitstore-cli", repo);
+}
+
+test "gh: derives GH_REPO from ghq path without .git" {
+    const gpa = testing.allocator;
+    const repo = (try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/EugOT/gitstore-cli/subdir",
+        "/Users/test/ghq",
+    )).?;
+    defer gpa.free(repo);
+    try testing.expectEqualStrings("EugOT/gitstore-cli", repo);
+}
+
+test "gh: rejects dot segments in ghq path" {
+    const gpa = testing.allocator;
+    try testing.expect((try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/EugOT/gitstore-cli/../other",
+        "/Users/test/ghq",
+    )) == null);
+}
+
+test "gh: rejects unsafe components in ghq path" {
+    const gpa = testing.allocator;
+    try testing.expect((try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/Bad Owner/gitstore-cli",
+        "/Users/test/ghq",
+    )) == null);
+    try testing.expect((try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/EugOT/bad\\repo",
+        "/Users/test/ghq",
+    )) == null);
+}
+
+test "gh: returns null for path outside ghq root" {
+    const gpa = testing.allocator;
+    try testing.expect((try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/src/github.com/EugOT/gitstore-cli",
+        "/Users/test/ghq",
+    )) == null);
+}
+
+test "gh: resolveGhRepo prefers git origin remote" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createHostRepo("github.com", "Fallback", "path-repo");
+    defer gpa.free(repo);
+
+    var remote = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "remote", "add", "origin", "git@github.com:EugOT/gitstore-cli.git" },
+        repo,
+    );
+    defer remote.deinit(gpa);
+    try testing.expect(remote.succeeded());
+
+    const resolved = (try gitstore.resolveGhRepo(gpa, io, repo, env.ghq_root)).?;
+    defer gpa.free(resolved);
+    try testing.expectEqualStrings("EugOT/gitstore-cli", resolved);
+}
+
 // =========================================================
 // rewriteJjGitTarget unit tests
 // =========================================================
@@ -461,9 +503,9 @@ test "ghRepoFromGhqPath strips optional .git suffix from repo directory" {
 test "rewriteJjGitTarget writes absolute path" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const jj_dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_jj_target");
+    const jj_dir = try test_support.uniqueTempDir(gpa, io, "test_jj_target");
     defer {
-        Dir.cwd().deleteTree(io, jj_dir) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(io, jj_dir) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(jj_dir);
     }
     const repo_store = try std.fmt.allocPrint(gpa, "{s}/repo/store", .{jj_dir});
@@ -493,9 +535,14 @@ test "rewriteJjGitTarget writes absolute path" {
 test "rewriteJjGitTarget reports missing git_target file" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const jj_dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_jj_missing");
-    defer gpa.free(jj_dir);
-    try Dir.cwd().deleteTree(io, jj_dir);
+    const jj_dir = try test_support.uniqueTempDir(gpa, io, "test_jj_missing");
+    defer {
+        Dir.cwd().deleteTree(io, jj_dir) catch |err| test_support.ignoreCleanupError("tests", err);
+        gpa.free(jj_dir);
+    }
+    const repo_store = try std.fmt.allocPrint(gpa, "{s}/repo/store", .{jj_dir});
+    defer gpa.free(repo_store);
+    try Dir.cwd().createDirPath(io, repo_store);
 
     try testing.expectError(error.FileNotFound, gitstore.rewriteJjGitTarget(gpa, io, jj_dir, "/some/git"));
 }
@@ -507,9 +554,9 @@ test "rewriteJjGitTarget reports missing git_target file" {
 test "init creates gitstore directory" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_init_dir");
+    const dir = try test_support.uniqueTempDir(gpa, io, "test_init_dir");
     defer {
-        Dir.cwd().deleteTree(io, dir) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(io, dir) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(dir);
     }
     try Dir.cwd().deleteTree(io, dir);
@@ -524,9 +571,9 @@ test "init creates gitstore directory" {
 test "init is idempotent" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_init_idem");
+    const dir = try test_support.uniqueTempDir(gpa, io, "test_init_idem");
     defer {
-        Dir.cwd().deleteTree(io, dir) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(io, dir) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(dir);
     }
     try Dir.cwd().deleteTree(io, dir);
@@ -776,11 +823,13 @@ test "e2e verify accepts relative adopted repo path" {
 
     try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
 
-    const relative_repo = try uniqueTempFile(gpa, io, "gitstore_verify_relative_link", "");
+    const relative_repo = try test_support.uniqueTempFile(gpa, io, "gitstore_verify_relative_link", "");
     defer gpa.free(relative_repo);
+    // Test-only pattern: reserve a collision-free name, delete the file, then
+    // reuse that path for the symlink target.
     try Dir.cwd().deleteFile(io, relative_repo);
     try Dir.cwd().symLink(io, repo, relative_repo, .{ .is_directory = true });
-    defer Dir.cwd().deleteFile(io, relative_repo) catch |err| ignoreCleanupError(err);
+    defer Dir.cwd().deleteFile(io, relative_repo) catch |err| test_support.ignoreCleanupError("tests", err);
 
     const ok = try gitstore.verify(gpa, io, relative_repo);
     try testing.expect(ok);
@@ -1017,8 +1066,7 @@ test "e2e adopt repo with linked worktree rewrites pointer" {
     // Create a linked worktree on a new branch
     const wt_dir = try std.fmt.allocPrint(gpa, "{s}/wt-feature", .{env.base});
     defer gpa.free(wt_dir);
-    Dir.cwd().deleteTree(io, wt_dir) catch |err| ignoreCleanupError(err);
-    defer Dir.cwd().deleteTree(io, wt_dir) catch |err| ignoreCleanupError(err);
+    defer Dir.cwd().deleteTree(io, wt_dir) catch |err| test_support.ignoreCleanupError("tests", err);
     const wt_add = try ex.exec(gpa, io, &.{ "git", "worktree", "add", "-b", "feature", wt_dir }, repo);
     gpa.free(wt_add.stdout);
     gpa.free(wt_add.stderr);
@@ -1196,8 +1244,7 @@ test "e2e detach round-trip preserves linked worktree" {
 
     const wt_dir = try std.fmt.allocPrint(gpa, "{s}/wt-detach", .{env.base});
     defer gpa.free(wt_dir);
-    Dir.cwd().deleteTree(io, wt_dir) catch |err| ignoreCleanupError(err);
-    defer Dir.cwd().deleteTree(io, wt_dir) catch |err| ignoreCleanupError(err);
+    defer Dir.cwd().deleteTree(io, wt_dir) catch |err| test_support.ignoreCleanupError("tests", err);
     const wt_add = try ex.exec(gpa, io, &.{ "git", "worktree", "add", "-b", "feature", wt_dir }, repo);
     gpa.free(wt_add.stdout);
     gpa.free(wt_add.stderr);
@@ -1607,7 +1654,7 @@ test "config: fuzz resolvePrecedence is total" {
 // =========================================================
 
 fn tempGitConfigPath(gpa: Allocator, io: Io) ![]u8 {
-    return uniqueTempFile(gpa, io, "/tmp/gitstore_config_test", ".gitconfig");
+    return test_support.uniqueTempFile(gpa, io, "config_test", ".gitconfig");
 }
 
 /// Run `git config --unset <key>` against a test-local config file.
@@ -1632,7 +1679,7 @@ test "config: load reads gitstore.root from real global git config" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch |err| ignoreCleanupError(err);
+    defer Dir.cwd().deleteFile(io, config_path) catch |err| test_support.ignoreCleanupError("tests", err);
 
     try gitSetFile(gpa, io, config_path, "gitstore.root", "/gitstore_unit_test_sentinel_root");
 
@@ -1649,13 +1696,36 @@ test "config: load reads gitstore.root from real global git config" {
     try testing.expect(!cfg.used_legacy_ghq_keys);
 }
 
+test "config: load reads HOME global git config from caller env" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const home = try test_support.uniqueTempDir(gpa, io, "config_home");
+    defer gpa.free(home);
+    defer Dir.cwd().deleteTree(io, home) catch |err| test_support.ignoreCleanupError("tests", err);
+
+    const config_path = try std.fmt.allocPrint(gpa, "{s}/.gitconfig", .{home});
+    defer gpa.free(config_path);
+    try gitSetFile(gpa, io, config_path, "gitstore.root", "/home_env_gitstore_root");
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings("/home_env_gitstore_root", cfg.root);
+    try testing.expect(!cfg.used_legacy_ghq_keys);
+}
+
 test "config: load falls back to ghq.root and flags legacy" {
     const gpa = testing.allocator;
     const io = testing.io;
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch |err| ignoreCleanupError(err);
+    defer Dir.cwd().deleteFile(io, config_path) catch |err| test_support.ignoreCleanupError("tests", err);
 
     try gitSetFile(gpa, io, config_path, "ghq.root", "/ghq_legacy_test_sentinel_root");
 
@@ -1677,7 +1747,7 @@ test "config: load uses env GITSTORE_ROOT when no git config set" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch |err| ignoreCleanupError(err);
+    defer Dir.cwd().deleteFile(io, config_path) catch |err| test_support.ignoreCleanupError("tests", err);
     try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
 
     var env_map: std.process.Environ.Map = .init(gpa);
@@ -1704,7 +1774,7 @@ test "config: resolveRootForUrl falls back to base.root when no pattern matches"
     const sentinel_url = "https://gitstore-test.invalid/unused/sentinel";
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch |err| ignoreCleanupError(err);
+    defer Dir.cwd().deleteFile(io, config_path) catch |err| test_support.ignoreCleanupError("tests", err);
     try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
     var env_map: std.process.Environ.Map = .init(gpa);
     defer env_map.deinit();
@@ -1736,7 +1806,7 @@ test "config: resolveRootForUrl prefers matching gitstore.<url>.root urlmatch" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch |err| ignoreCleanupError(err);
+    defer Dir.cwd().deleteFile(io, config_path) catch |err| test_support.ignoreCleanupError("tests", err);
 
     try gitSetFile(gpa, io, config_path, pattern_key, "/per-org/acme");
     var env_map: std.process.Environ.Map = .init(gpa);
@@ -2129,6 +2199,47 @@ fn controlledEnv(
     return map;
 }
 
+const ControlledEnvFixture = struct {
+    const Self = ControlledEnvFixture;
+
+    gpa: Allocator,
+    io: Io,
+    home: []u8,
+    git_config: []u8,
+    env_map: std.process.Environ.Map,
+
+    fn deinit(self: *Self) void {
+        self.env_map.deinit();
+        Dir.cwd().deleteFile(self.io, self.git_config) catch |err| test_support.ignoreCleanupError("tests", err);
+        self.gpa.free(self.git_config);
+        Dir.cwd().deleteTree(self.io, self.home) catch |err| test_support.ignoreCleanupError("tests", err);
+        self.gpa.free(self.home);
+        self.* = undefined;
+    }
+};
+
+fn setupControlledEnvFixture(gpa: Allocator, io: Io, namespace: []const u8) !ControlledEnvFixture {
+    const home = try test_support.uniqueTempDir(gpa, io, namespace);
+    errdefer {
+        Dir.cwd().deleteTree(io, home) catch |err| test_support.ignoreCleanupError("tests", err);
+        gpa.free(home);
+    }
+    const git_config = try test_support.uniqueTempFile(gpa, io, namespace, ".gitconfig");
+    errdefer {
+        Dir.cwd().deleteFile(io, git_config) catch |err| test_support.ignoreCleanupError("tests", err);
+        gpa.free(git_config);
+    }
+    var env_map = try controlledEnv(gpa, home, git_config);
+    errdefer env_map.deinit();
+    return .{
+        .gpa = gpa,
+        .io = io,
+        .home = home,
+        .git_config = git_config,
+        .env_map = env_map,
+    };
+}
+
 /// Spawn the built gitstore binary with `argv_tail` and a controlled env,
 /// then assert the expected exit code and that `needle` appears in the
 /// selected stream. Uses std.process.run (the same high-level spawn API
@@ -2136,14 +2247,14 @@ fn controlledEnv(
 fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
     // Throwaway HOME dir + empty global gitconfig, unique per invocation so
     // parallel test execution cannot collide.
-    const home = try uniqueTempDir(gpa, io, "/tmp/gitstore_e2e_home");
+    const home = try test_support.uniqueTempDir(gpa, io, "e2e_home");
     defer {
-        Dir.cwd().deleteTree(io, home) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteTree(io, home) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(home);
     }
-    const git_config = try uniqueTempFile(gpa, io, "/tmp/gitstore_e2e", ".gitconfig");
+    const git_config = try test_support.uniqueTempFile(gpa, io, "e2e", ".gitconfig");
     defer {
-        Dir.cwd().deleteFile(io, git_config) catch |err| ignoreCleanupError(err);
+        Dir.cwd().deleteFile(io, git_config) catch |err| test_support.ignoreCleanupError("tests", err);
         gpa.free(git_config);
     }
 
@@ -2280,7 +2391,7 @@ test "e2e hook with no shell flag errors, exit 2" {
         .argv_tail = &.{"hook"},
         .expect = .{ .code = 2 },
         .stream = .stderr,
-        .needle = "error: hook requires --zsh, --bash, or --nu",
+        .needle = "error: hook requires --zsh, --bash, --nu, --gh-zsh, --gh-bash, or --gh-nu",
     });
 }
 
@@ -2289,7 +2400,7 @@ test "e2e hook with conflicting shells errors, exit 2" {
         .argv_tail = &.{ "hook", "--zsh", "--bash" },
         .expect = .{ .code = 2 },
         .stream = .stderr,
-        .needle = "error: hook accepts only one of --zsh/--bash/--nu",
+        .needle = "error: hook accepts only one shell flag",
     });
 }
 
@@ -2301,6 +2412,211 @@ test "e2e hook --zsh --help surfaces help to stdout, exit 0" {
         .stream = .stdout,
         .needle = "gitstore hook",
     });
+}
+
+test "e2e hook --gh shells print opt-in gh wrappers" {
+    const cases = [_]struct {
+        flag: []const u8,
+        needle: []const u8,
+    }{
+        .{ .flag = "--gh-zsh", .needle = "gitstore-gh-hook.zsh" },
+        .{ .flag = "--gh-zsh", .needle = "command gitstore gh-repo" },
+        .{ .flag = "--gh-bash", .needle = "gitstore-gh-hook.bash" },
+        .{ .flag = "--gh-bash", .needle = "command gitstore gh-repo" },
+        .{ .flag = "--gh-nu", .needle = "with-env { GH_REPO:" },
+        .{ .flag = "--gh-nu", .needle = "^gitstore gh-repo" },
+    };
+    for (cases) |item| {
+        try runE2eCase(testing.allocator, testing.io, .{
+            .argv_tail = &.{ "hook", item.flag },
+            .expect = .{ .code = 0 },
+            .stream = .stdout,
+            .needle = item.needle,
+        });
+    }
+}
+
+test "e2e gh-repo resolves synced ghq path without .git" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "e2e_gh");
+    defer fixture.deinit();
+    const repo_subdir = try std.fmt.allocPrint(gpa, "{s}/ghq/github.com/EugOT/gitstore-cli/src", .{fixture.home});
+    defer gpa.free(repo_subdir);
+    try Dir.cwd().createDirPath(io, repo_subdir);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.gitstore_bin, "gh-repo", repo_subdir },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+    try testing.expectEqualStrings("EugOT/gitstore-cli\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+}
+
+test "e2e gh-repo resolves configured gitstore root without full config load" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "e2e_gh_config");
+    defer fixture.deinit();
+    const configured_root = try std.fmt.allocPrint(gpa, "{s}/configured-root", .{fixture.home});
+    defer gpa.free(configured_root);
+    try gitSetFile(gpa, io, fixture.git_config, "gitstore.root", configured_root);
+    const repo_subdir = try std.fmt.allocPrint(gpa, "{s}/github.com/EugOT/configured/src", .{configured_root});
+    defer gpa.free(repo_subdir);
+    try Dir.cwd().createDirPath(io, repo_subdir);
+    const fake_bin = try std.fmt.allocPrint(gpa, "{s}/bin", .{fixture.home});
+    defer gpa.free(fake_bin);
+    try Dir.cwd().createDirPath(io, fake_bin);
+    const fake_gh = try std.fmt.allocPrint(gpa, "{s}/gh", .{fake_bin});
+    defer gpa.free(fake_gh);
+    const fake_gh_marker = try std.fmt.allocPrint(gpa, "{s}/gh-was-called", .{fixture.home});
+    defer gpa.free(fake_gh_marker);
+    const fake_gh_script = try std.fmt.allocPrint(gpa, "#!/bin/sh\n: > '{s}'\nexit 99\n", .{fake_gh_marker});
+    defer gpa.free(fake_gh_script);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = fake_gh,
+        .data = fake_gh_script,
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    const inherited_path = fixture.env_map.get("PATH") orelse "";
+    const fake_path = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ fake_bin, inherited_path });
+    defer gpa.free(fake_path);
+    try fixture.env_map.put("PATH", fake_path);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.gitstore_bin, "gh-repo", repo_subdir },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+    try testing.expectEqualStrings("EugOT/configured\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, fake_gh_marker, .{}));
+}
+
+test "e2e gh-repo resolves ghq path when git metadata probe fails" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "e2e_gh_no_git");
+    defer fixture.deinit();
+    const repo_subdir = try std.fmt.allocPrint(gpa, "{s}/ghq/github.com/EugOT/gitstore-cli/src", .{fixture.home});
+    defer gpa.free(repo_subdir);
+    try Dir.cwd().createDirPath(io, repo_subdir);
+    const fake_bin = try std.fmt.allocPrint(gpa, "{s}/bin", .{fixture.home});
+    defer gpa.free(fake_bin);
+    try Dir.cwd().createDirPath(io, fake_bin);
+    const fake_git = try std.fmt.allocPrint(gpa, "{s}/git", .{fake_bin});
+    defer gpa.free(fake_git);
+    const fake_git_marker = try std.fmt.allocPrint(gpa, "{s}/fake-git-probe", .{fixture.home});
+    defer gpa.free(fake_git_marker);
+    const inherited_path = fixture.env_map.get("PATH") orelse "";
+    const fake_git_script = try std.fmt.allocPrint(
+        gpa,
+        \\#!/bin/sh
+        \\if [ "$1" = "config" ]; then
+        \\  PATH="{s}" exec git "$@"
+        \\fi
+        \\printf '%s\n' "$*" >> '{s}'
+        \\exit 42
+        \\
+    ,
+        .{ inherited_path, fake_git_marker },
+    );
+    defer gpa.free(fake_git_script);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = fake_git,
+        .data = fake_git_script,
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    const fake_path = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ fake_bin, inherited_path });
+    defer gpa.free(fake_path);
+    try fixture.env_map.put("PATH", fake_path);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.gitstore_bin, "gh-repo", repo_subdir },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+    try testing.expectEqualStrings("EugOT/gitstore-cli\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+
+    const marker = try Dir.cwd().readFileAlloc(io, fake_git_marker, gpa, .unlimited);
+    defer gpa.free(marker);
+    try testing.expect(std.mem.indexOf(u8, marker, "-C") != null);
+    try testing.expect(std.mem.indexOf(u8, marker, "rev-parse --show-toplevel") != null);
+}
+
+test "e2e gh-repo outside ghq exits 1 with derive error" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "e2e_gh_outside");
+    defer fixture.deinit();
+    const repo_path = try std.fmt.allocPrint(gpa, "{s}/outside/repo", .{fixture.home});
+    defer gpa.free(repo_path);
+    try Dir.cwd().createDirPath(io, repo_path);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.gitstore_bin, "gh-repo", repo_path },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 1), result.term.exited);
+    try testing.expectEqualStrings("", result.stdout);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "cannot derive GH_REPO") != null);
+}
+
+test "e2e gh-repo --export shell-quotes derived repo" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "e2e_gh_export");
+    defer fixture.deinit();
+    const repo_path = try std.fmt.allocPrint(gpa, "{s}/ghq/github.com/EugOT/re'po", .{fixture.home});
+    defer gpa.free(repo_path);
+    try Dir.cwd().createDirPath(io, repo_path);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.gitstore_bin, "gh-repo", "--export", repo_path },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+    try testing.expectEqualStrings("export GH_REPO='EugOT/re'\\''po'\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 // --- filter (exit-1 anomaly) ---
@@ -2372,7 +2688,7 @@ test "e2e migrate real-mode is unimplemented, non-zero exit with stderr" {
     // returns error.MigrationNotImplemented (main.zig:1218); the Zig runtime
     // turns that into a non-zero process exit.
     try runE2eCase(testing.allocator, testing.io, .{
-        .argv_tail = &.{ "migrate", "/tmp/gitstore_e2e_new_root" },
+        .argv_tail = &.{ "migrate", "e2e_new_root" },
         .expect = .nonzero,
         .stream = .stderr,
         .needle = "real-mode not implemented",

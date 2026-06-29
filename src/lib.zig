@@ -32,12 +32,22 @@ pub const status = gs.status;
 pub const sync = gs.sync;
 pub const init = gs.init;
 pub const initRepo = gs.initRepo;
+/// Borrowed adoption path components derived from repo/root inputs.
+/// The caller retains ownership of both slices.
 pub const AdoptionPaths = gs.AdoptionPaths;
+/// Error set returned by `formatGhRepo` for invalid host/owner/name components.
+pub const FormatGhRepoError = gs.FormatGhRepoError;
+/// Format a GH_REPO string. Caller owns the returned slice and must free it with `gpa`.
 pub const formatGhRepo = gs.formatGhRepo;
+/// Parse a remote into GH_REPO. When non-null, caller owns the returned slice and must free it with `gpa`.
 pub const ghRepoFromRemoteUrl = gs.ghRepoFromRemoteUrl;
+/// Derive GH_REPO from a ghq/gitstore path. When non-null, caller owns the returned slice and must free it with `gpa`.
 pub const ghRepoFromGhqPath = gs.ghRepoFromGhqPath;
+/// Resolve GH_REPO for a path. When non-null, caller owns the returned slice and must free it with `gpa`.
 pub const resolveGhRepo = gs.resolveGhRepo;
 pub const isAdopted = gs.isAdopted;
+/// Check adoption status from explicit paths without allocating ownership to
+/// the caller. Returns false for missing or non-adopted repositories.
 pub const isAdoptedPaths = gs.isAdoptedPaths;
 pub const repoRelativePath = gs.repoRelativePath;
 pub const repoStoragePath = gs.repoStoragePath;
