@@ -1,7 +1,12 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = std.Io.Dir;
 const File = std.Io.File;
+const test_support = @import("test_support.zig");
+
+const log_lock_attempts: u8 = 64;
+const log_lock_backoff = Io.Duration.fromMilliseconds(1);
 
 pub const Action = enum {
     copy,
@@ -24,6 +29,21 @@ pub const Action = enum {
 /// Append a JSONL line to the operations log file.
 /// Each line is a JSON object with: timestamp, action, source, destination, status.
 pub fn logOperation(
+    gpa: Allocator,
+    io: Io,
+    log_path: []const u8,
+    action: Action,
+    source: []const u8,
+    destination: []const u8,
+    status: []const u8,
+) void {
+    writeOperation(gpa, io, log_path, action, source, destination, status) catch |err| {
+        std.log.warn("operation log write failed for {s}: {s}", .{ log_path, @errorName(err) });
+    };
+}
+
+fn writeOperation(
+    gpa: Allocator,
     io: Io,
     log_path: []const u8,
     action: Action,
@@ -35,20 +55,26 @@ pub fn logOperation(
     var ts_buf: [30]u8 = undefined;
     const ts_str = timestamp(io, &ts_buf);
 
-    // Build the JSONL line in a stack buffer
-    var line_buf: [4096]u8 = undefined;
-    const line = std.fmt.bufPrint(
-        &line_buf,
-        \\{{"timestamp":"{s}","action":"{s}","source":"{s}","destination":"{s}","status":"{s}"}}
-    ++ "\n",
-        .{
-            ts_str,
-            action.toString(),
-            source,
-            destination,
-            status,
-        },
-    ) catch return;
+    // Build the JSONL line with JSON escaping. It can exceed a fixed stack
+    // buffer for long repository paths, but logging must not abort migrations
+    // after filesystem state has already changed.
+    var line_writer: std.Io.Writer.Allocating = .init(gpa);
+    defer line_writer.deinit();
+    var json: std.json.Stringify = .{ .writer = &line_writer.writer, .options = .{} };
+    try json.beginObject();
+    try json.objectField("timestamp");
+    try json.write(ts_str);
+    try json.objectField("action");
+    try json.write(action.toString());
+    try json.objectField("source");
+    try json.write(source);
+    try json.objectField("destination");
+    try json.write(destination);
+    try json.objectField("status");
+    try json.write(status);
+    try json.endObject();
+    try line_writer.writer.writeByte('\n');
+    const line = line_writer.written();
 
     // Open or create the log file (non-truncating)
     var file = Dir.cwd().createFile(io, log_path, .{
@@ -58,8 +84,21 @@ pub fn logOperation(
     };
     defer file.close(io);
 
-    // Append at end using positional write
-    const offset = file.length(io) catch 0;
+    // Serialize append offset selection with the write so concurrent processes
+    // cannot interleave JSONL records.
+    var locked = false;
+    var lock_attempt: u8 = 0;
+    while (lock_attempt < log_lock_attempts) : (lock_attempt += 1) {
+        locked = try file.tryLock(io, .exclusive);
+        if (locked) break;
+        try Io.sleep(io, log_lock_backoff, .real);
+    }
+    if (!locked) {
+        std.log.warn("operation log lock unavailable for {s}; dropping record", .{log_path});
+        return;
+    }
+    defer file.unlock(io);
+    const offset = try file.length(io);
     try file.writePositionalAll(io, line, offset);
 }
 
@@ -68,7 +107,7 @@ pub fn timestamp(io: Io, buf: *[30]u8) []const u8 {
     const ts = Io.Clock.real.now(io);
     const ns = ts.nanoseconds;
     const secs: u64 = @intCast(@divTrunc(ns, std.time.ns_per_s));
-    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const es: std.time.epoch.EpochSeconds = .{ .secs = secs };
     const day_seconds = es.getDaySeconds();
     const year_day = es.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -100,15 +139,15 @@ test "Action.toString covers all variants" {
 // ===== logOperation() tests =====
 
 test "logOperation creates file and writes valid JSONL" {
-    const io = testing.io;
-    const path = "/tmp/gitstore_test_log_create.jsonl";
-
-    // Clean up from prior runs
-    Dir.cwd().deleteFile(io, path) catch {};
-
-    try logOperation(io, path, .copy, "/src/a", "/dst/b", "ok");
-
     const gpa = testing.allocator;
+    const io = testing.io;
+    const path = try test_support.uniqueTempFile(gpa, io, "test_log_create", ".jsonl");
+    defer gpa.free(path);
+    try Dir.cwd().deleteFile(io, path);
+    defer Dir.cwd().deleteFile(io, path) catch |err| test_support.ignoreCleanupError("log create", err);
+
+    logOperation(gpa, io, path, .copy, "/src/a", "/dst/b", "ok");
+
     const content = try Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(content);
 
@@ -122,21 +161,19 @@ test "logOperation creates file and writes valid JSONL" {
     try testing.expect(std.mem.indexOf(u8, content, "\"destination\":\"/dst/b\"") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"status\":\"ok\"") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"timestamp\":\"") != null);
-
-    // Clean up
-    Dir.cwd().deleteFile(io, path) catch {};
 }
 
 test "logOperation appends multiple lines" {
-    const io = testing.io;
-    const path = "/tmp/gitstore_test_log_append.jsonl";
-    Dir.cwd().deleteFile(io, path) catch {};
-
-    try logOperation(io, path, .copy, "/a", "/b", "ok");
-    try logOperation(io, path, .remove, "/c", "", "ok");
-    try logOperation(io, path, .write_pointer, "/d", "/e", "error");
-
     const gpa = testing.allocator;
+    const io = testing.io;
+    const path = try test_support.uniqueTempFile(gpa, io, "test_log_append", ".jsonl");
+    defer gpa.free(path);
+    defer Dir.cwd().deleteFile(io, path) catch |err| test_support.ignoreCleanupError("log append", err);
+
+    logOperation(gpa, io, path, .copy, "/a", "/b", "ok");
+    logOperation(gpa, io, path, .remove, "/c", "", "ok");
+    logOperation(gpa, io, path, .write_pointer, "/d", "/e", "error");
+
     const content = try Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(content);
 
@@ -157,41 +194,68 @@ test "logOperation appends multiple lines" {
         idx += 1;
     }
     try testing.expectEqual(@as(usize, 3), idx);
-
-    Dir.cwd().deleteFile(io, path) catch {};
 }
 
 test "logOperation with empty source and destination" {
-    const io = testing.io;
-    const path = "/tmp/gitstore_test_log_empty.jsonl";
-    Dir.cwd().deleteFile(io, path) catch {};
-
-    try logOperation(io, path, .init_jj, "", "", "ok");
-
     const gpa = testing.allocator;
+    const io = testing.io;
+    const path = try test_support.uniqueTempFile(gpa, io, "test_log_empty", ".jsonl");
+    defer gpa.free(path);
+    defer Dir.cwd().deleteFile(io, path) catch |err| test_support.ignoreCleanupError("log empty", err);
+
+    logOperation(gpa, io, path, .init_jj, "", "", "ok");
+
     const content = try Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(content);
 
     try testing.expect(std.mem.indexOf(u8, content, "\"source\":\"\"") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"destination\":\"\"") != null);
-
-    Dir.cwd().deleteFile(io, path) catch {};
 }
 
 test "logOperation with special characters in paths" {
-    const io = testing.io;
-    const path = "/tmp/gitstore_test_log_special.jsonl";
-    Dir.cwd().deleteFile(io, path) catch {};
-
-    try logOperation(io, path, .copy, "/path/with spaces/repo", "/dst/path", "ok");
-
     const gpa = testing.allocator;
+    const io = testing.io;
+    const path = try test_support.uniqueTempFile(gpa, io, "test_log_special", ".jsonl");
+    defer gpa.free(path);
+    defer Dir.cwd().deleteFile(io, path) catch |err| test_support.ignoreCleanupError("log special", err);
+
+    const source = "/path/with \"quotes\" and \\backslash\nrepo";
+    const destination = "/dst/path/with\\backslash\"quote";
+    const status = "ok\nquoted \"status\" with \\ slash";
+    logOperation(gpa, io, path, .copy, source, destination, status);
+
     const content = try Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(content);
 
-    try testing.expect(std.mem.indexOf(u8, content, "with spaces") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, content, .{});
+    defer parsed.deinit();
 
-    Dir.cwd().deleteFile(io, path) catch {};
+    const object = parsed.value.object;
+    try testing.expectEqualStrings(source, object.get("source").?.string);
+    try testing.expectEqualStrings(destination, object.get("destination").?.string);
+    try testing.expectEqualStrings(status, object.get("status").?.string);
+}
+
+test "logOperation handles long escaped lines" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const path = try test_support.uniqueTempFile(gpa, io, "test_log_overflow", ".jsonl");
+    defer gpa.free(path);
+    try Dir.cwd().deleteFile(io, path);
+    defer Dir.cwd().deleteFile(io, path) catch |err| test_support.ignoreCleanupError("log overflow", err);
+
+    const too_large = try gpa.alloc(u8, 5000);
+    defer gpa.free(too_large);
+    @memset(too_large, 'x');
+
+    logOperation(gpa, io, path, .copy, too_large, "/dst", "ok");
+
+    const content = try Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+    defer gpa.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, content, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(too_large, parsed.value.object.get("source").?.string);
 }
 
 // ===== timestamp() tests =====

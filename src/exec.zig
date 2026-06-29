@@ -11,6 +11,7 @@ pub const ExecResult = struct {
     pub fn deinit(self: *ExecResult, gpa: Allocator) void {
         gpa.free(self.stdout);
         gpa.free(self.stderr);
+        self.* = undefined;
     }
 
     pub fn succeeded(self: ExecResult) bool {
@@ -122,6 +123,68 @@ pub fn exec(
         .stderr = result.stderr,
         .term = result.term,
     };
+}
+
+const caller_env_overrides = [_][]const u8{
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "GIT_CONFIG_GLOBAL",
+};
+
+/// Run a command with the normal scrubbed environment plus a narrow set of
+/// caller-provided config-discovery variables. This keeps generic git command
+/// execution protected from `GIT_*` injection while allowing configuration
+/// resolution to honor an explicit environment map.
+pub fn execWithEnv(
+    gpa: Allocator,
+    io: Io,
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+    env: *const std.process.Environ.Map,
+) ExecError!ExecResult {
+    const cwd_opt: std.process.Child.Cwd = if (cwd) |c| .{ .path = c } else .inherit;
+    var scrubbed = try buildScrubbedEnv(gpa);
+    defer scrubbed.deinit();
+    for (caller_env_overrides) |key| {
+        if (env.get(key)) |value| {
+            try scrubbed.put(key, value);
+        }
+    }
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv,
+        .cwd = cwd_opt,
+        .environ_map = &scrubbed,
+    });
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .term = result.term,
+    };
+}
+
+test "execWithEnv forwards only config-discovery overrides" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("HOME", "/tmp/gitstore-home");
+    try env.put("GIT_CONFIG_GLOBAL", "/tmp/gitstore-global.gitconfig");
+    try env.put("GIT_CONFIG_COUNT", "1");
+
+    var result = try execWithEnv(gpa, io, &.{
+        "sh",
+        "-c",
+        "printf '%s|%s|%s' \"$HOME\" \"${GIT_CONFIG_GLOBAL-unset}\" \"${GIT_CONFIG_COUNT-unset}\"",
+    }, null, &env);
+    defer result.deinit(gpa);
+
+    try testing.expect(result.succeeded());
+    try testing.expectEqualStrings(
+        "/tmp/gitstore-home|/tmp/gitstore-global.gitconfig|unset",
+        result.stdout,
+    );
 }
 
 /// Run a command, return stdout on success. Returns error on non-zero exit.
@@ -354,7 +417,7 @@ test "exec exit code preserved" {
 // ===== ExecResult.succeeded() tests =====
 
 test "succeeded returns true for exit 0" {
-    const result = ExecResult{
+    const result: ExecResult = .{
         .stdout = &.{},
         .stderr = &.{},
         .term = .{ .exited = 0 },
@@ -363,7 +426,7 @@ test "succeeded returns true for exit 0" {
 }
 
 test "succeeded returns false for exit 1" {
-    const result = ExecResult{
+    const result: ExecResult = .{
         .stdout = &.{},
         .stderr = &.{},
         .term = .{ .exited = 1 },
@@ -372,7 +435,7 @@ test "succeeded returns false for exit 1" {
 }
 
 test "succeeded returns false for signal" {
-    const result = ExecResult{
+    const result: ExecResult = .{
         .stdout = &.{},
         .stderr = &.{},
         .term = .{ .signal = .SEGV },

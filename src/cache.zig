@@ -10,6 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = std.Io.Dir;
+const test_support = @import("test_support.zig");
 const File = std.Io.File;
 
 /// One entry per repo in the on-disk index. All slices are owned by whatever
@@ -241,13 +242,29 @@ pub fn save(
         .sub_path = tmp_path,
         .data = aw.written(),
     }) catch |err| {
-        Dir.cwd().deleteFile(io, tmp_path) catch {};
+        deleteSaveTempPath(io, tmp_path);
         return err;
     };
 
     Dir.rename(Dir.cwd(), tmp_path, Dir.cwd(), final_path, io) catch |err| {
-        Dir.cwd().deleteFile(io, tmp_path) catch {};
+        deleteSaveTempPath(io, tmp_path);
         return err;
+    };
+}
+
+fn deleteSaveTempPath(io: Io, tmp_path: []const u8) void {
+    Dir.cwd().deleteFile(io, tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        error.IsDir => {
+            Dir.cwd().deleteTree(io, tmp_path) catch |tree_err| std.log.warn(
+                "cache: failed to remove temp directory {s}: {s}",
+                .{ tmp_path, @errorName(tree_err) },
+            );
+        },
+        else => |cleanup_err| std.log.warn(
+            "cache: failed to remove temp file {s}: {s}",
+            .{ tmp_path, @errorName(cleanup_err) },
+        ),
     };
 }
 
@@ -259,10 +276,14 @@ fn cacheDir(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/.gitstore/cache", .{trimmed});
 }
 
-fn indexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
+fn cachePath(gpa: Allocator, gitstore_root: []const u8, suffix: []const u8) ![]u8 {
     const dir = try cacheDir(gpa, gitstore_root);
     defer gpa.free(dir);
-    return std.fmt.allocPrint(gpa, "{s}/index.json", .{dir});
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, suffix });
+}
+
+fn indexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
+    return cachePath(gpa, gitstore_root, "index.json");
 }
 
 // =========================================================
@@ -271,9 +292,13 @@ fn indexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
 
 const testing = std.testing;
 
+fn cacheTestPath(gpa: Allocator, root: []const u8, suffix: []const u8) ![]u8 {
+    return cachePath(gpa, root, suffix);
+}
+
 test "cache: diffIndex detects added entries" {
     const gpa = testing.allocator;
-    const prev = [_]CacheEntry{};
+    const prev: [0]CacheEntry = .{};
     const curr = [_]CacheEntry{
         .{ .rel_path = "github.com/a/b" },
         .{ .rel_path = "github.com/a/c" },
@@ -347,8 +372,11 @@ test "cache: diffIndex detects url change when head_sha missing" {
 test "cache: load on missing root returns empty map" {
     const gpa = testing.allocator;
     const io = testing.io;
-    // Use a path that definitely does not exist.
-    var map = try load(gpa, io, "/tmp/gitstore_cache_missing_12345");
+    const root = try test_support.uniqueTempDir(gpa, io, "cache_missing");
+    defer gpa.free(root);
+    try Dir.cwd().deleteTree(io, root);
+
+    var map = try load(gpa, io, root);
     defer freeMap(gpa, &map);
     try testing.expectEqual(@as(u32, 0), map.count());
 }
@@ -356,9 +384,9 @@ test "cache: load on missing root returns empty map" {
 test "cache: save + load roundtrip preserves entries" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const root = "/tmp/gitstore_cache_roundtrip_test";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
+    const root = try test_support.uniqueTempDir(gpa, io, "cache_roundtrip_test");
+    defer gpa.free(root);
+    defer Dir.cwd().deleteTree(io, root) catch |err| test_support.ignoreCleanupError("cache roundtrip", err);
     try Dir.cwd().createDirPath(io, root);
 
     var src: std.StringHashMap(CacheEntry) = .init(gpa);
@@ -385,10 +413,13 @@ test "cache: save + load roundtrip preserves entries" {
     try save(gpa, io, root, &src);
 
     // Assert the final file exists (rename target).
-    const final_path = "/tmp/gitstore_cache_roundtrip_test/.gitstore/cache/index.json";
+    const final_path = try cacheTestPath(gpa, root, "index.json");
+    defer gpa.free(final_path);
     _ = try Dir.cwd().statFile(io, final_path, .{});
     // Temp file must be gone after rename.
-    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, final_path ++ ".tmp", .{}));
+    const tmp_path = try cacheTestPath(gpa, root, "index.json.tmp");
+    defer gpa.free(tmp_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, tmp_path, .{}));
 
     var loaded = try load(gpa, io, root);
     defer freeMap(gpa, &loaded);
@@ -405,15 +436,73 @@ test "cache: save + load roundtrip preserves entries" {
     try testing.expect(b.last_fetched_unix == null);
 }
 
+test "cache: save removes pre-existing temp directory when writeFile fails" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const root = try test_support.uniqueTempDir(gpa, io, "cache_write_fail_test");
+    defer gpa.free(root);
+    const tmp_path = try cacheTestPath(gpa, root, "index.json.tmp");
+    defer gpa.free(tmp_path);
+    defer Dir.cwd().deleteTree(io, root) catch |err| test_support.ignoreCleanupError("cache write-fail", err);
+    try Dir.cwd().createDirPath(io, tmp_path);
+
+    var src: std.StringHashMap(CacheEntry) = .init(gpa);
+    defer freeMap(gpa, &src);
+    const key = try gpa.dupe(u8, "write-fails");
+    try src.put(key, .{ .rel_path = key });
+
+    const result = save(gpa, io, root, &src);
+    if (result) |_| return error.TestExpectedError else |err| switch (err) {
+        error.IsDir, error.DirNotEmpty => {},
+        else => return err,
+    }
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, tmp_path, .{}));
+}
+
+test "cache: save removes temp file when rename fails" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const root = try test_support.uniqueTempDir(gpa, io, "cache_rename_fail_test");
+    defer gpa.free(root);
+    const cache_dir_path = try cacheDir(gpa, root);
+    defer gpa.free(cache_dir_path);
+    const final_path = try cacheTestPath(gpa, root, "index.json");
+    defer gpa.free(final_path);
+    const tmp_path = try cacheTestPath(gpa, root, "index.json.tmp");
+    defer gpa.free(tmp_path);
+    defer Dir.cwd().deleteTree(io, root) catch |err| test_support.ignoreCleanupError("cache rename-fail", err);
+    try Dir.cwd().createDirPath(io, final_path);
+
+    var src: std.StringHashMap(CacheEntry) = .init(gpa);
+    defer freeMap(gpa, &src);
+    const key = try gpa.dupe(u8, "rename-fails");
+    try src.put(key, .{ .rel_path = key });
+
+    const result = save(gpa, io, root, &src);
+    if (result) |_| return error.TestExpectedError else |err| switch (err) {
+        error.IsDir => {},
+        else => return err,
+    }
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, tmp_path, .{}));
+    const st = try Dir.cwd().statFile(io, final_path, .{});
+    try testing.expect(st.kind == .directory);
+    const cache_dir = try Dir.cwd().statFile(io, cache_dir_path, .{});
+    try testing.expect(cache_dir.kind == .directory);
+}
+
 test "cache: load on corrupt json returns empty map" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const root = "/tmp/gitstore_cache_corrupt_test";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
-    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_corrupt_test/.gitstore/cache");
+    const root = try test_support.uniqueTempDir(gpa, io, "cache_corrupt_test");
+    defer gpa.free(root);
+    const cache_dir = try cacheDir(gpa, root);
+    defer gpa.free(cache_dir);
+    const index_path = try cacheTestPath(gpa, root, "index.json");
+    defer gpa.free(index_path);
+    defer Dir.cwd().deleteTree(io, root) catch |err| test_support.ignoreCleanupError("cache corrupt", err);
+    try Dir.cwd().createDirPath(io, cache_dir);
     try Dir.cwd().writeFile(io, .{
-        .sub_path = "/tmp/gitstore_cache_corrupt_test/.gitstore/cache/index.json",
+        .sub_path = index_path,
         .data = "{not valid json",
     });
 
@@ -425,9 +514,9 @@ test "cache: load on corrupt json returns empty map" {
 test "cache: save overwrites previous index atomically" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const root = "/tmp/gitstore_cache_overwrite_test";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
+    const root = try test_support.uniqueTempDir(gpa, io, "cache_overwrite_test");
+    defer gpa.free(root);
+    defer Dir.cwd().deleteTree(io, root) catch |err| test_support.ignoreCleanupError("cache overwrite", err);
     try Dir.cwd().createDirPath(io, root);
 
     var m1: std.StringHashMap(CacheEntry) = .init(gpa);

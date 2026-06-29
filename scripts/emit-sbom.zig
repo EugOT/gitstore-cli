@@ -43,8 +43,8 @@ pub fn main(init: std.process.Init) !u8 {
     // build.zig.zon files are tiny; read with an explicit cap rather than
     // .unlimited so a tampered/unbounded file cannot OOM the emitter
     // (CodeRabbit finding). 1 MiB is far above any plausible manifest.
-    const MAX_ZON_BYTES: usize = 1 << 20;
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(MAX_ZON_BYTES)) catch |err| {
+    const max_zon_bytes: usize = 1 << 20;
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_zon_bytes)) catch |err| {
         try printErrFmt(io, "cannot read {s}: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
@@ -68,7 +68,8 @@ pub fn main(init: std.process.Init) !u8 {
     emitSbomDocument(gpa, ast, source, w) catch |err| switch (err) {
         SbomError.IncompleteSbom => {
             std.log.err(
-                "manifest declares `.dependencies` but the v1 stub could not extract any entries; refusing to publish an incomplete SBOM (see claude-zig-quality#TBD)",
+                "manifest declares `.dependencies`, but the v1 stub could not extract any entries; " ++
+                    "refusing to publish an incomplete SBOM; see TODO(claude-zig-quality#TBD)",
                 .{},
             );
             return 1;

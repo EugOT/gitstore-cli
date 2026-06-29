@@ -75,6 +75,15 @@ fn parseBool(s: []const u8) bool {
     return false;
 }
 
+fn gitConfigReturnedMissing(result: exec.ExecResult) bool {
+    return result.term == .exited and result.term.exited == 1;
+}
+
+fn gitConfigReturnedMissingGlobal(result: exec.ExecResult) bool {
+    if (!(result.term == .exited and result.term.exited == 128)) return false;
+    return std.mem.indexOf(u8, result.stderr, "$HOME not set") != null;
+}
+
 /// Returns a trimmed, heap-allocated copy of the stdout of
 /// `git config --get <key>` if the key is set. Returns `null` if the key is
 /// absent (non-zero exit) or if its value is empty after trimming.
@@ -83,16 +92,23 @@ fn parseBool(s: []const u8) bool {
 fn gitConfigGet(
     gpa: Allocator,
     io: Io,
+    env: *std.process.Environ.Map,
     key: []const u8,
     config_file: ?[]const u8,
 ) LoadError!?[]u8 {
-    const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get", key } else undefined;
-    const global_argv = [_][]const u8{ "git", "config", "--global", "--get", key };
-    const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
-    var result = try exec.exec(gpa, io, argv, null);
+    const argv: []const []const u8 = if (config_file) |path|
+        &.{ "git", "config", "--file", path, "--get", key }
+    else
+        &.{ "git", "config", "--global", "--get", key };
+    var result = try exec.execWithEnv(gpa, io, argv, null, env);
     defer gpa.free(result.stderr);
     if (!result.succeeded()) {
         gpa.free(result.stdout);
+        if (!gitConfigReturnedMissing(result) and
+            !(config_file == null and gitConfigReturnedMissingGlobal(result)))
+        {
+            return error.ProcessFailed;
+        }
         return null;
     }
     const trimmed = exec.trimTrailingNewline(result.stdout);
@@ -101,9 +117,115 @@ fn gitConfigGet(
         return null;
     }
     if (trimmed.len == result.stdout.len) return result.stdout;
-    const owned = try gpa.dupe(u8, trimmed);
+    const owned = gpa.dupe(u8, trimmed) catch |err| {
+        gpa.free(result.stdout);
+        return err;
+    };
     gpa.free(result.stdout);
     return owned;
+}
+
+fn gitConfigGetUrlmatch(
+    gpa: Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    key: []const u8,
+    url: []const u8,
+    config_file: ?[]const u8,
+) LoadError!?[]u8 {
+    const argv: []const []const u8 = if (config_file) |path|
+        &.{ "git", "config", "--file", path, "--get-urlmatch", key, url }
+    else
+        &.{ "git", "config", "--global", "--get-urlmatch", key, url };
+    var result = try exec.execWithEnv(gpa, io, argv, null, env);
+    defer gpa.free(result.stderr);
+    if (!result.succeeded()) {
+        gpa.free(result.stdout);
+        if (!gitConfigReturnedMissing(result) and
+            !(config_file == null and gitConfigReturnedMissingGlobal(result)))
+        {
+            return error.ProcessFailed;
+        }
+        return null;
+    }
+    const trimmed = exec.trimTrailingNewline(result.stdout);
+    if (trimmed.len == 0) {
+        gpa.free(result.stdout);
+        return null;
+    }
+    if (trimmed.len == result.stdout.len) return result.stdout;
+    const owned = gpa.dupe(u8, trimmed) catch |err| {
+        gpa.free(result.stdout);
+        return err;
+    };
+    gpa.free(result.stdout);
+    return owned;
+}
+
+fn defaultRoot(gpa: Allocator, env: *std.process.Environ.Map) LoadError![]u8 {
+    if (env.get("HOME")) |home| {
+        if (home.len != 0) return std.fmt.allocPrint(gpa, "{s}/ghq", .{home});
+    }
+    return error.ProcessFailed;
+}
+
+fn gitConfigGlobalPath(env: *std.process.Environ.Map) ?[]const u8 {
+    if (env.get("GIT_CONFIG_GLOBAL")) |path| {
+        const trimmed = std.mem.trim(u8, path, " \t\r\n");
+        if (trimmed.len != 0) return trimmed;
+    }
+    return null;
+}
+
+fn envHasValue(env: *std.process.Environ.Map, key: []const u8) bool {
+    const value = env.get(key) orelse return false;
+    return std.mem.trim(u8, value, " \t\r\n").len != 0;
+}
+
+fn hasGlobalGitConfigSource(env: *std.process.Environ.Map) bool {
+    return gitConfigGlobalPath(env) != null or
+        envHasValue(env, "HOME") or
+        envHasValue(env, "XDG_CONFIG_HOME");
+}
+
+fn gitConfigGetEnv(
+    gpa: Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    key: []const u8,
+) LoadError!?[]u8 {
+    const config_file = gitConfigGlobalPath(env);
+    if (config_file == null and !hasGlobalGitConfigSource(env)) return null;
+    return gitConfigGet(gpa, io, env, key, config_file);
+}
+
+const OwnedResolution = struct {
+    value: []u8,
+    source: Source,
+};
+
+fn loadResolvedRoot(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!OwnedResolution {
+    const gitstore_root_raw = try gitConfigGetEnv(gpa, io, env, "gitstore.root");
+    defer if (gitstore_root_raw) |v| gpa.free(v);
+    const ghq_root_raw = try gitConfigGetEnv(gpa, io, env, "ghq.root");
+    defer if (ghq_root_raw) |v| gpa.free(v);
+    const env_gitstore_root = env.get("GITSTORE_ROOT");
+    const env_ghq_root = env.get("GHQ_ROOT");
+
+    const root_res = resolveRootChain(
+        gitstore_root_raw,
+        ghq_root_raw,
+        env_gitstore_root,
+        env_ghq_root,
+        "",
+    );
+    if (root_res.source == .default) {
+        const fallback_root = try defaultRoot(gpa, env);
+        return .{ .value = fallback_root, .source = root_res.source };
+    }
+
+    const root = try gpa.dupe(u8, root_res.value);
+    return .{ .value = root, .source = root_res.source };
 }
 
 /// Run `gh api user -q .login` to derive the GitHub username. Returns null on
@@ -130,15 +252,18 @@ fn ghUser(gpa: Allocator, io: Io) LoadError!?[]u8 {
 }
 
 /// Duplicate `s` into `gpa`, register it in `list`, and return it.
-fn ownStatic(list: *std.ArrayList([]const u8), gpa: Allocator, s: []const u8) LoadError![]const u8 {
+fn ownStatic(gpa: Allocator, list: *std.ArrayList([]const u8), s: []const u8) LoadError![]const u8 {
     const dup = try gpa.dupe(u8, s);
-    try list.append(gpa, dup);
+    list.append(gpa, dup) catch |err| {
+        gpa.free(dup);
+        return err;
+    };
     return dup;
 }
 
 /// Load configuration by reading `git config` values, environment variables,
 /// and baked-in defaults in precedence order.
-pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Config {
+pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) anyerror!Config {
     var owned_strings: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (owned_strings.items) |s| gpa.free(s);
@@ -148,38 +273,18 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     var used_legacy = false;
 
     // --- root ---
-    const config_file = env.get("GIT_CONFIG_GLOBAL");
-    const gitstore_root_raw = try gitConfigGet(gpa, io, "gitstore.root", config_file);
-    defer if (gitstore_root_raw) |v| gpa.free(v);
-    const ghq_root_raw = try gitConfigGet(gpa, io, "ghq.root", config_file);
-    defer if (ghq_root_raw) |v| gpa.free(v);
-    const env_gitstore_root = env.get("GITSTORE_ROOT");
-    const env_ghq_root = env.get("GHQ_ROOT");
-    const home_opt = env.get("HOME");
-
-    const default_root = if (home_opt) |h|
-        try std.fmt.allocPrint(gpa, "{s}/ghq", .{h})
-    else
-        try gpa.dupe(u8, "ghq");
-    try owned_strings.append(gpa, default_root);
-
-    const root_res = resolveRootChain(
-        gitstore_root_raw,
-        ghq_root_raw,
-        env_gitstore_root,
-        env_ghq_root,
-        default_root,
-    );
-    const root: []const u8 = switch (root_res.source) {
-        .gitstore, .ghq, .env => try ownStatic(&owned_strings, gpa, root_res.value),
-        .default => default_root,
+    const root_res = try loadResolvedRoot(gpa, io, env);
+    owned_strings.append(gpa, root_res.value) catch |err| {
+        gpa.free(root_res.value);
+        return err;
     };
+    const root: []const u8 = root_res.value;
     if (root_res.source == .ghq) used_legacy = true;
 
     // --- user ---
-    const gitstore_user_raw = try gitConfigGet(gpa, io, "gitstore.user", config_file);
+    const gitstore_user_raw = try gitConfigGetEnv(gpa, io, env, "gitstore.user");
     defer if (gitstore_user_raw) |v| gpa.free(v);
-    const ghq_user_raw = try gitConfigGet(gpa, io, "ghq.user", config_file);
+    const ghq_user_raw = try gitConfigGetEnv(gpa, io, env, "ghq.user");
     defer if (ghq_user_raw) |v| gpa.free(v);
     const gh_user_raw = try ghUser(gpa, io);
     defer if (gh_user_raw) |v| gpa.free(v);
@@ -187,20 +292,20 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
 
     var user: ?[]const u8 = null;
     if (gitstore_user_raw) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
+        user = try ownStatic(gpa, &owned_strings, v);
     } else if (ghq_user_raw) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
+        user = try ownStatic(gpa, &owned_strings, v);
         used_legacy = true;
     } else if (gh_user_raw) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
+        user = try ownStatic(gpa, &owned_strings, v);
     } else if (env_user) |v| {
-        if (v.len != 0) user = try ownStatic(&owned_strings, gpa, v);
+        if (v.len != 0) user = try ownStatic(gpa, &owned_strings, v);
     }
 
     // --- defaultHost ---
-    const gitstore_host_raw = try gitConfigGet(gpa, io, "gitstore.defaultHost", config_file);
+    const gitstore_host_raw = try gitConfigGetEnv(gpa, io, env, "gitstore.defaultHost");
     defer if (gitstore_host_raw) |v| gpa.free(v);
-    const ghq_host_raw = try gitConfigGet(gpa, io, "ghq.defaultHost", config_file);
+    const ghq_host_raw = try gitConfigGetEnv(gpa, io, env, "ghq.defaultHost");
     defer if (ghq_host_raw) |v| gpa.free(v);
     const host_res = resolvePrecedence(
         gitstore_host_raw,
@@ -208,29 +313,26 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
         null,
         "github.com",
     );
-    const default_host: []const u8 = switch (host_res.source) {
-        .gitstore, .ghq, .env => try ownStatic(&owned_strings, gpa, host_res.value),
-        .default => try ownStatic(&owned_strings, gpa, host_res.value),
-    };
+    const default_host: []const u8 = try ownStatic(gpa, &owned_strings, host_res.value);
     if (host_res.source == .ghq) used_legacy = true;
 
     // --- completeUser ---
-    const gitstore_cu_raw = try gitConfigGet(gpa, io, "gitstore.completeUser", config_file);
+    const gitstore_cu_raw = try gitConfigGetEnv(gpa, io, env, "gitstore.completeUser");
     defer if (gitstore_cu_raw) |v| gpa.free(v);
-    const ghq_cu_raw = try gitConfigGet(gpa, io, "ghq.completeUser", config_file);
+    const ghq_cu_raw = try gitConfigGetEnv(gpa, io, env, "ghq.completeUser");
     defer if (ghq_cu_raw) |v| gpa.free(v);
     const cu_res = resolvePrecedence(gitstore_cu_raw, ghq_cu_raw, null, "true");
     const complete_user = parseBool(cu_res.value);
     if (cu_res.source == .ghq) used_legacy = true;
 
     // --- adoptOnClone (no ghq fallback) ---
-    const gitstore_aoc_raw = try gitConfigGet(gpa, io, "gitstore.adoptOnClone", config_file);
+    const gitstore_aoc_raw = try gitConfigGetEnv(gpa, io, env, "gitstore.adoptOnClone");
     defer if (gitstore_aoc_raw) |v| gpa.free(v);
     const aoc_res = resolvePrecedence(gitstore_aoc_raw, null, null, "true");
     const adopt_on_clone = parseBool(aoc_res.value);
 
     // --- jjColocate (no ghq fallback) ---
-    const gitstore_jj_raw = try gitConfigGet(gpa, io, "gitstore.jjColocate", config_file);
+    const gitstore_jj_raw = try gitConfigGetEnv(gpa, io, env, "gitstore.jjColocate");
     defer if (gitstore_jj_raw) |v| gpa.free(v);
     const jj_res = resolvePrecedence(gitstore_jj_raw, null, null, "true");
     const jj_colocate = parseBool(jj_res.value);
@@ -245,6 +347,14 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
         .used_legacy_ghq_keys = used_legacy,
         .owned_strings = owned_strings,
     };
+}
+
+/// Resolve only the ghq/gitstore root. This intentionally skips user/default
+/// host resolution because those paths can shell out to `gh api user`.
+/// Caller owns the returned memory.
+pub fn loadRoot(gpa: Allocator, io: Io, env: *std.process.Environ.Map) anyerror![]u8 {
+    const root_res = try loadResolvedRoot(gpa, io, env);
+    return root_res.value;
 }
 
 /// Four-way resolver used only for `root` (which has two env fallbacks).
@@ -270,10 +380,11 @@ pub fn resolveRootChain(
 pub fn resolveRootForUrl(
     gpa: Allocator,
     io: Io,
+    env: *std.process.Environ.Map,
     url: []const u8,
     base: Config,
-) LoadError![]u8 {
-    return resolveRootForUrlWithConfigFile(gpa, io, url, base, null);
+) anyerror![]u8 {
+    return resolveRootForUrlWithConfigFile(gpa, io, env, url, base, null);
 }
 
 /// Testable variant of `resolveRootForUrl` that reads a specific git config
@@ -281,56 +392,14 @@ pub fn resolveRootForUrl(
 pub fn resolveRootForUrlWithConfigFile(
     gpa: Allocator,
     io: Io,
+    env: *std.process.Environ.Map,
     url: []const u8,
     base: Config,
     config_file: ?[]const u8,
-) LoadError![]u8 {
+) anyerror![]u8 {
     // git config --get-urlmatch <key> <url>
-    {
-        const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "gitstore.root", url } else undefined;
-        const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "gitstore.root", url };
-        const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
-        var result = try exec.exec(
-            gpa,
-            io,
-            argv,
-            null,
-        );
-        defer gpa.free(result.stderr);
-        if (result.succeeded()) {
-            const trimmed = exec.trimTrailingNewline(result.stdout);
-            if (trimmed.len != 0) {
-                if (trimmed.len == result.stdout.len) return result.stdout;
-                const owned = try gpa.dupe(u8, trimmed);
-                gpa.free(result.stdout);
-                return owned;
-            }
-        }
-        gpa.free(result.stdout);
-    }
-
-    {
-        const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "ghq.root", url } else undefined;
-        const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "ghq.root", url };
-        const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
-        var result = try exec.exec(
-            gpa,
-            io,
-            argv,
-            null,
-        );
-        defer gpa.free(result.stderr);
-        if (result.succeeded()) {
-            const trimmed = exec.trimTrailingNewline(result.stdout);
-            if (trimmed.len != 0) {
-                if (trimmed.len == result.stdout.len) return result.stdout;
-                const owned = try gpa.dupe(u8, trimmed);
-                gpa.free(result.stdout);
-                return owned;
-            }
-        }
-        gpa.free(result.stdout);
-    }
+    if (try gitConfigGetUrlmatch(gpa, io, env, "gitstore.root", url, config_file)) |root| return root;
+    if (try gitConfigGetUrlmatch(gpa, io, env, "ghq.root", url, config_file)) |root| return root;
 
     return gpa.dupe(u8, base.root);
 }
@@ -401,6 +470,18 @@ test "config: resolvePrecedence treats all null as default" {
     const r = resolvePrecedence(null, null, null, "fallback");
     try testing.expectEqualStrings("fallback", r.value);
     try testing.expectEqual(Source.default, r.source);
+}
+
+test "config: loadRoot uses env root without global git config source" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    try env_map.put("GITSTORE_ROOT", "/from/env/gitstore");
+
+    const root = try loadRoot(gpa, io, &env_map);
+    defer gpa.free(root);
+    try testing.expectEqualStrings("/from/env/gitstore", root);
 }
 
 test "config: parseBool accepts true/1/yes/on case-insensitively" {

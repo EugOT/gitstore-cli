@@ -15,6 +15,60 @@ const File = std.Io.File;
 const gitstore = @import("gitstore.zig");
 const ex = @import("exec.zig");
 const cache = @import("cache.zig");
+const test_support = @import("test_support.zig");
+
+const HeadLookup = union(enum) {
+    sha: []u8,
+    clear,
+    unavailable,
+};
+
+fn ignoreMissingCleanupError(err: anyerror) !void {
+    switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+}
+
+fn freeCacheEntry(gpa: Allocator, entry: cache.CacheEntry) void {
+    gpa.free(entry.rel_path);
+    if (entry.url) |u| gpa.free(u);
+    if (entry.head_sha) |s| gpa.free(s);
+}
+
+fn updateHeadCache(
+    gpa: Allocator,
+    cache_map: *std.StringHashMap(cache.CacheEntry),
+    rel_path: []const u8,
+    head_sha: ?[]const u8,
+    last_fetched_unix: ?i64,
+) !void {
+    var url_copy: ?[]const u8 = null;
+    errdefer if (url_copy) |u| gpa.free(u);
+    var removed_entry: ?cache.CacheEntry = null;
+    errdefer if (removed_entry) |entry| freeCacheEntry(gpa, entry);
+    if (cache_map.fetchRemove(rel_path)) |old| {
+        removed_entry = old.value;
+        if (old.value.url) |u| url_copy = try gpa.dupe(u8, u);
+        freeCacheEntry(gpa, old.value);
+        removed_entry = null;
+    }
+
+    const rel_copy = try gpa.dupe(u8, rel_path);
+    errdefer gpa.free(rel_copy);
+    var sha_copy: ?[]const u8 = null;
+    errdefer if (sha_copy) |s| gpa.free(s);
+    if (head_sha) |s| sha_copy = try gpa.dupe(u8, s);
+
+    try cache_map.put(rel_copy, .{
+        .rel_path = rel_copy,
+        .url = url_copy,
+        .head_sha = sha_copy,
+        .last_fetched_unix = last_fetched_unix,
+    });
+    url_copy = null;
+    sha_copy = null;
+}
 
 /// One enumerated repository. All slices are heap-owned by the allocator
 /// passed to `walk()`. Call `deinit` to release them.
@@ -74,7 +128,7 @@ pub fn walk(
     ghq_root: []const u8,
     gitstore_root: []const u8,
     opts: ListOptions,
-) WalkError![]RepoEntry {
+) anyerror![]RepoEntry {
     var out: std.ArrayList(RepoEntry) = .empty;
     errdefer {
         for (out.items) |*e| e.deinit(gpa);
@@ -99,7 +153,13 @@ pub fn walk(
         try walkHost(gpa, io, &out, ghq_root, gitstore_root, host_entry.name, opts, &cache_map);
     }
 
-    return try out.toOwnedSlice(gpa);
+    if (opts.include_head) {
+        cache.save(gpa, io, gitstore_root, &cache_map) catch |err| {
+            std.log.warn("repository cache save failed for {s}: {s}", .{ gitstore_root, @errorName(err) });
+        };
+    }
+
+    return out.toOwnedSlice(gpa);
 }
 
 fn walkHost(
@@ -115,7 +175,10 @@ fn walkHost(
     const host_abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ ghq_root, host_name });
     defer gpa.free(host_abs);
 
-    var host_dir = Dir.openDirAbsolute(io, host_abs, .{ .iterate = true }) catch return;
+    var host_dir = Dir.openDirAbsolute(io, host_abs, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
     defer host_dir.close(io);
 
     var owner_iter = host_dir.iterate();
@@ -139,13 +202,27 @@ fn walkOwner(
     const owner_abs = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ ghq_root, host_name, owner_name });
     defer gpa.free(owner_abs);
 
-    var owner_dir = Dir.openDirAbsolute(io, owner_abs, .{ .iterate = true }) catch return;
+    var owner_dir = Dir.openDirAbsolute(io, owner_abs, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
     defer owner_dir.close(io);
 
     var name_iter = owner_dir.iterate();
     while (try name_iter.next(io)) |name_entry| {
         if (name_entry.kind != .directory) continue;
-        try tryAppendRepo(gpa, io, out, ghq_root, gitstore_root, host_name, owner_name, name_entry.name, opts, cache_map);
+        try tryAppendRepo(
+            gpa,
+            io,
+            out,
+            ghq_root,
+            gitstore_root,
+            host_name,
+            owner_name,
+            name_entry.name,
+            opts,
+            cache_map,
+        );
     }
 }
 
@@ -166,35 +243,43 @@ fn tryAppendRepo(
         "{s}/{s}/{s}/{s}",
         .{ ghq_root, host_name, owner_name, repo_name },
     );
-    errdefer gpa.free(abs_path);
+    var abs_path_owned = true;
+    defer if (abs_path_owned) gpa.free(abs_path);
     const rel_path = try std.fmt.allocPrint(
         gpa,
         "{s}/{s}/{s}",
         .{ host_name, owner_name, repo_name },
     );
-    errdefer gpa.free(rel_path);
-
-    if (!isRepoDir(io, abs_path, gpa)) {
-        gpa.free(abs_path);
-        gpa.free(rel_path);
-        return;
-    }
+    var rel_path_owned = true;
+    defer if (rel_path_owned) gpa.free(rel_path);
 
     if (opts.pattern) |p| {
         if (p.len != 0 and std.mem.indexOf(u8, rel_path, p) == null) {
-            gpa.free(abs_path);
-            gpa.free(rel_path);
             return;
         }
     }
 
-    const is_adopted = gitstore.isAdopted(io, abs_path, gitstore_root, gpa);
-    const has_jj = hasJj(io, abs_path, gpa);
+    if (!try isRepoDir(gpa, io, abs_path)) {
+        return;
+    }
+
+    const is_adopted = gitstore.isAdoptedPaths(gpa, io, .{ .repo_path = abs_path, .gitstore_root = gitstore_root });
+    const has_jj = try hasJj(gpa, io, abs_path);
 
     var worktrees: [][]const u8 = &.{};
+    var worktrees_owned = false;
+    defer if (worktrees_owned) {
+        for (worktrees) |wt| gpa.free(wt);
+        gpa.free(worktrees);
+    };
     // Always enumerate when a worktree-related thing is needed, or include_worktrees.
     if (opts.include_worktrees or is_adopted) {
         if (gitstore.enumerateLinkedWorktrees(gpa, io, abs_path)) |wt_bufs| {
+            var wt_bufs_owned = true;
+            errdefer if (wt_bufs_owned) {
+                for (wt_bufs) |w| gpa.free(w);
+                gpa.free(wt_bufs);
+            };
             // Convert [][]u8 → [][]const u8 (same memory, reinterpreted ownership).
             var buf: std.ArrayList([]const u8) = .empty;
             errdefer {
@@ -204,58 +289,154 @@ fn tryAppendRepo(
             try buf.ensureTotalCapacity(gpa, wt_bufs.len);
             for (wt_bufs) |w| buf.appendAssumeCapacity(w);
             gpa.free(wt_bufs); // outer only — inner items now owned by buf
+            wt_bufs_owned = false;
             worktrees = try buf.toOwnedSlice(gpa);
-        } else |_| {
-            worktrees = &.{};
+            worktrees_owned = true;
+        } else |err| switch (err) {
+            error.ProcessFailed => {
+                std.log.warn("linked worktree enumeration failed for {s}: {s}", .{ abs_path, @errorName(err) });
+                worktrees = &.{};
+            },
+            else => return err,
         }
     }
 
     // Resolve HEAD sha + last_fetched_unix.
     var head_sha: ?[]const u8 = null;
+    var head_sha_owned = false;
+    defer if (head_sha_owned) {
+        if (head_sha) |s| gpa.free(s);
+    };
     var last_fetched_unix: ?i64 = null;
     if (cache_map.get(rel_path)) |cached| {
-        if (cached.head_sha) |s| head_sha = try gpa.dupe(u8, s);
+        if (cached.head_sha) |s| {
+            head_sha = try gpa.dupe(u8, s);
+            head_sha_owned = true;
+        }
         last_fetched_unix = cached.last_fetched_unix;
     }
     if (opts.include_head) {
-        if (try resolveHead(gpa, io, abs_path)) |sha| {
-            if (head_sha) |old| gpa.free(old);
-            head_sha = sha;
+        switch (try resolveHead(gpa, io, abs_path)) {
+            .sha => |sha| {
+                if (head_sha_owned) {
+                    if (head_sha) |old| gpa.free(old);
+                }
+                head_sha = sha;
+                head_sha_owned = true;
+                try updateHeadCache(gpa, cache_map, rel_path, head_sha, last_fetched_unix);
+            },
+            .clear => {
+                if (head_sha_owned) {
+                    if (head_sha) |old| gpa.free(old);
+                }
+                head_sha = null;
+                head_sha_owned = false;
+                try updateHeadCache(gpa, cache_map, rel_path, head_sha, last_fetched_unix);
+            },
+            .unavailable => {},
         }
     }
+
+    const entry_host = try gpa.dupe(u8, host_name);
+    var entry_host_owned = true;
+    defer if (entry_host_owned) gpa.free(entry_host);
+    const entry_owner = try gpa.dupe(u8, owner_name);
+    var entry_owner_owned = true;
+    defer if (entry_owner_owned) gpa.free(entry_owner);
+    const entry_name = try gpa.dupe(u8, repo_name);
+    var entry_name_owned = true;
+    defer if (entry_name_owned) gpa.free(entry_name);
 
     try out.append(gpa, .{
         .rel_path = rel_path,
         .abs_path = abs_path,
-        .host = try gpa.dupe(u8, host_name),
-        .owner = try gpa.dupe(u8, owner_name),
-        .name = try gpa.dupe(u8, repo_name),
+        .host = entry_host,
+        .owner = entry_owner,
+        .name = entry_name,
         .is_adopted = is_adopted,
         .has_jj = has_jj,
         .worktrees = worktrees,
         .head_sha = head_sha,
         .last_fetched_unix = last_fetched_unix,
     });
+    rel_path_owned = false;
+    abs_path_owned = false;
+    entry_host_owned = false;
+    entry_owner_owned = false;
+    entry_name_owned = false;
+    worktrees_owned = false;
+    head_sha_owned = false;
 
     // If requested, flatten worktree paths as their own entries.
     if (opts.include_worktrees) {
         for (worktrees) |wt| {
             const wt_abs = try gpa.dupe(u8, wt);
-            errdefer gpa.free(wt_abs);
+            var wt_abs_owned = true;
+            defer if (wt_abs_owned) gpa.free(wt_abs);
             const wt_rel = try gpa.dupe(u8, wt); // rel == abs for out-of-tree worktrees
-            errdefer gpa.free(wt_rel);
+            var wt_rel_owned = true;
+            defer if (wt_rel_owned) gpa.free(wt_rel);
+            const wt_host = try gpa.dupe(u8, host_name);
+            var wt_host_owned = true;
+            defer if (wt_host_owned) gpa.free(wt_host);
+            const wt_owner = try gpa.dupe(u8, owner_name);
+            var wt_owner_owned = true;
+            defer if (wt_owner_owned) gpa.free(wt_owner);
+            const wt_name = try gpa.dupe(u8, repo_name);
+            var wt_name_owned = true;
+            defer if (wt_name_owned) gpa.free(wt_name);
+            var wt_head_sha: ?[]const u8 = null;
+            var wt_head_sha_owned = false;
+            defer if (wt_head_sha_owned) {
+                if (wt_head_sha) |sha| gpa.free(sha);
+            };
+            var wt_last_fetched_unix: ?i64 = null;
+            if (cache_map.get(wt_rel)) |cached| {
+                if (cached.head_sha) |s| {
+                    wt_head_sha = try gpa.dupe(u8, s);
+                    wt_head_sha_owned = true;
+                }
+                wt_last_fetched_unix = cached.last_fetched_unix;
+            }
+            if (opts.include_head) {
+                switch (try resolveHead(gpa, io, wt_abs)) {
+                    .sha => |sha| {
+                        if (wt_head_sha_owned) {
+                            if (wt_head_sha) |old| gpa.free(old);
+                        }
+                        wt_head_sha = sha;
+                        wt_head_sha_owned = true;
+                        try updateHeadCache(gpa, cache_map, wt_rel, wt_head_sha, wt_last_fetched_unix);
+                    },
+                    .clear => {
+                        if (wt_head_sha_owned) {
+                            if (wt_head_sha) |old| gpa.free(old);
+                        }
+                        wt_head_sha = null;
+                        wt_head_sha_owned = false;
+                        try updateHeadCache(gpa, cache_map, wt_rel, wt_head_sha, wt_last_fetched_unix);
+                    },
+                    .unavailable => {},
+                }
+            }
             try out.append(gpa, .{
                 .rel_path = wt_rel,
                 .abs_path = wt_abs,
-                .host = try gpa.dupe(u8, host_name),
-                .owner = try gpa.dupe(u8, owner_name),
-                .name = try gpa.dupe(u8, repo_name),
+                .host = wt_host,
+                .owner = wt_owner,
+                .name = wt_name,
                 .is_adopted = false,
                 .has_jj = false,
                 .worktrees = &.{},
-                .head_sha = null,
-                .last_fetched_unix = null,
+                .head_sha = wt_head_sha,
+                .last_fetched_unix = wt_last_fetched_unix,
             });
+            wt_rel_owned = false;
+            wt_abs_owned = false;
+            wt_host_owned = false;
+            wt_owner_owned = false;
+            wt_name_owned = false;
+            wt_head_sha_owned = false;
         }
     }
 }
@@ -263,35 +444,67 @@ fn tryAppendRepo(
 /// A directory is considered a repo if it contains `.git` (dir or pointer
 /// file) or `.jj`. Non-git VCS (hg, svn, bzr) are intentionally skipped per
 /// libgitstore v2 scope.
-fn isRepoDir(io: Io, abs_path: []const u8, gpa: Allocator) bool {
-    const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{abs_path}) catch return false;
+fn isRepoDir(gpa: Allocator, io: Io, abs_path: []const u8) !bool {
+    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{abs_path});
     defer gpa.free(git_path);
-    if (Dir.cwd().statFile(io, git_path, .{})) |_| return true else |_| {}
+    if (Dir.cwd().statFile(io, git_path, .{})) |_| return true else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
 
-    const jj_path = std.fmt.allocPrint(gpa, "{s}/.jj", .{abs_path}) catch return false;
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{abs_path});
     defer gpa.free(jj_path);
-    if (Dir.cwd().statFile(io, jj_path, .{})) |_| return true else |_| {}
+    if (Dir.cwd().statFile(io, jj_path, .{})) |st| return st.kind == .directory else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
 
     return false;
 }
 
-fn hasJj(io: Io, abs_path: []const u8, gpa: Allocator) bool {
-    const jj_path = std.fmt.allocPrint(gpa, "{s}/.jj", .{abs_path}) catch return false;
+fn hasJj(gpa: Allocator, io: Io, abs_path: []const u8) !bool {
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{abs_path});
     defer gpa.free(jj_path);
-    const st = Dir.cwd().statFile(io, jj_path, .{}) catch return false;
+    const st = Dir.cwd().statFile(io, jj_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
     return st.kind == .directory;
 }
 
-fn resolveHead(gpa: Allocator, io: Io, abs_path: []const u8) !?[]const u8 {
-    var result = ex.exec(gpa, io, &.{ "git", "-C", abs_path, "rev-parse", "HEAD" }, null) catch return null;
+fn resolveHead(gpa: Allocator, io: Io, abs_path: []const u8) !HeadLookup {
+    const result = ex.exec(
+        gpa,
+        io,
+        &.{ "git", "-C", abs_path, "rev-parse", "--verify", "--quiet", "HEAD" },
+        null,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            std.log.warn("HEAD lookup failed for {s}: {s}", .{ abs_path, @errorName(err) });
+            return .unavailable;
+        },
+    };
     defer {
         gpa.free(result.stdout);
         gpa.free(result.stderr);
     }
-    if (!result.succeeded()) return null;
+    if (!result.succeeded()) {
+        const stderr = ex.trimTrailingNewline(result.stderr);
+        if (result.term == .exited and result.term.exited == 1 and stderr.len == 0) {
+            return .clear;
+        }
+        if (stderr.len != 0) {
+            std.log.warn("HEAD lookup failed for {s}: {s}", .{ abs_path, stderr });
+        } else {
+            std.log.warn("HEAD lookup failed for {s}: git rev-parse exited non-zero", .{abs_path});
+        }
+        return .unavailable;
+    }
     const trimmed = ex.trimTrailingNewline(result.stdout);
-    if (trimmed.len == 0) return null;
-    return try gpa.dupe(u8, trimmed);
+    if (trimmed.len == 0) return .clear;
+    const owned = try gpa.dupe(u8, trimmed);
+    return .{ .sha = owned };
 }
 
 /// Accept `[A-Za-z0-9.-]+` that also contains at least one '.'. Rejects
@@ -386,10 +599,15 @@ const WalkTestEnv = struct {
     io: Io,
 
     fn setup(gpa: Allocator, io: Io, tag: []const u8) !WalkTestEnv {
-        const base = try std.fmt.allocPrint(gpa, "/tmp/gitstore_list_{s}", .{tag});
+        const prefix = try std.fmt.allocPrint(gpa, "list_{s}", .{tag});
+        defer gpa.free(prefix);
+        const base = try test_support.uniqueTempDir(gpa, io, prefix);
+        errdefer gpa.free(base);
+        errdefer Dir.cwd().deleteTree(io, base) catch |err| test_support.ignoreCleanupError("list setup", err);
         const ghq = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
+        errdefer gpa.free(ghq);
         const store = try std.fmt.allocPrint(gpa, "{s}/gitstore", .{base});
-        Dir.cwd().deleteTree(io, base) catch {};
+        errdefer gpa.free(store);
         try Dir.cwd().createDirPath(io, ghq);
         try Dir.cwd().createDirPath(io, store);
         return .{
@@ -402,7 +620,7 @@ const WalkTestEnv = struct {
     }
 
     fn teardown(self: *const WalkTestEnv) void {
-        Dir.cwd().deleteTree(self.io, self.base) catch {};
+        Dir.cwd().deleteTree(self.io, self.base) catch |err| test_support.ignoreCleanupError("list env", err);
         self.gpa.free(self.base);
         self.gpa.free(self.ghq_root);
         self.gpa.free(self.gitstore_root);
@@ -440,7 +658,7 @@ const WalkTestEnv = struct {
         );
         defer self.gpa.free(git_path);
         // Remove the .git dir placeholder if present, replace with a pointer file.
-        Dir.cwd().deleteTree(self.io, git_path) catch {};
+        Dir.cwd().deleteTree(self.io, git_path) catch |err| try ignoreMissingCleanupError(err);
         const pointer = try std.fmt.allocPrint(
             self.gpa,
             "gitdir: {s}/{s}/{s}/{s}/git\n",
@@ -465,7 +683,19 @@ test "list: empty ghq root yields no entries" {
 test "list: nonexistent ghq root returns empty slice" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const entries = try walk(gpa, io, "/tmp/gitstore_list_absolutely_no_such_root_42", "/tmp/gitstore_list_no_such_store_42", .{});
+    var env = try WalkTestEnv.setup(gpa, io, "missingroot");
+    defer env.teardown();
+    const missing_ghq = try std.fmt.allocPrint(gpa, "{s}/missing-ghq", .{env.base});
+    defer gpa.free(missing_ghq);
+    const missing_store = try std.fmt.allocPrint(gpa, "{s}/missing-store", .{env.base});
+    defer gpa.free(missing_store);
+    const entries = try walk(
+        gpa,
+        io,
+        missing_ghq,
+        missing_store,
+        .{},
+    );
     defer freeEntries(gpa, entries);
     try testing.expectEqual(@as(usize, 0), entries.len);
 }
@@ -483,6 +713,87 @@ test "list: single git repo is enumerated" {
     try testing.expectEqualStrings("github.com/owner/repo", entries[0].rel_path);
     try testing.expect(!entries[0].is_adopted);
     try testing.expect(!entries[0].has_jj);
+}
+
+test "list: include_head keeps stale cached head when live lookup is unavailable" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env = try WalkTestEnv.setup(gpa, io, "stalehead");
+    defer env.teardown();
+    try env.createGitRepo("github.com", "owner", "stale");
+
+    var src: std.StringHashMap(cache.CacheEntry) = .init(gpa);
+    defer cache.freeMap(gpa, &src);
+    const rel = try gpa.dupe(u8, "github.com/owner/stale");
+    var rel_owned = true;
+    errdefer if (rel_owned) gpa.free(rel);
+    const stale_sha = try gpa.dupe(u8, "deadbeef");
+    var stale_sha_owned = true;
+    errdefer if (stale_sha_owned) gpa.free(stale_sha);
+    try src.put(rel, .{
+        .rel_path = rel,
+        .head_sha = stale_sha,
+        .last_fetched_unix = 1_700_000_000,
+    });
+    rel_owned = false;
+    stale_sha_owned = false;
+    try cache.save(gpa, io, env.gitstore_root, &src);
+
+    const entries = try walk(gpa, io, env.ghq_root, env.gitstore_root, .{ .include_head = true });
+    defer freeEntries(gpa, entries);
+
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("deadbeef", entries[0].head_sha.?);
+    try testing.expectEqual(@as(?i64, 1_700_000_000), entries[0].last_fetched_unix);
+
+    const cached_entries = try walk(gpa, io, env.ghq_root, env.gitstore_root, .{});
+    defer freeEntries(gpa, cached_entries);
+    try testing.expectEqual(@as(usize, 1), cached_entries.len);
+    try testing.expectEqualStrings("deadbeef", cached_entries[0].head_sha.?);
+    try testing.expectEqual(@as(?i64, 1_700_000_000), cached_entries[0].last_fetched_unix);
+}
+
+test "list: include_head clears stale cached head for unborn git repo" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env = try WalkTestEnv.setup(gpa, io, "unbornhead");
+    defer env.teardown();
+    const repo = try std.fmt.allocPrint(gpa, "{s}/github.com/owner/unborn", .{env.ghq_root});
+    defer gpa.free(repo);
+    try Dir.cwd().createDirPath(io, repo);
+    var init = try ex.exec(gpa, io, &.{ "git", "-C", repo, "init" }, null);
+    defer init.deinit(gpa);
+    try testing.expect(init.succeeded());
+
+    var src: std.StringHashMap(cache.CacheEntry) = .init(gpa);
+    defer cache.freeMap(gpa, &src);
+    const rel = try gpa.dupe(u8, "github.com/owner/unborn");
+    var rel_owned = true;
+    errdefer if (rel_owned) gpa.free(rel);
+    const stale_sha = try gpa.dupe(u8, "deadbeef");
+    var stale_sha_owned = true;
+    errdefer if (stale_sha_owned) gpa.free(stale_sha);
+    try src.put(rel, .{
+        .rel_path = rel,
+        .head_sha = stale_sha,
+        .last_fetched_unix = 1_700_000_000,
+    });
+    rel_owned = false;
+    stale_sha_owned = false;
+    try cache.save(gpa, io, env.gitstore_root, &src);
+
+    const entries = try walk(gpa, io, env.ghq_root, env.gitstore_root, .{ .include_head = true });
+    defer freeEntries(gpa, entries);
+
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expect(entries[0].head_sha == null);
+    try testing.expectEqual(@as(?i64, 1_700_000_000), entries[0].last_fetched_unix);
+
+    const cached_entries = try walk(gpa, io, env.ghq_root, env.gitstore_root, .{});
+    defer freeEntries(gpa, cached_entries);
+    try testing.expectEqual(@as(usize, 1), cached_entries.len);
+    try testing.expect(cached_entries[0].head_sha == null);
+    try testing.expectEqual(@as(?i64, 1_700_000_000), cached_entries[0].last_fetched_unix);
 }
 
 test "list: jj-colocated repo flips has_jj" {
@@ -671,10 +982,11 @@ fn fuzzWalkerSynthetic(_: void, smith: *std.testing.Smith) anyerror!void {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const base = "/tmp/gitstore_list_fuzz_root";
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
-    try Dir.cwd().createDirPath(io, base);
+    const base = try test_support.uniqueTempDir(gpa, io, "list_fuzz_root");
+    defer {
+        Dir.cwd().deleteTree(io, base) catch |err| test_support.ignoreCleanupError("list fuzz", err);
+        gpa.free(base);
+    }
 
     const host_count = smith.valueRangeAtMost(u8, 0, 3);
     var h: u8 = 0;
@@ -708,18 +1020,21 @@ fn fuzzWalkerSynthetic(_: void, smith: *std.testing.Smith) anyerror!void {
                 if (has_git) {
                     const gitp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
                     defer gpa.free(gitp);
-                    Dir.cwd().createDirPath(io, gitp) catch {};
+                    try Dir.cwd().createDirPath(io, gitp);
                 }
                 if (has_jj_flag) {
                     const jjp = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo_path});
                     defer gpa.free(jjp);
-                    Dir.cwd().createDirPath(io, jjp) catch {};
+                    try Dir.cwd().createDirPath(io, jjp);
                 }
             }
         }
     }
 
-    const entries = walk(gpa, io, base, "/tmp/gitstore_list_fuzz_store_does_not_exist", .{}) catch |err| switch (err) {
+    const missing_store = try std.fmt.allocPrint(gpa, "{s}/store_does_not_exist", .{base});
+    defer gpa.free(missing_store);
+
+    const entries = walk(gpa, io, base, missing_store, .{}) catch |err| switch (err) {
         error.OutOfMemory => return,
         else => return err,
     };

@@ -10,6 +10,7 @@ const url_mod = @import("url.zig");
 const config_mod = @import("config.zig");
 const clone_mod = @import("clone.zig");
 const list_mod = @import("list.zig");
+const exec_mod = @import("exec.zig");
 
 const usage_text =
     \\Usage: gitstore <command> [options]
@@ -277,15 +278,14 @@ fn getGitstoreRoot(gpa: Allocator, environ_map: *const std.process.Environ.Map) 
 }
 
 fn getGhqRoot(gpa: Allocator, io: Io) ![]u8 {
-    const ex = @import("exec.zig");
-    const result = try ex.exec(gpa, io, &.{ "ghq", "root" }, null);
+    const result = try exec_mod.exec(gpa, io, &.{ "ghq", "root" }, null);
     defer gpa.free(result.stderr);
     if (!result.succeeded()) {
         gpa.free(result.stdout);
         return error.ProcessFailed;
     }
     // Trim trailing newline from the stdout
-    const trimmed = ex.trimTrailingNewline(result.stdout);
+    const trimmed = exec_mod.trimTrailingNewline(result.stdout);
     // We need to return owned memory of just the trimmed part
     if (trimmed.len < result.stdout.len) {
         const owned = try gpa.dupe(u8, trimmed);
@@ -513,11 +513,17 @@ pub fn main(init: std.process.Init) !u8 {
         while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 has_help = true;
-            } else if (std.mem.eql(u8, arg, "--zsh") or std.mem.eql(u8, arg, "--bash") or std.mem.eql(u8, arg, "--nu")) {
+            } else if (std.mem.eql(u8, arg, "--zsh") or
+                std.mem.eql(u8, arg, "--bash") or
+                std.mem.eql(u8, arg, "--nu"))
+            {
                 if (shell != null and !std.mem.eql(u8, shell.?, arg)) {
                     var buf: [512]u8 = undefined;
                     var w = File.stderr().writerStreaming(io, &buf);
-                    try w.interface.print("error: hook accepts only one of --zsh/--bash/--nu (got {s} after {s})\n", .{ arg, shell.? });
+                    try w.interface.print(
+                        "error: hook accepts only one of --zsh/--bash/--nu (got {s} after {s})\n",
+                        .{ arg, shell.? },
+                    );
                     try w.flush();
                     return 2;
                 }
@@ -1192,7 +1198,10 @@ fn cmdRm(
             error.GitDirMalformed => {
                 var ebuf: [512]u8 = undefined;
                 var ew = File.stderr().writerStreaming(io, &ebuf);
-                try ew.interface.print("error: {s}/.git has a malformed gitdir pointer; refusing to remove\n", .{target.abs_path});
+                try ew.interface.print(
+                    "error: {s}/.git has a malformed gitdir pointer; refusing to remove\n",
+                    .{target.abs_path},
+                );
                 try ew.flush();
                 return 1;
             },

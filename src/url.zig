@@ -142,7 +142,7 @@ fn cloneSshUrl(
     // userinfo field is ambiguous once it contains a ':'. Fall back to the
     // hierarchical `ssh://` form whenever either is present.
     const needs_hierarchical = auth.port.len > 0 or
-        std.mem.indexOfScalar(u8, user, ':') != null;
+        std.mem.findScalar(u8, user, ':') != null;
     if (needs_hierarchical) {
         if (auth.port.len > 0) {
             return std.fmt.allocPrint(gpa, "ssh://{s}@{s}:{s}/{s}/{s}.git", .{
@@ -243,8 +243,8 @@ pub fn parse(gpa: Allocator, input: []const u8, defaults: Defaults) ParseError!R
     }
 
     // scp-like: `user@host:path`. Rewrite to ssh form.
-    if (std.mem.indexOfScalar(u8, work, '@')) |at_idx| {
-        if (std.mem.indexOfScalar(u8, work, ':')) |colon_idx| {
+    if (std.mem.findScalar(u8, work, '@')) |at_idx| {
+        if (std.mem.findScalar(u8, work, ':')) |colon_idx| {
             if (colon_idx > at_idx and !std.mem.startsWith(u8, work, "://")) {
                 return parseScpLike(gpa, work, at_idx, colon_idx, orig);
             }
@@ -306,7 +306,7 @@ fn parseUrl(gpa: Allocator, rest: []const u8, scheme: Scheme, orig: []u8) ParseE
     if (rest.len == 0) return error.InvalidFormat;
 
     // Split authority from path.
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidFormat;
+    const slash = std.mem.findScalar(u8, rest, '/') orelse return error.InvalidFormat;
     const authority = rest[0..slash];
     const path = rest[slash + 1 ..];
     if (authority.len == 0) return error.InvalidHost;
@@ -314,7 +314,7 @@ fn parseUrl(gpa: Allocator, rest: []const u8, scheme: Scheme, orig: []u8) ParseE
 
     var auth: Authority = .{};
     var host_with_port = authority;
-    if (std.mem.indexOfScalar(u8, authority, '@')) |at| {
+    if (std.mem.findScalar(u8, authority, '@')) |at| {
         auth.userinfo = authority[0..at];
         host_with_port = authority[at + 1 ..];
     }
@@ -323,7 +323,7 @@ fn parseUrl(gpa: Allocator, rest: []const u8, scheme: Scheme, orig: []u8) ParseE
     // Strip optional `:port` from host. Reject a malformed port (empty or
     // non-digit) rather than silently dropping it, matching the short-host
     // parser's behavior.
-    if (std.mem.indexOfScalar(u8, host_with_port, ':')) |colon| {
+    if (std.mem.findScalar(u8, host_with_port, ':')) |colon| {
         const port = host_with_port[colon + 1 ..];
         if (port.len == 0) return error.InvalidHost;
         for (port) |c| {
@@ -494,12 +494,12 @@ fn stripDotGit(s: []const u8) []const u8 {
 }
 
 fn stripHostPort(s: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, s, ':')) |c| return s[0..c];
+    if (std.mem.findScalar(u8, s, ':')) |c| return s[0..c];
     return s;
 }
 
 fn hostPort(s: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, s, ':')) |c| return s[c + 1 ..];
+    if (std.mem.findScalar(u8, s, ':')) |c| return s[c + 1 ..];
     return "";
 }
 

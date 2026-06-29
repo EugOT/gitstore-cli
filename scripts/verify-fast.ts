@@ -83,14 +83,17 @@ async function main(): Promise<void> {
 
 	// Bun.which performs a real PATH lookup; `command` is a shell builtin
 	// and cannot be exec'd via Bun.spawnSync (CodeRabbit finding).
-	if (Bun.which("ziglint") !== null) {
+	if (zigFiles.length > 0 && Bun.which("ziglint") !== null) {
 		console.log("== ziglint (EugOT/ziglint expected) ==");
-		const ziglint = spawnSync(["ziglint", ...fmtInputs]);
+		const ziglint = spawnSync(["ziglint", ...zigFiles]);
 		process.stdout.write(ziglint.stdout);
+		if (ziglint.stderr.length > 0) process.stderr.write(ziglint.stderr);
 		if (ziglint.code !== 0) {
 			printFail("ziglint", ziglint);
 			await finish(ziglint.code ?? 1, startedAt);
 		}
+	} else if (zigFiles.length === 0) {
+		console.log("(ziglint skipped; no Zig inputs)");
 	} else {
 		console.log("(ziglint not found; install EugOT/ziglint for the lint gate)");
 	}

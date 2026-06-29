@@ -17,6 +17,7 @@ const Dir = std.Io.Dir;
 
 const ex = @import("exec.zig");
 const gitstore = @import("gitstore.zig");
+const test_support = @import("test_support.zig");
 const url = @import("url.zig");
 
 /// Options threaded through `cloneOne` / `cloneMany`.
@@ -51,12 +52,16 @@ pub const CloneReport = struct {
     pub const Status = enum { cloned, updated, skipped_exists, failed };
 };
 
+fn freeReportFields(gpa: Allocator, report: CloneReport) void {
+    if (report.url.len != 0) gpa.free(report.url);
+    if (report.storage_path.len != 0) gpa.free(report.storage_path);
+    if (report.err) |e| gpa.free(e);
+}
+
 /// Free every string inside each `CloneReport` and the outer slice.
 pub fn freeReports(gpa: Allocator, reports: []CloneReport) void {
     for (reports) |r| {
-        gpa.free(r.url);
-        gpa.free(r.storage_path);
-        if (r.err) |e| gpa.free(e);
+        freeReportFields(gpa, r);
     }
     gpa.free(reports);
 }
@@ -85,7 +90,7 @@ pub fn cloneOne(
     ghq_root: []const u8,
     gitstore_root: []const u8,
     opts: CloneOptions,
-) CloneError!CloneReport {
+) anyerror!CloneReport {
     const storage_path = try spec.toStoragePath(gpa, ghq_root);
     errdefer gpa.free(storage_path);
     const url_dup = try gpa.dupe(u8, spec.orig_url);
@@ -203,6 +208,7 @@ pub fn cloneOne(
     // Post-clone: relocate .git into gitstore layout unless caller opted out.
     if (!opts.no_adopt) {
         gitstore.adopt(gpa, io, storage_path, ghq_root, gitstore_root, false) catch |err| {
+            if (err == error.Canceled) return err;
             const msg = try std.fmt.allocPrint(
                 gpa,
                 "adopt failed: {s}",
@@ -240,7 +246,7 @@ pub fn cloneMany(
     ghq_root: []const u8,
     gitstore_root: []const u8,
     opts: CloneOptions,
-) CloneError![]CloneReport {
+) anyerror![]CloneReport {
     const reports = try gpa.alloc(CloneReport, specs.len);
     // Seed each slot with an empty placeholder so early cancellation
     // never leaves uninitialized memory. `workerOne` replaces each slot
@@ -251,6 +257,7 @@ pub fn cloneMany(
         .status = .failed,
         .err = null,
     };
+    errdefer freeReports(gpa, reports);
 
     const cap: u32 = if (opts.parallelism == 0) 1 else opts.parallelism;
     var limiter: Io.Semaphore = .{ .permits = cap };
@@ -283,8 +290,6 @@ pub fn cloneMany(
     // non-cancel failures were already captured on the report.
     group.await(io) catch |err| switch (err) {
         error.Canceled => {
-            // Surface cancellation to caller; already-populated reports
-            // keep whatever state they reached.
             return error.Canceled;
         },
     };
@@ -337,9 +342,7 @@ fn workerOne(ctx: *WorkerCtx) Io.Cancelable!void {
     // (impossible — single-shot worker) or are the empty-string seeds we
     // wrote in cloneMany. Empty slices cannot be freed, so we only free
     // when non-empty.
-    if (old.url.len != 0) ctx.gpa.free(old.url);
-    if (old.storage_path.len != 0) ctx.gpa.free(old.storage_path);
-    if (old.err) |e| ctx.gpa.free(e);
+    freeReportFields(ctx.gpa, old);
 
     ctx.out.* = result;
 }
@@ -468,9 +471,6 @@ fn makeLocalBareFixture(
     work_dir: []const u8,
     bare_path: []const u8,
 ) !void {
-    // Fresh workspace.
-    Dir.cwd().deleteTree(io, work_dir) catch {};
-    Dir.cwd().deleteTree(io, bare_path) catch {};
     try Dir.cwd().createDirPath(io, work_dir);
 
     // `git init` in working dir.
@@ -513,14 +513,17 @@ test "clone: cloneOne clones from a file:// bare fixture" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const base = "/tmp/gitstore_clone_test_basic";
-    const work = "/tmp/gitstore_clone_test_basic/wk";
-    const bare = "/tmp/gitstore_clone_test_basic/bare.git";
-    const ghq_root = "/tmp/gitstore_clone_test_basic/ghq";
-    const store = "/tmp/gitstore_clone_test_basic/store";
-
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    const base = try test_support.uniqueTempDir(gpa, io, "clone_test_basic");
+    defer gpa.free(base);
+    defer Dir.cwd().deleteTree(io, base) catch |err| test_support.ignoreCleanupError("clone basic", err);
+    const work = try std.fmt.allocPrint(gpa, "{s}/wk", .{base});
+    defer gpa.free(work);
+    const bare = try std.fmt.allocPrint(gpa, "{s}/bare.git", .{base});
+    defer gpa.free(bare);
+    const ghq_root = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
+    defer gpa.free(ghq_root);
+    const store = try std.fmt.allocPrint(gpa, "{s}/store", .{base});
+    defer gpa.free(store);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
@@ -554,14 +557,17 @@ test "clone: cloneOne with update_if_exists refreshes an existing clone" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const base = "/tmp/gitstore_clone_test_update";
-    const work = "/tmp/gitstore_clone_test_update/wk";
-    const bare = "/tmp/gitstore_clone_test_update/bare.git";
-    const ghq_root = "/tmp/gitstore_clone_test_update/ghq";
-    const store = "/tmp/gitstore_clone_test_update/store";
-
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    const base = try test_support.uniqueTempDir(gpa, io, "clone_test_update");
+    defer gpa.free(base);
+    defer Dir.cwd().deleteTree(io, base) catch |err| test_support.ignoreCleanupError("clone update", err);
+    const work = try std.fmt.allocPrint(gpa, "{s}/wk", .{base});
+    defer gpa.free(work);
+    const bare = try std.fmt.allocPrint(gpa, "{s}/bare.git", .{base});
+    defer gpa.free(bare);
+    const ghq_root = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
+    defer gpa.free(ghq_root);
+    const store = try std.fmt.allocPrint(gpa, "{s}/store", .{base});
+    defer gpa.free(store);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
@@ -608,14 +614,17 @@ test "clone: cloneOne without update on existing path returns skipped" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const base = "/tmp/gitstore_clone_test_skip";
-    const work = "/tmp/gitstore_clone_test_skip/wk";
-    const bare = "/tmp/gitstore_clone_test_skip/bare.git";
-    const ghq_root = "/tmp/gitstore_clone_test_skip/ghq";
-    const store = "/tmp/gitstore_clone_test_skip/store";
-
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    const base = try test_support.uniqueTempDir(gpa, io, "clone_test_skip");
+    defer gpa.free(base);
+    defer Dir.cwd().deleteTree(io, base) catch |err| test_support.ignoreCleanupError("clone skip", err);
+    const work = try std.fmt.allocPrint(gpa, "{s}/wk", .{base});
+    defer gpa.free(work);
+    const bare = try std.fmt.allocPrint(gpa, "{s}/bare.git", .{base});
+    defer gpa.free(bare);
+    const ghq_root = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
+    defer gpa.free(ghq_root);
+    const store = try std.fmt.allocPrint(gpa, "{s}/store", .{base});
+    defer gpa.free(store);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
@@ -654,16 +663,18 @@ test "clone: cloneOne against a non-existent remote reports failure" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const base = "/tmp/gitstore_clone_test_fail";
-    const ghq_root = "/tmp/gitstore_clone_test_fail/ghq";
-    const store = "/tmp/gitstore_clone_test_fail/store";
-
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    const base = try test_support.uniqueTempDir(gpa, io, "clone_test_fail");
+    defer gpa.free(base);
+    defer Dir.cwd().deleteTree(io, base) catch |err| test_support.ignoreCleanupError("clone fail", err);
+    const ghq_root = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
+    defer gpa.free(ghq_root);
+    const store = try std.fmt.allocPrint(gpa, "{s}/store", .{base});
+    defer gpa.free(store);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
-    const missing = "/tmp/gitstore_clone_test_fail/__no_such_repo__.git";
+    const missing = try std.fmt.allocPrint(gpa, "{s}/__no_such_repo__.git", .{base});
+    defer gpa.free(missing);
     const input = try std.fmt.allocPrint(gpa, "file://{s}", .{missing});
     defer gpa.free(input);
 
@@ -689,12 +700,13 @@ test "clone: cloneMany runs three file:// clones with parallelism=2" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const base = "/tmp/gitstore_clone_test_many";
-    const ghq_root = "/tmp/gitstore_clone_test_many/ghq";
-    const store = "/tmp/gitstore_clone_test_many/store";
-
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    const base = try test_support.uniqueTempDir(gpa, io, "clone_test_many");
+    defer gpa.free(base);
+    defer Dir.cwd().deleteTree(io, base) catch |err| test_support.ignoreCleanupError("clone many", err);
+    const ghq_root = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
+    defer gpa.free(ghq_root);
+    const store = try std.fmt.allocPrint(gpa, "{s}/store", .{base});
+    defer gpa.free(store);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
