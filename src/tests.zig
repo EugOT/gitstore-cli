@@ -785,6 +785,52 @@ test "e2e initRepo idempotent on already adopted" {
     try testing.expect(jj_r.succeeded());
 }
 
+test "e2e verify accepts relative repo path" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    var env = blk: {
+        const base_abs = try uniqueTempDir(gpa, io, "/tmp/gitstore_relative_verify");
+        errdefer {
+            Dir.cwd().deleteTree(io, base_abs) catch {};
+            gpa.free(base_abs);
+        }
+        const ghq = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base_abs});
+        errdefer gpa.free(ghq);
+        const store = try std.fmt.allocPrint(gpa, "{s}/gitstore", .{base_abs});
+        errdefer gpa.free(store);
+
+        try Dir.cwd().createDirPath(io, ghq);
+        try Dir.cwd().createDirPath(io, store);
+
+        break :blk TestEnv{
+            .base = base_abs,
+            .ghq_root = ghq,
+            .gitstore_root = store,
+            .gpa = gpa,
+            .io = io,
+        };
+    };
+    defer env.teardown();
+
+    const repo_abs = try env.createRepo("testorg", "verify_relative");
+    defer gpa.free(repo_abs);
+
+    try gitstore.adopt(gpa, io, repo_abs, env.ghq_root, env.gitstore_root, false);
+
+    var cwd_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try Dir.cwd().realPathFile(io, ".", &cwd_buf);
+    const cwd = cwd_buf[0..cwd_len];
+    const base_rel = try std.fs.path.relative(gpa, cwd, null, cwd, env.base);
+    defer gpa.free(base_rel);
+
+    const repo_rel = try std.fmt.allocPrint(gpa, "{s}/ghq/testorg/verify_relative", .{base_rel});
+    defer gpa.free(repo_rel);
+
+    const ok = try gitstore.verify(gpa, io, repo_rel);
+    try testing.expect(ok);
+}
+
 // =========================================================
 // E2E: status
 // =========================================================
@@ -795,9 +841,7 @@ test "e2e status with empty gitstore" {
     var env = try TestEnv.setup(gpa, io);
     defer env.teardown();
 
-    // status should not crash on empty gitstore
-    // (It calls ghq list which returns real repos, but gitstore is empty)
-    // Just verify it doesn't error
+    // status should not crash on an empty gitstore or require external ghq.
     try gitstore.status(gpa, io, env.ghq_root, env.gitstore_root, false);
     try gitstore.status(gpa, io, env.ghq_root, env.gitstore_root, true);
 }

@@ -457,7 +457,7 @@ pub fn main(init: std.process.Init) !u8 {
         // with error.ProcessFailed when ghq is not installed.
         const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
         defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
+        const ghq_root = try resolveGhqRootOrHome(gpa, io, init.environ_map);
         defer gpa.free(ghq_root);
         try gitstore.init(io, gitstore_root);
 
@@ -502,14 +502,11 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
 
-        // Resolve roots only after arg parse so `verify --help` cannot fail
-        // when ghq is not installed.
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-
         if (all) {
+            const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+            defer gpa.free(gitstore_root);
+            const ghq_root = try getGhqRoot(gpa, io);
+            defer gpa.free(ghq_root);
             try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
         } else if (path) |p| {
             const ok = try gitstore.verify(gpa, io, p);
@@ -562,7 +559,7 @@ pub fn main(init: std.process.Init) !u8 {
         // when ghq is not installed.
         const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
         defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
+        const ghq_root = try resolveGhqRootOrHome(gpa, io, init.environ_map);
         defer gpa.free(ghq_root);
 
         if (all) {
@@ -606,7 +603,7 @@ pub fn main(init: std.process.Init) !u8 {
         // when ghq is not installed.
         const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
         defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
+        const ghq_root = try resolveGhqRootOrHome(gpa, io, init.environ_map);
         defer gpa.free(ghq_root);
 
         try gitstore.status(gpa, io, ghq_root, gitstore_root, json_mode);

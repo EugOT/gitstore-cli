@@ -100,6 +100,14 @@ pub fn isAdopted(io: Io, repo_path: []const u8, gitstore_root: []const u8, gpa: 
     return gitdir.len == root.len or gitdir[root.len] == '/';
 }
 
+fn absoluteRepoPath(gpa: Allocator, io: Io, repo_path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(repo_path)) return gpa.dupe(u8, repo_path);
+
+    var cwd_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try Dir.cwd().realPathFile(io, ".", &cwd_buf);
+    return std.fs.path.resolve(gpa, &.{ cwd_buf[0..cwd_len], repo_path });
+}
+
 /// Initialize a directory as a gitstore-managed repo in one shot.
 /// If the directory already has .git, just adopt it.
 /// If not, run git init + jj colocate, then adopt.
@@ -545,18 +553,21 @@ pub fn verify(
     io: Io,
     repo_path: []const u8,
 ) !bool {
+    const repo_abs = try absoluteRepoPath(gpa, io, repo_path);
+    defer gpa.free(repo_abs);
+
     var ok = true;
 
-    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
+    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_abs});
     defer gpa.free(git_path);
 
     const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch |err| switch (err) {
         error.IsDir => {
-            warn(io, "FAIL: {s}/.git is a directory (not adopted)\n", .{repo_path});
+            warn(io, "FAIL: {s}/.git is a directory (not adopted)\n", .{repo_abs});
             return false;
         },
         else => {
-            warn(io, "FAIL: {s}/.git not found\n", .{repo_path});
+            warn(io, "FAIL: {s}/.git not found\n", .{repo_abs});
             return false;
         },
     };
@@ -564,7 +575,7 @@ pub fn verify(
 
     const trimmed = ex.trimTrailingNewline(content);
     if (!std.mem.startsWith(u8, trimmed, "gitdir: ")) {
-        warn(io, "FAIL: {s}/.git is not a valid gitdir pointer\n", .{repo_path});
+        warn(io, "FAIL: {s}/.git is not a valid gitdir pointer\n", .{repo_abs});
         return false;
     }
     const git_dir = trimmed["gitdir: ".len..];
@@ -575,28 +586,28 @@ pub fn verify(
     };
 
     {
-        const git_result = try ex.exec(gpa, io, &.{ "git", "-C", repo_path, "rev-parse", "--git-dir" }, null);
+        const git_result = try ex.exec(gpa, io, &.{ "git", "-C", repo_abs, "rev-parse", "--git-dir" }, null);
         defer {
             gpa.free(git_result.stdout);
             gpa.free(git_result.stderr);
         }
         if (!git_result.succeeded()) {
-            warn(io, "FAIL: git rev-parse --git-dir failed in {s}\n", .{repo_path});
+            warn(io, "FAIL: git rev-parse --git-dir failed in {s}\n", .{repo_abs});
             ok = false;
         }
     }
 
-    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo_path});
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo_abs});
     defer gpa.free(jj_path);
 
     var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const link_len = Dir.readLinkAbsolute(io, jj_path, &link_buf) catch |err| switch (err) {
         error.FileNotFound => {
-            if (ok) info(io, "OK: {s} (no .jj)\n", .{repo_path});
+            if (ok) info(io, "OK: {s} (no .jj)\n", .{repo_abs});
             return ok;
         },
         else => {
-            warn(io, "FAIL: {s}/.jj is not a symlink\n", .{repo_path});
+            warn(io, "FAIL: {s}/.jj is not a symlink\n", .{repo_abs});
             return false;
         },
     };
@@ -608,18 +619,18 @@ pub fn verify(
     };
 
     {
-        const jj_result = try ex.exec(gpa, io, &.{ "jj", "status", "-R", repo_path }, null);
+        const jj_result = try ex.exec(gpa, io, &.{ "jj", "status", "-R", repo_abs }, null);
         defer {
             gpa.free(jj_result.stdout);
             gpa.free(jj_result.stderr);
         }
         if (!jj_result.succeeded()) {
-            warn(io, "FAIL: jj status failed in {s}\n", .{repo_path});
+            warn(io, "FAIL: jj status failed in {s}\n", .{repo_abs});
             ok = false;
         }
     }
 
-    if (ok) info(io, "OK: {s}\n", .{repo_path});
+    if (ok) info(io, "OK: {s}\n", .{repo_abs});
 
     return ok;
 }
@@ -654,6 +665,90 @@ pub fn verifyAll(
     info(io, "\nverify: {d} ok, {d} failed\n", .{ ok_count, fail_count });
 }
 
+const StatusCounts = struct {
+    total_repos: usize = 0,
+    adopted: usize = 0,
+    broken: usize = 0,
+};
+
+fn hasRepoMarker(io: Io, abs_path: []const u8, gpa: Allocator) bool {
+    const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{abs_path}) catch return false;
+    defer gpa.free(git_path);
+    if (Dir.cwd().statFile(io, git_path, .{})) |_| return true else |_| {}
+
+    const jj_path = std.fmt.allocPrint(gpa, "{s}/.jj", .{abs_path}) catch return false;
+    defer gpa.free(jj_path);
+    if (Dir.cwd().statFile(io, jj_path, .{})) |_| return true else |_| {}
+
+    return false;
+}
+
+fn countStatusRepo(gpa: Allocator, io: Io, gitstore_root: []const u8, repo_path: []const u8, counts: *StatusCounts) !void {
+    if (!hasRepoMarker(io, repo_path, gpa)) return;
+
+    counts.total_repos += 1;
+    if (!isAdopted(io, repo_path, gitstore_root, gpa)) return;
+
+    counts.adopted += 1;
+    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
+    defer gpa.free(git_path);
+    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch return;
+    defer gpa.free(content);
+    const trimmed = ex.trimTrailingNewline(content);
+    if (std.mem.startsWith(u8, trimmed, "gitdir: ")) {
+        const git_dir = trimmed["gitdir: ".len..];
+        _ = Dir.cwd().statFile(io, git_dir, .{}) catch {
+            counts.broken += 1;
+        };
+    }
+}
+
+fn countStatusOwner(gpa: Allocator, io: Io, gitstore_root: []const u8, owner_abs: []const u8, counts: *StatusCounts) !void {
+    var owner_dir = Dir.openDirAbsolute(io, owner_abs, .{ .iterate = true }) catch return;
+    defer owner_dir.close(io);
+
+    var repo_iter = owner_dir.iterate();
+    while (try repo_iter.next(io)) |repo_entry| {
+        if (repo_entry.kind != .directory) continue;
+        const repo_abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ owner_abs, repo_entry.name });
+        defer gpa.free(repo_abs);
+        try countStatusRepo(gpa, io, gitstore_root, repo_abs, counts);
+    }
+}
+
+fn countStatusHost(gpa: Allocator, io: Io, gitstore_root: []const u8, host_abs: []const u8, counts: *StatusCounts) !void {
+    var host_dir = Dir.openDirAbsolute(io, host_abs, .{ .iterate = true }) catch return;
+    defer host_dir.close(io);
+
+    var owner_iter = host_dir.iterate();
+    while (try owner_iter.next(io)) |owner_entry| {
+        if (owner_entry.kind != .directory) continue;
+        const owner_abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ host_abs, owner_entry.name });
+        defer gpa.free(owner_abs);
+        try countStatusOwner(gpa, io, gitstore_root, owner_abs, counts);
+    }
+}
+
+fn countStatus(gpa: Allocator, io: Io, ghq_root: []const u8, gitstore_root: []const u8) !StatusCounts {
+    var counts: StatusCounts = .{};
+
+    var root_dir = Dir.openDirAbsolute(io, ghq_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return counts,
+        else => return err,
+    };
+    defer root_dir.close(io);
+
+    var host_iter = root_dir.iterate();
+    while (try host_iter.next(io)) |host_entry| {
+        if (host_entry.kind != .directory) continue;
+        const host_abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ ghq_root, host_entry.name });
+        defer gpa.free(host_abs);
+        try countStatusHost(gpa, io, gitstore_root, host_abs, &counts);
+    }
+
+    return counts;
+}
+
 /// Show gitstore disk usage, repo count, and broken pointers.
 pub fn status(
     gpa: Allocator,
@@ -662,8 +757,6 @@ pub fn status(
     gitstore_root: []const u8,
     json_mode: bool,
 ) !void {
-    _ = ghq_root;
-
     const du_result = try ex.exec(gpa, io, &.{ "du", "-sh", gitstore_root }, null);
     defer {
         gpa.free(du_result.stdout);
@@ -673,49 +766,19 @@ pub fn status(
     var du_parts = std.mem.splitScalar(u8, du_line, '\t');
     const disk_usage = du_parts.next() orelse "unknown";
 
-    const list_result = try ex.exec(gpa, io, &.{ "ghq", "list", "--full-path" }, null);
-    defer {
-        gpa.free(list_result.stdout);
-        gpa.free(list_result.stderr);
-    }
-
-    var total_repos: usize = 0;
-    var adopted_count: usize = 0;
-    var broken_count: usize = 0;
-
-    if (list_result.succeeded()) {
-        var lines = std.mem.splitScalar(u8, ex.trimTrailingNewline(list_result.stdout), '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            total_repos += 1;
-            if (isAdopted(io, line, gitstore_root, gpa)) {
-                adopted_count += 1;
-                const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{line}) catch continue;
-                defer gpa.free(git_path);
-                const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch continue;
-                defer gpa.free(content);
-                const trimmed = ex.trimTrailingNewline(content);
-                if (std.mem.startsWith(u8, trimmed, "gitdir: ")) {
-                    const git_dir = trimmed["gitdir: ".len..];
-                    _ = Dir.cwd().statFile(io, git_dir, .{}) catch {
-                        broken_count += 1;
-                    };
-                }
-            }
-        }
-    }
+    const counts = try countStatus(gpa, io, ghq_root, gitstore_root);
 
     if (json_mode) {
         info(io,
             \\{{"disk_usage":"{s}","gitstore_root":"{s}","total_repos":{d},"adopted":{d},"broken":{d}}}
-        ++ "\n", .{ disk_usage, gitstore_root, total_repos, adopted_count, broken_count });
+        ++ "\n", .{ disk_usage, gitstore_root, counts.total_repos, counts.adopted, counts.broken });
     } else {
         info(io, "gitstore: {s}\n", .{gitstore_root});
         info(io, "disk usage: {s}\n", .{disk_usage});
-        info(io, "total repos: {d}\n", .{total_repos});
-        info(io, "adopted: {d}\n", .{adopted_count});
-        if (broken_count > 0) {
-            info(io, "broken pointers: {d}\n", .{broken_count});
+        info(io, "total repos: {d}\n", .{counts.total_repos});
+        info(io, "adopted: {d}\n", .{counts.adopted});
+        if (counts.broken > 0) {
+            info(io, "broken pointers: {d}\n", .{counts.broken});
         }
     }
 }
