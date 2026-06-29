@@ -115,6 +115,31 @@ Do not silently sync DVC workspace outputs. Excluding `.dvc/cache` and `.dvc/tmp
 
 The documented safe pattern is Git for code/metadata, DVC for data cache/remotes, and gitstore/rclone only for non-DVC working tree backup semantics.
 
+### Google Drive Shortcut Validation
+
+Live validation on 2026-06-28 used the Google Drive connector and rclone
+against the connector-discovered `A42.Code` folder:
+
+- Connector folder: `A42.Code` (private folder URL redacted).
+- rclone addressed the same folder by ID with
+  `gdrive,root_folder_id=<A42_CODE_FOLDER_ID>:`.
+- rclone created an isolated validation file at
+  `gitstore-validation/dvc-store/gitstore-gh-dvc-validation.txt`.
+- rclone created a Drive shortcut at
+  `gitstore-validation/dvc-alias/gitstore-gh-dvc-validation.txt` with
+  `rclone backend shortcut`.
+- Google Drive connector readback reported the alias MIME type as
+  `application/vnd.google-apps.shortcut` with a private file ID.
+- Connector readback reported the target file as `text/plain`, size `2198`,
+  with a private file ID.
+- rclone `lsjson` resolved the shortcut path to target ID
+  `<TARGET_FILE_ID>` and shortcut ID `<SHORTCUT_FILE_ID>`.
+
+This exercises the Google Drive shortcut mechanism required for a future
+DVC-output alias mode. It is not by itself proof that a repository's DVC remote
+configuration has been parsed and mapped to shortcuts; that still requires the
+DVC implementation tasks below.
+
 ## Implementation Tasks
 
 ### 1. Add Detection Metadata

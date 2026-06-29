@@ -69,8 +69,12 @@ function buildTestBinary(step: string): { binary: string | null; log: string } {
 	// The test binary path appears in the verbose output as an absolute path
 	// ending in `/test` (the run step invokes it). Grab the last such match.
 	const matches = [...log.matchAll(/(\S*\.zig-cache\/o\/[0-9a-f]+\/test)\b/g)];
-	if (matches.length > 0) {
-		return { binary: matches[matches.length - 1][1], log };
+	const lastMatch = matches.at(-1);
+	if (lastMatch !== undefined) {
+		const matchedBinary = lastMatch[1];
+		if (typeof matchedBinary === "string") {
+			return { binary: matchedBinary, log };
+		}
 	}
 	// Fallback: scan the cache for the newest `test` artifact.
 	const found = newestTestArtifact();

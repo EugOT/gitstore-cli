@@ -171,14 +171,20 @@ export type LogLine = Record<string, unknown> & {
 	event: string;
 };
 
+type AppendJsonlLine = Record<string, unknown> & {
+	event: string;
+	ts?: string;
+};
+
 export async function appendJsonl(
 	relPath: string,
-	line: Omit<LogLine, "ts"> & { ts?: string },
+	line: AppendJsonlLine,
 ): Promise<void> {
 	const full = resolve(repoRoot(), relPath);
+	const { ts, ...rest } = line;
 	const payload: LogLine = {
-		ts: line.ts ?? new Date().toISOString(),
-		...line,
+		...rest,
+		ts: ts ?? new Date().toISOString(),
 	};
 	const data = `${JSON.stringify(payload)}\n`;
 	// Atomic O_APPEND via node:fs/promises so concurrent writers do not lose
