@@ -703,29 +703,31 @@ fn countStatusRepo(gpa: Allocator, io: Io, gitstore_root: []const u8, repo_path:
     }
 }
 
-fn countStatusOwner(gpa: Allocator, io: Io, gitstore_root: []const u8, owner_abs: []const u8, counts: *StatusCounts) !void {
-    var owner_dir = Dir.openDirAbsolute(io, owner_abs, .{ .iterate = true }) catch return;
-    defer owner_dir.close(io);
-
-    var repo_iter = owner_dir.iterate();
-    while (try repo_iter.next(io)) |repo_entry| {
-        if (repo_entry.kind != .directory) continue;
-        const repo_abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ owner_abs, repo_entry.name });
-        defer gpa.free(repo_abs);
-        try countStatusRepo(gpa, io, gitstore_root, repo_abs, counts);
+fn countStatusTree(
+    gpa: Allocator,
+    io: Io,
+    gitstore_root: []const u8,
+    abs_path: []const u8,
+    counts: *StatusCounts,
+    remaining_depth: usize,
+) !void {
+    if (hasRepoMarker(io, abs_path, gpa)) {
+        try countStatusRepo(gpa, io, gitstore_root, abs_path, counts);
+        return;
     }
-}
 
-fn countStatusHost(gpa: Allocator, io: Io, gitstore_root: []const u8, host_abs: []const u8, counts: *StatusCounts) !void {
-    var host_dir = Dir.openDirAbsolute(io, host_abs, .{ .iterate = true }) catch return;
-    defer host_dir.close(io);
+    if (remaining_depth == 0) return;
 
-    var owner_iter = host_dir.iterate();
-    while (try owner_iter.next(io)) |owner_entry| {
-        if (owner_entry.kind != .directory) continue;
-        const owner_abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ host_abs, owner_entry.name });
-        defer gpa.free(owner_abs);
-        try countStatusOwner(gpa, io, gitstore_root, owner_abs, counts);
+    var dir = Dir.openDirAbsolute(io, abs_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (std.mem.eql(u8, entry.name, ".git") or std.mem.eql(u8, entry.name, ".jj")) continue;
+        const child_abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ abs_path, entry.name });
+        defer gpa.free(child_abs);
+        try countStatusTree(gpa, io, gitstore_root, child_abs, counts, remaining_depth - 1);
     }
 }
 
@@ -743,7 +745,7 @@ fn countStatus(gpa: Allocator, io: Io, ghq_root: []const u8, gitstore_root: []co
         if (host_entry.kind != .directory) continue;
         const host_abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ ghq_root, host_entry.name });
         defer gpa.free(host_abs);
-        try countStatusHost(gpa, io, gitstore_root, host_abs, &counts);
+        try countStatusTree(gpa, io, gitstore_root, host_abs, &counts, 2);
     }
 
     return counts;
