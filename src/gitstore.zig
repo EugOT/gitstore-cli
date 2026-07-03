@@ -482,20 +482,22 @@ pub fn adoptWithJjBinary(
         info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
     } else {
         info(io, "init: jj colocated in {s}\n", .{repo_path});
-        const jj_init = ex.exec(gpa, io, &.{ jj_binary, "git", "init", "--colocate" }, repo_path) catch |err| {
-            // Allocator exhaustion is a real failure, not a missing-jj
-            // situation — propagate it rather than masking it as success.
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            // Any other spawn failure (jj not installed / absent from PATH)
-            // is the same best-effort situation as jj exiting non-zero below:
-            // git-level adoption is already complete, so record it and
-            // finish instead of failing the whole adoption (#22). A failed
-            // log write must not resurrect the fatal path either.
-            oplog.logOperation(io, log_path, .init_jj, repo_path, "", "error: jj spawn failed") catch |log_err| {
-                warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
-            };
-            warn(io, "warn: jj init unavailable (non-fatal): {s}\n", .{@errorName(err)});
-            return;
+        const jj_init = ex.exec(gpa, io, &.{ jj_binary, "git", "init", "--colocate" }, repo_path) catch |err| switch (err) {
+            // Missing jj binary (absent from PATH) is the only spawn failure
+            // treated as best-effort: git-level adoption is already complete,
+            // so record it and finish instead of failing the whole adoption
+            // (#22) — the same leniency the non-zero-exit path below gets.
+            // A failed log write must not resurrect the fatal path either.
+            error.FileNotFound => {
+                oplog.logOperation(io, log_path, .init_jj, repo_path, "", "error: jj spawn failed") catch |log_err| {
+                    warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
+                };
+                warn(io, "warn: jj init unavailable (non-fatal): jj not found\n", .{});
+                return;
+            },
+            // Every other spawn failure (OutOfMemory, permission, exec
+            // errors) is unexpected — propagate rather than mask it.
+            else => return err,
         };
         defer {
             gpa.free(jj_init.stdout);
