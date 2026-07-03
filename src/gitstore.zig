@@ -19,6 +19,11 @@ pub const Error = error{
     Dir.DeleteTreeError || Dir.OpenError || Dir.CreateDirPathError ||
     File.OpenError || File.StatError || Dir.ReadFileAllocError;
 
+/// Executable used for jj colocation in `adopt`. A `pub var` (not const)
+/// solely so tests can point it at a nonexistent absolute path to exercise
+/// the spawn-failure branch; production code never reassigns it.
+pub var jj_binary: []const u8 = "jj";
+
 fn info(io: Io, comptime fmt: []const u8, args: anytype) void {
     if (builtin.is_test) return;
     var buf: [8192]u8 = undefined;
@@ -466,7 +471,18 @@ pub fn adopt(
         info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
     } else {
         info(io, "init: jj colocated in {s}\n", .{repo_path});
-        const jj_init = try ex.exec(gpa, io, &.{ "jj", "git", "init", "--colocate" }, repo_path);
+        const jj_init = ex.exec(gpa, io, &.{ jj_binary, "git", "init", "--colocate" }, repo_path) catch |err| {
+            // Spawn failure (jj not installed / absent from PATH) is the
+            // same best-effort situation as jj exiting non-zero below:
+            // git-level adoption is already complete, so record it and
+            // finish instead of failing the whole adoption (#22). A failed
+            // log write must not resurrect the fatal path either.
+            oplog.logOperation(io, log_path, .init_jj, repo_path, "", "error: jj spawn failed") catch |log_err| {
+                warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
+            };
+            warn(io, "warn: jj init unavailable (non-fatal): {s}\n", .{@errorName(err)});
+            return;
+        };
         defer {
             gpa.free(jj_init.stdout);
             gpa.free(jj_init.stderr);
