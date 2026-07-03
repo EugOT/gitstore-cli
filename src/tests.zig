@@ -432,6 +432,45 @@ test "e2e adopt git-only repo" {
 }
 
 // =========================================================
+// E2E: adopt when jj binary is missing (regression #22)
+// =========================================================
+
+test "e2e adopt git-only repo completes when jj binary is missing" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "nojj");
+    defer gpa.free(repo);
+
+    // Simulate an uninstalled jj deterministically: an absolute path that
+    // cannot exist makes the spawn itself fail with error.FileNotFound.
+    // Injected as a parameter (not shared global state), so the override is
+    // local to this test and safe under concurrent adopts.
+    // Regression EugOT/gitstore-cli#22: a missing jj binary (spawn
+    // error.FileNotFound) must be as non-fatal as jj exiting non-zero —
+    // git-level adoption is already complete when the jj step runs.
+    try gitstore.adoptWithJjBinary(gpa, io, repo, env.ghq_root, env.gitstore_root, false, "/nonexistent/gitstore-test-missing-jj");
+
+    // Git-level adoption completed: .git is a pointer file.
+    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(git_path);
+    const content = try Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited);
+    defer gpa.free(content);
+    try testing.expect(std.mem.startsWith(u8, content, "gitdir: "));
+
+    // The jj spawn failure is recorded in the operations log.
+    const log_file = try std.fmt.allocPrint(gpa, "{s}/operations.log", .{env.gitstore_root});
+    defer gpa.free(log_file);
+    const log_content = try Dir.cwd().readFileAlloc(io, log_file, gpa, .unlimited);
+    defer gpa.free(log_content);
+    try testing.expect(std.mem.indexOf(u8, log_content, "\"action\":\"init_jj\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log_content, "error: jj spawn failed") != null);
+}
+
+// =========================================================
 // E2E: adopt git+jj colocated repo
 // =========================================================
 

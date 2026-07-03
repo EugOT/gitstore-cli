@@ -271,6 +271,22 @@ pub fn adopt(
     gitstore_root: []const u8,
     dry_run: bool,
 ) !void {
+    return adoptWithJjBinary(gpa, io, repo_path, ghq_root, gitstore_root, dry_run, "jj");
+}
+
+/// Like `adopt`, but with the jj executable injected as a parameter. Production
+/// callers use `adopt` (which passes `"jj"`); the explicit binary path exists
+/// only so tests can exercise the spawn-failure branch by pointing at a
+/// nonexistent path — no shared mutable state, safe under concurrent adopts.
+pub fn adoptWithJjBinary(
+    gpa: Allocator,
+    io: Io,
+    repo_path: []const u8,
+    ghq_root: []const u8,
+    gitstore_root: []const u8,
+    dry_run: bool,
+    jj_binary: []const u8,
+) !void {
     const rel_path = repoStoragePath(repo_path, ghq_root) orelse {
         warn(io, "error: {s} is not an absolute path\n", .{repo_path});
         return error.InvalidGhqRoot;
@@ -466,7 +482,23 @@ pub fn adopt(
         info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
     } else {
         info(io, "init: jj colocated in {s}\n", .{repo_path});
-        const jj_init = try ex.exec(gpa, io, &.{ "jj", "git", "init", "--colocate" }, repo_path);
+        const jj_init = ex.exec(gpa, io, &.{ jj_binary, "git", "init", "--colocate" }, repo_path) catch |err| switch (err) {
+            // Missing jj binary (absent from PATH) is the only spawn failure
+            // treated as best-effort: git-level adoption is already complete,
+            // so record it and finish instead of failing the whole adoption
+            // (#22) — the same leniency the non-zero-exit path below gets.
+            // A failed log write must not resurrect the fatal path either.
+            error.FileNotFound => {
+                oplog.logOperation(io, log_path, .init_jj, repo_path, "", "error: jj spawn failed") catch |log_err| {
+                    warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
+                };
+                warn(io, "warn: jj init unavailable (non-fatal): jj not found\n", .{});
+                return;
+            },
+            // Every other spawn failure (OutOfMemory, permission, exec
+            // errors) is unexpected — propagate rather than mask it.
+            else => return err,
+        };
         defer {
             gpa.free(jj_init.stdout);
             gpa.free(jj_init.stderr);
