@@ -19,11 +19,6 @@ pub const Error = error{
     Dir.DeleteTreeError || Dir.OpenError || Dir.CreateDirPathError ||
     File.OpenError || File.StatError || Dir.ReadFileAllocError;
 
-/// Executable used for jj colocation in `adopt`. A `pub var` (not const)
-/// solely so tests can point it at a nonexistent absolute path to exercise
-/// the spawn-failure branch; production code never reassigns it.
-pub var jj_binary: []const u8 = "jj";
-
 fn info(io: Io, comptime fmt: []const u8, args: anytype) void {
     if (builtin.is_test) return;
     var buf: [8192]u8 = undefined;
@@ -276,6 +271,22 @@ pub fn adopt(
     gitstore_root: []const u8,
     dry_run: bool,
 ) !void {
+    return adoptWithJjBinary(gpa, io, repo_path, ghq_root, gitstore_root, dry_run, "jj");
+}
+
+/// Like `adopt`, but with the jj executable injected as a parameter. Production
+/// callers use `adopt` (which passes `"jj"`); the explicit binary path exists
+/// only so tests can exercise the spawn-failure branch by pointing at a
+/// nonexistent path — no shared mutable state, safe under concurrent adopts.
+pub fn adoptWithJjBinary(
+    gpa: Allocator,
+    io: Io,
+    repo_path: []const u8,
+    ghq_root: []const u8,
+    gitstore_root: []const u8,
+    dry_run: bool,
+    jj_binary: []const u8,
+) !void {
     const rel_path = repoStoragePath(repo_path, ghq_root) orelse {
         warn(io, "error: {s} is not an absolute path\n", .{repo_path});
         return error.InvalidGhqRoot;
@@ -472,8 +483,11 @@ pub fn adopt(
     } else {
         info(io, "init: jj colocated in {s}\n", .{repo_path});
         const jj_init = ex.exec(gpa, io, &.{ jj_binary, "git", "init", "--colocate" }, repo_path) catch |err| {
-            // Spawn failure (jj not installed / absent from PATH) is the
-            // same best-effort situation as jj exiting non-zero below:
+            // Allocator exhaustion is a real failure, not a missing-jj
+            // situation — propagate it rather than masking it as success.
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            // Any other spawn failure (jj not installed / absent from PATH)
+            // is the same best-effort situation as jj exiting non-zero below:
             // git-level adoption is already complete, so record it and
             // finish instead of failing the whole adoption (#22). A failed
             // log write must not resurrect the fatal path either.

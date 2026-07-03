@@ -446,17 +446,13 @@ test "e2e adopt git-only repo completes when jj binary is missing" {
     defer gpa.free(repo);
 
     // Simulate an uninstalled jj deterministically: an absolute path that
-    // cannot exist makes the spawn itself fail with error.FileNotFound
-    // (PATH manipulation is not reliable here — spawn resolution does not
-    // re-read a mutated libc environ).
-    const saved_jj_binary = gitstore.jj_binary;
-    gitstore.jj_binary = "/nonexistent/gitstore-test-missing-jj";
-    defer gitstore.jj_binary = saved_jj_binary;
-
+    // cannot exist makes the spawn itself fail with error.FileNotFound.
+    // Injected as a parameter (not shared global state), so the override is
+    // local to this test and safe under concurrent adopts.
     // Regression EugOT/gitstore-cli#22: a missing jj binary (spawn
     // error.FileNotFound) must be as non-fatal as jj exiting non-zero —
     // git-level adoption is already complete when the jj step runs.
-    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+    try gitstore.adoptWithJjBinary(gpa, io, repo, env.ghq_root, env.gitstore_root, false, "/nonexistent/gitstore-test-missing-jj");
 
     // Git-level adoption completed: .git is a pointer file.
     const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
