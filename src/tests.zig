@@ -6,7 +6,7 @@ const Dir = std.Io.Dir;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-const gitstore = @import("gitstore.zig");
+const gitstore = @import("z3store.zig");
 const ex = @import("exec.zig");
 const oplog = @import("log.zig");
 const hooks = @import("hooks.zig");
@@ -1547,7 +1547,8 @@ test "config: load reads gitstore.root from real global git config" {
     defer cfg.deinit(gpa);
 
     try testing.expectEqualStrings("/gitstore_unit_test_sentinel_root", cfg.root);
-    try testing.expect(!cfg.used_legacy_ghq_keys);
+    // gitstore.root is now a legacy fallback -> flags the deprecation signal.
+    try testing.expect(cfg.used_legacy);
 }
 
 test "config: load falls back to ghq.root and flags legacy" {
@@ -1569,7 +1570,7 @@ test "config: load falls back to ghq.root and flags legacy" {
     defer cfg.deinit(gpa);
 
     try testing.expectEqualStrings("/ghq_legacy_test_sentinel_root", cfg.root);
-    try testing.expect(cfg.used_legacy_ghq_keys);
+    try testing.expect(cfg.used_legacy);
 }
 
 test "config: load uses env GITSTORE_ROOT when no git config set" {
@@ -1591,7 +1592,55 @@ test "config: load uses env GITSTORE_ROOT when no git config set" {
     defer cfg.deinit(gpa);
 
     try testing.expectEqualStrings("/from/env/gitstore", cfg.root);
-    try testing.expect(!cfg.used_legacy_ghq_keys);
+    // Legacy $GITSTORE_ROOT must flag the deprecation signal.
+    try testing.expect(cfg.used_legacy);
+}
+
+test "config: load uses env Z3STORE_ROOT and does not flag legacy" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/nonexistent_test_home");
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
+    // Both set: primary Z3STORE_ROOT must win over legacy GITSTORE_ROOT.
+    try env_map.put("Z3STORE_ROOT", "/from/env/z3store");
+    try env_map.put("GITSTORE_ROOT", "/from/env/gitstore");
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings("/from/env/z3store", cfg.root);
+    try testing.expect(!cfg.used_legacy);
+}
+
+test "config: load prefers z3store.root over gitstore.root git config" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
+
+    try gitSetFile(gpa, io, config_path, "z3store.root", "/z3store_primary_root");
+    try gitSetFile(gpa, io, config_path, "gitstore.root", "/gitstore_legacy_root");
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/nonexistent_test_home");
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings("/z3store_primary_root", cfg.root);
+    try testing.expect(!cfg.used_legacy);
 }
 
 // =========================================================
@@ -1617,7 +1666,7 @@ test "config: resolveRootForUrl falls back to base.root when no pattern matches"
         .complete_user = true,
         .adopt_on_clone = true,
         .jj_colocate = true,
-        .used_legacy_ghq_keys = false,
+        .used_legacy = false,
         .owned_strings = owned,
     };
 
@@ -1648,7 +1697,7 @@ test "config: resolveRootForUrl prefers matching gitstore.<url>.root urlmatch" {
         .complete_user = true,
         .adopt_on_clone = true,
         .jj_colocate = true,
-        .used_legacy_ghq_keys = false,
+        .used_legacy = false,
         .owned_strings = owned,
     };
 
@@ -1954,14 +2003,14 @@ test "adopt rejects repo_path with '.' segment under storage path" {
 //
 //   build.zig:
 //     integration_tests.step.dependOn(&exe.step);   // build gitstore first
-//     e2e_opts.addOptionPath("gitstore_bin", exe.getEmittedBin());
+//     e2e_opts.addOptionPath("zt_bin", exe.getEmittedBin());
 //     integration_mod.addOptions("build_options", e2e_opts);
 //
 // `addOptionPath` takes the emitted-bin LazyPath and resolves it lazily inside
 // the Options step's own make() (an eager getPath2() during graph construction
 // panics with "misconfigured build script"), writing the absolute path into
 // the generated `build_options` module where it surfaces as a `[]const u8`.
-// `gitstore_bin` is therefore an absolute path to the just-built binary —
+// `zt_bin` is therefore an absolute path to the just-built binary —
 // no cwd-relative guessing, no reliance on the install prefix.
 //
 // stdout vs stderr routing (load-bearing, verified against main.zig):
@@ -2047,7 +2096,7 @@ fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
     // argv = [binary, tail...]
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.append(gpa, build_options.gitstore_bin);
+    try argv.append(gpa, build_options.zt_bin);
     for (case.argv_tail) |a| try argv.append(gpa, a);
 
     // Space-joined tail for diagnostics. In Zig 0.16 `{s}` only formats a
@@ -2110,7 +2159,7 @@ test "e2e (no args) prints usage to stderr, exit 0" {
         .argv_tail = &.{},
         .expect = .{ .code = 0 },
         .stream = .stderr,
-        .needle = "Usage: gitstore",
+        .needle = "Usage: zt",
     });
 }
 
@@ -2119,7 +2168,7 @@ test "e2e --help prints usage to stderr, exit 0" {
         .argv_tail = &.{"--help"},
         .expect = .{ .code = 0 },
         .stream = .stderr,
-        .needle = "Usage: gitstore",
+        .needle = "Usage: zt",
     });
 }
 
@@ -2128,7 +2177,7 @@ test "e2e -h prints usage to stderr, exit 0" {
         .argv_tail = &.{"-h"},
         .expect = .{ .code = 0 },
         .stream = .stderr,
-        .needle = "Usage: gitstore",
+        .needle = "Usage: zt",
     });
 }
 
@@ -2166,7 +2215,7 @@ test "e2e init --help prints sub-help to stdout, exit 0" {
         .argv_tail = &.{ "init", "--help" },
         .expect = .{ .code = 0 },
         .stream = .stdout,
-        .needle = "gitstore init",
+        .needle = "zt init",
     });
 }
 
@@ -2196,7 +2245,7 @@ test "e2e hook --zsh --help surfaces help to stdout, exit 0" {
         .argv_tail = &.{ "hook", "--zsh", "--help" },
         .expect = .{ .code = 0 },
         .stream = .stdout,
-        .needle = "gitstore hook",
+        .needle = "zt hook",
     });
 }
 

@@ -21,7 +21,7 @@ pub const log = @import("log.zig");
 pub const hooks = @import("hooks.zig");
 
 // Existing gitstore.zig surface — re-exported flat for back-compat.
-const gs = @import("gitstore.zig");
+const gs = @import("z3store.zig");
 pub const adopt = gs.adopt;
 pub const adoptAll = gs.adoptAll;
 pub const detach = gs.detach;

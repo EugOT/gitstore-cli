@@ -16,7 +16,7 @@ const Io = std.Io;
 const Dir = std.Io.Dir;
 
 const ex = @import("exec.zig");
-const gitstore = @import("gitstore.zig");
+const gitstore = @import("z3store.zig");
 const url = @import("url.zig");
 
 /// Options threaded through `cloneOne` / `cloneMany`.

@@ -39,6 +39,7 @@ const env_whitelist = [_][]const u8{
     "TMPDIR",         "SSH_AUTH_SOCK",     "SSL_CERT_FILE",
     "SSL_CERT_DIR",   "NIX_SSL_CERT_FILE", "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME", "GHQ_ROOT",          "GITSTORE_ROOT",
+    "Z3STORE_ROOT",
 };
 
 /// Build a fresh env map containing only `env_whitelist` entries that are
@@ -154,19 +155,23 @@ const testing = std.testing;
 
 // ===== env_whitelist / buildScrubbedEnv tests =====
 
-test "env_whitelist contains GHQ_ROOT and GITSTORE_ROOT" {
-    // ghq honours GHQ_ROOT for repo location. gitstore-cli wraps `ghq root`
+test "env_whitelist contains GHQ_ROOT, GITSTORE_ROOT and Z3STORE_ROOT" {
+    // ghq honours GHQ_ROOT for repo location. zt wraps `ghq root`
     // and other ghq commands through exec() with a SCRUBBED env, so if
     // GHQ_ROOT is dropped here every adoptAll/detachAll/status call will
-    // resolve the wrong root. Same logic for gitstore's own GITSTORE_ROOT.
+    // resolve the wrong root. Same logic for the legacy GITSTORE_ROOT and the
+    // primary Z3STORE_ROOT store-root overrides.
     var has_ghq = false;
     var has_gitstore = false;
+    var has_z3store = false;
     for (env_whitelist) |key| {
         if (std.mem.eql(u8, key, "GHQ_ROOT")) has_ghq = true;
         if (std.mem.eql(u8, key, "GITSTORE_ROOT")) has_gitstore = true;
+        if (std.mem.eql(u8, key, "Z3STORE_ROOT")) has_z3store = true;
     }
     try testing.expect(has_ghq);
     try testing.expect(has_gitstore);
+    try testing.expect(has_z3store);
 }
 
 test "buildScrubbedEnv preserves whitelisted vars from parent env" {

@@ -12,7 +12,7 @@ const Io = std.Io;
 const Dir = std.Io.Dir;
 const File = std.Io.File;
 
-const gitstore = @import("gitstore.zig");
+const gitstore = @import("z3store.zig");
 const ex = @import("exec.zig");
 const cache = @import("cache.zig");
 
