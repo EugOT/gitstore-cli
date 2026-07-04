@@ -21,6 +21,7 @@ comptime {
     _ = @import("list.zig");
     _ = @import("cache.zig");
     _ = @import("clone.zig");
+    _ = @import("lore.zig");
     // main.zig hosts inline unit tests for its private dispatcher helpers
     // (getGitstoreRoot / getGhqRoot / resolveGhqRootOrHome) and e2e tests
     // that spawn the built gitstore binary. Force-importing it here makes the
@@ -2322,5 +2323,165 @@ test "e2e migrate real-mode is unimplemented, non-zero exit with stderr" {
         .expect = .nonzero,
         .stream = .stderr,
         .needle = "real-mode not implemented",
+    });
+}
+
+// =========================================================
+// EpicGames Lore workspace recognition (e2e)
+// =========================================================
+
+const lore = @import("lore.zig");
+
+const ZtOut = struct {
+    exit: u8,
+    stdout: []u8,
+    stderr: []u8,
+    fn deinit(self: *ZtOut, gpa: Allocator) void {
+        gpa.free(self.stdout);
+        gpa.free(self.stderr);
+    }
+};
+
+/// Spawn the built `zt` with an absolute-path argument and a throwaway HOME.
+/// Unlike `runE2eCase`, this returns the captured output so a test can assert
+/// on both streams AND inspect on-disk state afterwards (the no-mutation
+/// property for adopt-refusal).
+fn spawnZt(gpa: Allocator, io: Io, argv_tail: []const []const u8) !ZtOut {
+    const home = try uniqueTempDir(gpa, io, "/tmp/gitstore_lore_home");
+    defer {
+        Dir.cwd().deleteTree(io, home) catch {};
+        gpa.free(home);
+    }
+    const git_config = try uniqueTempFile(gpa, io, "/tmp/gitstore_lore", ".gitconfig");
+    defer {
+        Dir.cwd().deleteFile(io, git_config) catch {};
+        gpa.free(git_config);
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, build_options.zt_bin);
+    for (argv_tail) |a| try argv.append(gpa, a);
+
+    var env_map = try controlledEnv(gpa, home, git_config);
+    defer env_map.deinit();
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    try testing.expect(result.term == .exited);
+    return .{ .exit = result.term.exited, .stdout = result.stdout, .stderr = result.stderr };
+}
+
+/// Create a Lore workspace fixture at a unique /tmp dir. When `config_body` is
+/// non-null it is written to `.lore/config.toml`. Caller owns/deletes the dir.
+fn makeLoreFixture(gpa: Allocator, io: Io, config_body: ?[]const u8) ![]u8 {
+    const ws = try uniqueTempDir(gpa, io, "/tmp/gitstore_lore_ws");
+    const lore_dir = try std.fmt.allocPrint(gpa, "{s}/.lore", .{ws});
+    defer gpa.free(lore_dir);
+    try Dir.cwd().createDirPath(io, lore_dir);
+    const instance = try std.fmt.allocPrint(gpa, "{s}/instance", .{lore_dir});
+    defer gpa.free(instance);
+    try Dir.cwd().writeFile(io, .{ .sub_path = instance, .data = "0192f000-0000-7000-8000-000000000000\n" });
+    if (config_body) |body| {
+        const cfg = try std.fmt.allocPrint(gpa, "{s}/config.toml", .{lore_dir});
+        defer gpa.free(cfg);
+        try Dir.cwd().writeFile(io, .{ .sub_path = cfg, .data = body });
+    }
+    return ws;
+}
+
+test "e2e adopt refuses a lore-only workspace and mutates nothing" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const ws = try makeLoreFixture(gpa, io, null);
+    defer {
+        Dir.cwd().deleteTree(io, ws) catch {};
+        gpa.free(ws);
+    }
+
+    var out = try spawnZt(gpa, io, &.{ "adopt", ws });
+    defer out.deinit(gpa);
+
+    try testing.expect(out.exit != 0);
+    try testing.expect(std.mem.indexOf(u8, out.stderr, "Lore workspace") != null);
+    try testing.expect(std.mem.indexOf(u8, out.stderr, "lore shared-store") != null);
+
+    // No mutation: `.lore/instance` still present, no `.git` pointer created.
+    try testing.expect(lore.detectLoreWorkspace(io, ws));
+    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{ws});
+    defer gpa.free(git_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, git_path, .{}));
+}
+
+test "e2e lore subcommand reports shared-store config" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const ws = try makeLoreFixture(gpa, io,
+        \\[shared_store_to_use]
+        \\use_shared_store = true
+        \\shared_store_path = "/nonexistent/shared/store"
+        \\
+    );
+    defer {
+        Dir.cwd().deleteTree(io, ws) catch {};
+        gpa.free(ws);
+    }
+
+    var out = try spawnZt(gpa, io, &.{ "lore", ws });
+    defer out.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 0), out.exit);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "instance:") != null);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "shared_store: enabled") != null);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "MISSING") != null);
+}
+
+test "e2e lore subcommand rejects a non-lore path" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_lore_notlore");
+    defer {
+        Dir.cwd().deleteTree(io, dir) catch {};
+        gpa.free(dir);
+    }
+
+    var out = try spawnZt(gpa, io, &.{ "lore", dir });
+    defer out.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 1), out.exit);
+    try testing.expect(std.mem.indexOf(u8, out.stderr, "not a Lore workspace") != null);
+}
+
+test "e2e verify on a lore-only workspace reports metadata, exit 0" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const ws = try makeLoreFixture(gpa, io,
+        \\[shared_store_to_use]
+        \\use_shared_store = false
+        \\
+    );
+    defer {
+        Dir.cwd().deleteTree(io, ws) catch {};
+        gpa.free(ws);
+    }
+
+    var out = try spawnZt(gpa, io, &.{ "verify", ws });
+    defer out.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 0), out.exit);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "instance:") != null);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "shared_store: not configured") != null);
+}
+
+test "e2e lore subcommand help prints to stdout, exit 0" {
+    try runE2eCase(testing.allocator, testing.io, .{
+        .argv_tail = &.{ "lore", "--help" },
+        .expect = .{ .code = 0 },
+        .stream = .stdout,
+        .needle = "zt lore",
     });
 }

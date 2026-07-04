@@ -15,6 +15,7 @@ const File = std.Io.File;
 const gitstore = @import("z3store.zig");
 const ex = @import("exec.zig");
 const cache = @import("cache.zig");
+const lore = @import("lore.zig");
 
 /// One enumerated repository. All slices are heap-owned by the allocator
 /// passed to `walk()`. Call `deinit` to release them.
@@ -26,6 +27,11 @@ pub const RepoEntry = struct {
     name: []const u8,
     is_adopted: bool,
     has_jj: bool,
+    /// True when the directory is an EpicGames Lore workspace (`.lore/instance`
+    /// present). A repo may be both git AND lore; the flag is independent of
+    /// `is_adopted`/`has_jj`. Lore workspaces are marked ` [lore]` in plain
+    /// output and are never relocated (see `lore.zig`).
+    is_lore: bool = false,
     worktrees: [][]const u8,
     head_sha: ?[]const u8,
     last_fetched_unix: ?i64,
@@ -190,6 +196,7 @@ fn tryAppendRepo(
 
     const is_adopted = gitstore.isAdopted(io, abs_path, gitstore_root, gpa);
     const has_jj = hasJj(io, abs_path, gpa);
+    const is_lore = lore.detectLoreWorkspace(io, abs_path);
 
     var worktrees: [][]const u8 = &.{};
     // Always enumerate when a worktree-related thing is needed, or include_worktrees.
@@ -232,6 +239,7 @@ fn tryAppendRepo(
         .name = try gpa.dupe(u8, repo_name),
         .is_adopted = is_adopted,
         .has_jj = has_jj,
+        .is_lore = is_lore,
         .worktrees = worktrees,
         .head_sha = head_sha,
         .last_fetched_unix = last_fetched_unix,
@@ -271,6 +279,10 @@ fn isRepoDir(io: Io, abs_path: []const u8, gpa: Allocator) bool {
     const jj_path = std.fmt.allocPrint(gpa, "{s}/.jj", .{abs_path}) catch return false;
     defer gpa.free(jj_path);
     if (Dir.cwd().statFile(io, jj_path, .{})) |_| return true else |_| {}
+
+    // EpicGames Lore workspaces have neither `.git` nor `.jj` but should still
+    // surface in `zt list` (marked ` [lore]`), so recognize `.lore/instance`.
+    if (lore.detectLoreWorkspace(io, abs_path)) return true;
 
     return false;
 }
@@ -326,6 +338,9 @@ pub fn renderPlain(gpa: Allocator, entries: []const RepoEntry, full_path: bool) 
     for (entries) |e| {
         const line = if (full_path) e.abs_path else e.rel_path;
         try aw.writer.writeAll(line);
+        // Mark EpicGames Lore workspaces so operators know the tree carries
+        // non-relocatable `.lore/` metadata (see lore.zig).
+        if (e.is_lore) try aw.writer.writeAll(" [lore]");
         try aw.writer.writeByte('\n');
     }
     return aw.toOwnedSlice();
@@ -357,6 +372,8 @@ pub fn renderJson(gpa: Allocator, entries: []const RepoEntry) ![]u8 {
         try s.write(e.is_adopted);
         try s.objectField("has_jj");
         try s.write(e.has_jj);
+        try s.objectField("is_lore");
+        try s.write(e.is_lore);
         try s.objectField("worktrees");
         try s.beginArray();
         for (e.worktrees) |w| try s.write(w);
@@ -429,6 +446,16 @@ const WalkTestEnv = struct {
         const p = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.ghq_root, rel });
         defer self.gpa.free(p);
         try Dir.cwd().createDirPath(self.io, p);
+    }
+
+    /// Create a Lore-only workspace (`.lore/instance`) at `<ghq>/host/owner/name`.
+    fn createLoreWorkspace(self: *const WalkTestEnv, host: []const u8, owner: []const u8, name: []const u8) !void {
+        const lore_dir = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}/{s}/.lore", .{ self.ghq_root, host, owner, name });
+        defer self.gpa.free(lore_dir);
+        try Dir.cwd().createDirPath(self.io, lore_dir);
+        const instance = try std.fmt.allocPrint(self.gpa, "{s}/instance", .{lore_dir});
+        defer self.gpa.free(instance);
+        try Dir.cwd().writeFile(self.io, .{ .sub_path = instance, .data = "0192f000-0000-7000-8000-000000000000\n" });
     }
 
     /// Write a pointer file that marks the repo as adopted into gitstore.
@@ -593,6 +620,37 @@ test "list: renderPlain produces one line per entry" {
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expect(std.mem.indexOf(u8, text, "github.com/owner/a") != null);
     try testing.expect(std.mem.indexOf(u8, text, "github.com/owner/b") != null);
+}
+
+test "list: lore-only workspace is enumerated and marked [lore]" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env = try WalkTestEnv.setup(gpa, io, "loremark");
+    defer env.teardown();
+    try env.createGitRepo("github.com", "owner", "plaingit");
+    try env.createLoreWorkspace("github.com", "owner", "lorews");
+
+    const entries = try walk(gpa, io, env.ghq_root, env.gitstore_root, .{});
+    defer freeEntries(gpa, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+
+    var saw_lore = false;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.rel_path, "github.com/owner/lorews")) {
+            saw_lore = true;
+            try testing.expect(e.is_lore);
+            try testing.expect(!e.is_adopted);
+        } else {
+            try testing.expect(!e.is_lore);
+        }
+    }
+    try testing.expect(saw_lore);
+
+    const text = try renderPlain(gpa, entries, false);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "github.com/owner/lorews [lore]") != null);
+    // The plain git repo carries no marker.
+    try testing.expect(std.mem.indexOf(u8, text, "github.com/owner/plaingit [lore]") == null);
 }
 
 test "list: renderJson emits a top-level array" {

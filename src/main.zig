@@ -10,6 +10,7 @@ const url_mod = @import("url.zig");
 const config_mod = @import("config.zig");
 const clone_mod = @import("clone.zig");
 const list_mod = @import("list.zig");
+const lore = @import("lore.zig");
 
 const usage_text =
     \\Usage: zt <command> [options]
@@ -41,6 +42,7 @@ const usage_text =
     \\  filter            Print rclone filter rules to stdout
     \\  hook --zsh|--bash|--nu
     \\                    Print the shell wrapper for `ghq`->`zt`
+    \\  lore <path>       Report EpicGames Lore workspace (.lore/) status
     \\
     \\Global options:
     \\  --help, -h        Show this help message
@@ -73,6 +75,24 @@ const sub_help_hook =
     \\
     \\OPTIONS:
     \\   --help, -h                   Show this help
+    \\
+;
+
+const sub_help_lore =
+    \\NAME:
+    \\   zt lore — Report EpicGames Lore workspace (.lore/) status
+    \\
+    \\USAGE:
+    \\   zt lore <path>               Print Lore workspace metadata report
+    \\
+    \\OPTIONS:
+    \\   --help, -h                   Show this help
+    \\
+    \\NOTES:
+    \\   `.lore/` holds Lore's own workspace metadata (config.toml, instance,
+    \\   view) and is NOT relocatable — z3store never writes into it. To keep
+    \\   bulk data out of the worktree, use Lore's shared store: `lore shared-store`.
+    \\   See docs/LORE.md.
     \\
 ;
 
@@ -276,6 +296,104 @@ fn dirExists(io: Io, path: []const u8) bool {
     var d = Dir.openDirAbsolute(io, path, .{}) catch return false;
     d.close(io);
     return true;
+}
+
+/// True if `<dir>/<name>` exists (file, dir, or pointer). Used to probe for a
+/// repo's `.git`/`.jj` entries without allocating a persistent path.
+fn hasEntry(gpa: Allocator, io: Io, dir: []const u8, name: []const u8) bool {
+    const p = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name }) catch return false;
+    defer gpa.free(p);
+    _ = Dir.cwd().statFile(io, p, .{}) catch return false;
+    return true;
+}
+
+/// Resolve `p` against `base` when relative and report whether it exists. Lore's
+/// `shared_store_path` may be absolute or worktree-relative.
+fn sharedStoreExists(gpa: Allocator, io: Io, base: []const u8, p: []const u8) bool {
+    const full = if (p.len > 0 and p[0] == '/')
+        gpa.dupe(u8, p) catch return false
+    else
+        std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, p }) catch return false;
+    defer gpa.free(full);
+    _ = Dir.cwd().statFile(io, full, .{}) catch return false;
+    return true;
+}
+
+/// Print the Lore workspace report for `path` to stdout and return whether it
+/// is healthy (instance present, and any configured shared store resolves).
+/// Read-only: never writes into `.lore/`.
+fn writeLoreReport(gpa: Allocator, io: Io, path: []const u8) !bool {
+    var st = try lore.loreStatus(gpa, io, path);
+    defer st.deinit(gpa);
+
+    var buf: [4096]u8 = undefined;
+    var w = File.stdout().writerStreaming(io, &buf);
+    try w.interface.print("lore: workspace metadata at {s}/.lore\n", .{path});
+    try w.interface.print("  instance:    {s}\n", .{if (st.has_instance) "present" else "MISSING"});
+    try w.interface.print("  config.toml: {s}\n", .{if (st.has_config) "present" else "absent"});
+
+    var ok = st.has_instance;
+    if (st.shared_store_configured) {
+        if (st.shared_store_path) |sp| {
+            const exists = sharedStoreExists(gpa, io, path, sp);
+            try w.interface.print(
+                "  shared_store: enabled -> {s} ({s})\n",
+                .{ sp, if (exists) "exists" else "MISSING" },
+            );
+            if (!exists) ok = false;
+        } else {
+            try w.interface.print("  shared_store: enabled but no shared_store_path set\n", .{});
+        }
+    } else {
+        try w.interface.print("  shared_store: not configured\n", .{});
+    }
+    try w.flush();
+    return ok;
+}
+
+fn cmdLore(
+    gpa: Allocator,
+    io: Io,
+    args_iter: *std.process.Args.Iterator,
+) !u8 {
+    var path: ?[]const u8 = null;
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printOut(io, sub_help_lore);
+            return 0;
+        } else if (arg.len != 0 and arg[0] == '-') {
+            var buf: [512]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: unknown flag for lore: {s}\n", .{arg});
+            try w.flush();
+            return 2;
+        } else {
+            if (path != null) {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: lore takes at most one path: {s}\n", .{arg});
+                try w.flush();
+                return 2;
+            }
+            path = arg;
+        }
+    }
+
+    const p = path orelse {
+        try printErr(io, "error: lore requires <path>\n");
+        return 2;
+    };
+
+    if (!lore.detectLoreWorkspace(io, p)) {
+        var buf: [1024]u8 = undefined;
+        var w = File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("error: {s} is not a Lore workspace (no .lore/instance)\n", .{p});
+        try w.flush();
+        return 1;
+    }
+
+    _ = try writeLoreReport(gpa, io, p);
+    return 0;
 }
 
 /// Resolve the store root under $HOME.
@@ -658,6 +776,31 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
 
+        // Lore awareness (before any root resolution or mutation): a workspace
+        // whose ONLY VCS is EpicGames Lore (`.lore/`) cannot be adopted. Unlike
+        // git/jj, `.lore/` exposes no pointer/symlink indirection and its
+        // on-disk formats are pre-1.0 (see src/lore.zig); relocating it would
+        // corrupt the workspace. Refuse cleanly, mutate nothing.
+        if (!all) {
+            if (path) |p| {
+                if (lore.detectLoreWorkspace(io, p) and
+                    !hasEntry(gpa, io, p, ".git") and
+                    !hasEntry(gpa, io, p, ".jj"))
+                {
+                    var buf: [1024]u8 = undefined;
+                    var w = File.stderr().writerStreaming(io, &buf);
+                    try w.interface.print(
+                        "error: {s} is an EpicGames Lore workspace (.lore/) with no git/jj to adopt.\n" ++
+                            "  .lore/ is not relocatable and z3store never writes into it.\n" ++
+                            "  To keep bulk data out of the worktree, use Lore's own shared store: `lore shared-store`.\n",
+                        .{p},
+                    );
+                    try w.flush();
+                    return 1;
+                }
+            }
+        }
+
         // Resolve roots only after arg parse so `adopt --help` cannot fail
         // with error.ProcessFailed when ghq is not installed.
         const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
@@ -670,6 +813,17 @@ pub fn main(init: std.process.Init) !u8 {
             try gitstore.adoptAll(gpa, io, ghq_root, gitstore_root, dry_run);
         } else if (path) |p| {
             try gitstore.adopt(gpa, io, p, ghq_root, gitstore_root, dry_run);
+            // git+lore repo: git was adopted normally; note that the Lore
+            // metadata stays put (z3store never touches `.lore/`).
+            if (!dry_run and lore.detectLoreWorkspace(io, p)) {
+                var buf: [1024]u8 = undefined;
+                var w = File.stdout().writerStreaming(io, &buf);
+                try w.interface.print(
+                    "note: {s}/.lore left in place (Lore workspace metadata is not relocatable)\n",
+                    .{p},
+                );
+                try w.flush();
+            }
         }
         return 0;
     }
@@ -717,7 +871,23 @@ pub fn main(init: std.process.Init) !u8 {
         if (all) {
             try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
         } else if (path) |p| {
-            const ok = try gitstore.verify(gpa, io, p);
+            const has_git = hasEntry(gpa, io, p, ".git");
+            const is_lore = lore.detectLoreWorkspace(io, p);
+            var ok = true;
+            // Run the standard pointer/symlink verify whenever git is present,
+            // or when the path is neither git nor lore (so a genuinely broken
+            // path still surfaces the familiar "not adopted" failure). A
+            // lore-ONLY workspace skips git verify — it legitimately has no
+            // `.git` pointer.
+            if (has_git or !is_lore) {
+                ok = try gitstore.verify(gpa, io, p);
+            }
+            // On a Lore workspace, additionally report instance/config presence
+            // and shared-store resolution.
+            if (is_lore) {
+                const lore_ok = try writeLoreReport(gpa, io, p);
+                if (!lore_ok) ok = false;
+            }
             if (!ok) {
                 return 1;
             }
@@ -914,6 +1084,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, command, "migrate")) {
         return cmdMigrate(gpa, io, init.environ_map, &args_iter);
+    }
+
+    if (std.mem.eql(u8, command, "lore")) {
+        return cmdLore(gpa, io, &args_iter);
     }
 
     try printErr(io, "error: unknown command '");
