@@ -431,6 +431,37 @@ test "e2e adopt git-only repo" {
     try testing.expect(git_r.succeeded());
 }
 
+test "e2e adopt rolls back partial gitstore copy when cp fails" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "adopt_cp_failure");
+    defer gpa.free(repo);
+
+    const copied_first = try std.fmt.allocPrint(gpa, "{s}/.git/00-copied-before-failure", .{repo});
+    defer gpa.free(copied_first);
+    try Dir.cwd().writeFile(io, .{ .sub_path = copied_first, .data = "copied\n" });
+
+    const unreadable = try std.fmt.allocPrint(gpa, "{s}/.git/zz-unreadable", .{repo});
+    defer gpa.free(unreadable);
+    try Dir.cwd().writeFile(io, .{ .sub_path = unreadable, .data = "blocked\n" });
+    try Dir.cwd().setFilePermissions(io, unreadable, .fromMode(0), .{});
+    defer Dir.cwd().setFilePermissions(io, unreadable, .default_file, .{}) catch {};
+
+    try testing.expectError(error.ProcessFailed, gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false));
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const git_dest = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(git_dest);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, git_dest, .{}));
+
+    const original_git = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(original_git);
+    _ = try Dir.cwd().statFile(io, original_git, .{});
+}
+
 // =========================================================
 // E2E: adopt when jj binary is missing (regression #22)
 // =========================================================
@@ -2522,6 +2553,10 @@ fn expectLoreSnapshotEqual(expected: LoreSnapshot, actual: LoreSnapshot) !void {
 /// non-null it is written to `.lore/config.toml`. Caller owns/deletes the dir.
 fn makeLoreFixture(gpa: Allocator, io: Io, config_body: ?[]const u8) ![]u8 {
     const ws = try uniqueTempDir(gpa, io, "/tmp/gitstore_lore_ws");
+    errdefer {
+        Dir.cwd().deleteTree(io, ws) catch {};
+        gpa.free(ws);
+    }
     const lore_dir = try std.fmt.allocPrint(gpa, "{s}/.lore", .{ws});
     defer gpa.free(lore_dir);
     try Dir.cwd().createDirPath(io, lore_dir);

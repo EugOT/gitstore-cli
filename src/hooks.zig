@@ -63,8 +63,7 @@ pub const nu_hook =
     \\  } else if (which ghq | is-not-empty) {
     \\    ^ghq ...$args
     \\  } else {
-    \\    print -e "ghq(): neither zt nor ghq found on PATH"
-    \\    exit 127
+    \\    error make {msg: "ghq(): zt not found on PATH"}
     \\  }
     \\}
     \\
@@ -262,8 +261,9 @@ test "hook: nu falls back to ghq" {
     try testing.expect(mem.indexOf(u8, nu_hook, "^ghq ...$args") != null);
 }
 
-test "hook: nu exits 127 when neither tool present" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "exit 127") != null);
+test "hook: nu raises an error when zt is missing" {
+    try testing.expect(mem.indexOf(u8, nu_hook, "error make {msg: \"ghq(): zt not found on PATH\"}") != null);
+    try testing.expect(mem.indexOf(u8, nu_hook, "exit 127") == null);
 }
 
 test "hook: nu has no legacy diff-dance" {

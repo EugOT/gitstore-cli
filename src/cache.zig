@@ -442,6 +442,38 @@ test "cache: load falls back to legacy gitstore cache index" {
     try testing.expectEqual(@as(i64, 1_700_000_000), entry.last_fetched_unix.?);
 }
 
+test "cache: load prefers z3store cache index over stale legacy index" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const root = "/tmp/gitstore_cache_prefer_z3store_test";
+    Dir.cwd().deleteTree(io, root) catch {};
+    defer Dir.cwd().deleteTree(io, root) catch {};
+    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_prefer_z3store_test/.z3store/cache");
+    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_prefer_z3store_test/.gitstore/cache");
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/gitstore_cache_prefer_z3store_test/.z3store/cache/index.json",
+        .data =
+        \\{"version":1,"entries":[{"rel_path":"github.com/current/repo","url":"https://github.com/current/repo","head_sha":"z3abc","last_fetched_unix":1700000001}]}
+        ,
+    });
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/gitstore_cache_prefer_z3store_test/.gitstore/cache/index.json",
+        .data =
+        \\{"version":1,"entries":[{"rel_path":"github.com/stale/repo","url":"https://github.com/stale/repo","head_sha":"oldabc","last_fetched_unix":1}]}
+        ,
+    });
+
+    var loaded = try load(gpa, io, root);
+    defer freeMap(gpa, &loaded);
+
+    try testing.expectEqual(@as(u32, 1), loaded.count());
+    try testing.expect(loaded.get("github.com/stale/repo") == null);
+    const entry = loaded.get("github.com/current/repo") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("https://github.com/current/repo", entry.url.?);
+    try testing.expectEqualStrings("z3abc", entry.head_sha.?);
+    try testing.expectEqual(@as(i64, 1_700_000_001), entry.last_fetched_unix.?);
+}
+
 test "cache: load on corrupt json returns empty map" {
     const gpa = testing.allocator;
     const io = testing.io;

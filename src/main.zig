@@ -427,16 +427,20 @@ fn cmdLore(
 /// slice.
 fn getStoreRoot(gpa: Allocator, io: Io, environ_map: *const std.process.Environ.Map) ![]u8 {
     const home = environ_map.get("HOME") orelse return error.InvalidUserId;
-    const z3 = try std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
-    errdefer gpa.free(z3);
-    if (try dirExists(io, z3)) return z3;
-    gpa.free(z3);
-
-    const legacy = try std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
-    errdefer gpa.free(legacy);
-    if (try dirExists(io, legacy)) return legacy;
-    gpa.free(legacy);
-
+    // Each candidate's errdefer is scoped to its own block so it can never
+    // stay armed past the explicit free (double-free hazard otherwise).
+    {
+        const z3 = try std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
+        errdefer gpa.free(z3);
+        if (try dirExists(io, z3)) return z3;
+        gpa.free(z3);
+    }
+    {
+        const legacy = try std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
+        errdefer gpa.free(legacy);
+        if (try dirExists(io, legacy)) return legacy;
+        gpa.free(legacy);
+    }
     return std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
 }
 

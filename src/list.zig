@@ -180,7 +180,7 @@ fn tryAppendRepo(
     );
     errdefer gpa.free(rel_path);
 
-    const repo_status = detectRepoDirStatus(io, abs_path, gpa);
+    const repo_status = try detectRepoDirStatus(io, abs_path, gpa);
     if (!repo_status.is_repo) {
         gpa.free(abs_path);
         gpa.free(rel_path);
@@ -276,27 +276,27 @@ const RepoDirStatus = struct {
 /// A directory is considered a repo if it contains `.git` (dir or pointer
 /// file) or `.jj`. Non-git VCS (hg, svn, bzr) are intentionally skipped per
 /// libz3store v2 scope.
-fn detectRepoDirStatus(io: Io, abs_path: []const u8, gpa: Allocator) RepoDirStatus {
+fn detectRepoDirStatus(io: Io, abs_path: []const u8, gpa: Allocator) !RepoDirStatus {
     var is_repo = false;
 
-    const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{abs_path}) catch return .{
-        .is_repo = false,
-        .has_jj = false,
-        .is_lore = false,
-    };
+    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{abs_path});
     defer gpa.free(git_path);
-    if (Dir.cwd().statFile(io, git_path, .{})) |_| is_repo = true else |_| {}
+    if (Dir.cwd().statFile(io, git_path, .{})) |_| {
+        is_repo = true;
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => return err,
+    }
 
-    const jj_path = std.fmt.allocPrint(gpa, "{s}/.jj", .{abs_path}) catch return .{
-        .is_repo = false,
-        .has_jj = false,
-        .is_lore = false,
-    };
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{abs_path});
     defer gpa.free(jj_path);
     const has_jj = if (Dir.cwd().statFile(io, jj_path, .{})) |st| blk: {
         is_repo = true;
         break :blk st.kind == .directory;
-    } else |_| false;
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => false,
+        else => return err,
+    };
 
     // EpicGames Lore workspaces have neither `.git` nor `.jj` but should still
     // surface in `zt list` (marked ` [lore]`), so recognize `.lore/instance`.

@@ -457,6 +457,7 @@ pub fn adoptWithJjBinary(
     }
     if (!cp_result.succeeded()) {
         warn(io, "error: cp failed: {s}\n", .{cp_result.stderr});
+        Dir.cwd().deleteTree(io, git_dest) catch {};
         try oplog.logOperation(io, log_path, .copy, git_src, git_dest, "error: cp failed");
         return error.ProcessFailed;
     }
