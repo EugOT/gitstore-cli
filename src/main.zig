@@ -4,58 +4,60 @@ const File = std.Io.File;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 
-const gitstore = @import("gitstore.zig");
+const gitstore = @import("z3store.zig");
 const hooks = @import("hooks.zig");
 const url_mod = @import("url.zig");
 const config_mod = @import("config.zig");
 const clone_mod = @import("clone.zig");
 const list_mod = @import("list.zig");
+const lore = @import("lore.zig");
 
 const usage_text =
-    \\Usage: gitstore <command> [options]
+    \\Usage: zt <command> [options]
     \\
-    \\Run `gitstore <command> --help` (or `-h`) for per-command help.
+    \\Run `zt <command> --help` (or `-h`) for per-command help.
     \\
     \\Commands:
     \\  get [-u] [-P N] [--no-adopt] [--shallow] [-b BRANCH] <url>...
-    \\                    Clone one or more repos via libgitstore
+    \\                    Clone one or more repos into the store
     \\  list [-p] [-e] [--json] [--with-head] [<pattern>]
     \\                    List adopted/unadopted repos under ghq root
-    \\  root [--all]      Print configured ghq/gitstore root
+    \\  root [--all]      Print configured ghq/z3store root
     \\  rm [--dry-run] <repo>
     \\                    Remove a repo (detaches adopted pointer first)
     \\  create [--vcs git|jj] <host/owner/name>
     \\                    Create a new git+jj repo and adopt in one shot
     \\  migrate <new-root> [--dry-run]
     \\                    Plan/move adopted repos under a new ghq root
-    \\  init [<path>]     Create gitstore dir or init+adopt one-shot
+    \\  init [<path>]     Create z3store dir or init+adopt one-shot
     \\  adopt <path>|--all
-    \\                    Migrate existing repo(s) into gitstore
+    \\                    Migrate existing repo(s) into the store
     \\  detach <path>|--all [--keep-backup]
     \\                    Restore an adopted repo (reverse of adopt)
     \\  verify <path>|--all
     \\                    Check pointer/symlink integrity
-    \\  status [--json]   Show gitstore disk usage and repo count
+    \\  status [--json]   Show store disk usage and repo count
     \\  sync <remote> [--dry-run]
     \\                    Sync ghq working trees to rclone remote
     \\  filter            Print rclone filter rules to stdout
     \\  hook --zsh|--bash|--nu
-    \\                    Print the shell wrapper for `ghq`->`gitstore`
+    \\                    Print the shell wrapper for `ghq`->`zt`
+    \\  lore <path>       Report EpicGames Lore workspace (.lore/) status
     \\
     \\Global options:
     \\  --help, -h        Show this help message
     \\
-    \\See also: docs/MIGRATION-ghq-to-gitstore.md, https://github.com/EugOT/gitstore-cli
+    \\See also: docs/MIGRATION-ghq-to-gitstore.md, https://github.com/EugOT/z3store
     \\
 ;
 
 const sub_help_init =
     \\NAME:
-    \\   gitstore init — Create gitstore dir or init+adopt a repo in one shot
+    \\   zt init — Create z3store dir or init+adopt a repo in one shot
     \\
     \\USAGE:
-    \\   gitstore init                Ensure ~/.local/share/gitstore exists
-    \\   gitstore init <path>         git init + jj colocate + adopt at <path>
+    \\   zt init                      Ensure ~/.local/share/z3store exists
+    \\   zt init <path>               git init + jj colocate + adopt at <path>
     \\
     \\OPTIONS:
     \\   --help, -h                   Show this help
@@ -64,25 +66,43 @@ const sub_help_init =
 
 const sub_help_hook =
     \\NAME:
-    \\   gitstore hook — Print the shell wrapper that delegates ghq → gitstore
+    \\   zt hook — Print the shell wrapper that delegates ghq → zt
     \\
     \\USAGE:
-    \\   gitstore hook --zsh          Print zsh wrapper (source from .zshrc)
-    \\   gitstore hook --bash         Print bash wrapper (source from .bashrc)
-    \\   gitstore hook --nu           Print nushell module (source from config.nu)
+    \\   zt hook --zsh                Print zsh wrapper (source from .zshrc)
+    \\   zt hook --bash               Print bash wrapper (source from .bashrc)
+    \\   zt hook --nu                 Print nushell module (source from config.nu)
     \\
     \\OPTIONS:
     \\   --help, -h                   Show this help
     \\
 ;
 
-const sub_help_adopt =
+const sub_help_lore =
     \\NAME:
-    \\   gitstore adopt — Migrate an existing repo into gitstore (detach .git)
+    \\   zt lore — Report EpicGames Lore workspace (.lore/) status
     \\
     \\USAGE:
-    \\   gitstore adopt <path>        Adopt a single repo
-    \\   gitstore adopt --all         Adopt every git repo under ghq root
+    \\   zt lore <path>               Print Lore workspace metadata report
+    \\
+    \\OPTIONS:
+    \\   --help, -h                   Show this help
+    \\
+    \\NOTES:
+    \\   `.lore/` holds Lore's own workspace metadata (config.toml, instance,
+    \\   view) and is NOT relocatable — z3store never writes into it. To keep
+    \\   bulk data out of the worktree, use Lore's shared store: `lore shared-store`.
+    \\   See docs/LORE.md.
+    \\
+;
+
+const sub_help_adopt =
+    \\NAME:
+    \\   zt adopt — Migrate an existing repo into the store (detach .git)
+    \\
+    \\USAGE:
+    \\   zt adopt <path>              Adopt a single repo
+    \\   zt adopt --all               Adopt every git repo under ghq root
     \\
     \\OPTIONS:
     \\   --dry-run                    Print plan without touching disk
@@ -93,11 +113,11 @@ const sub_help_adopt =
 
 const sub_help_verify =
     \\NAME:
-    \\   gitstore verify — Check pointer/symlink integrity of adopted repos
+    \\   zt verify — Check pointer/symlink integrity of adopted repos
     \\
     \\USAGE:
-    \\   gitstore verify <path>       Verify a single adopted repo
-    \\   gitstore verify --all        Verify every adopted repo under ghq root
+    \\   zt verify <path>             Verify a single adopted repo
+    \\   zt verify --all              Verify every adopted repo under ghq root
     \\
     \\OPTIONS:
     \\   --all                        Recurse over the entire ghq root
@@ -107,27 +127,27 @@ const sub_help_verify =
 
 const sub_help_detach =
     \\NAME:
-    \\   gitstore detach — Reverse adopt: restore .git in the working tree
+    \\   zt detach — Reverse adopt: restore .git in the working tree
     \\
     \\USAGE:
-    \\   gitstore detach <path>       Detach a single adopted repo
-    \\   gitstore detach --all        Detach every adopted repo
+    \\   zt detach <path>             Detach a single adopted repo
+    \\   zt detach --all              Detach every adopted repo
     \\
     \\OPTIONS:
     \\   --dry-run                    Print plan without touching disk
     \\   --all                        Recurse over the entire ghq root
-    \\   --keep-backup                Rename the gitstore entry instead of deleting
+    \\   --keep-backup                Rename the store entry instead of deleting
     \\   --help, -h                   Show this help
     \\
 ;
 
 const sub_help_status =
     \\NAME:
-    \\   gitstore status — Show gitstore disk usage and repo counts
+    \\   zt status — Show store disk usage and repo counts
     \\
     \\USAGE:
-    \\   gitstore status              Plain text summary
-    \\   gitstore status --json       Machine-readable JSON
+    \\   zt status                    Plain text summary
+    \\   zt status --json             Machine-readable JSON
     \\
     \\OPTIONS:
     \\   --json                       Emit JSON instead of text
@@ -137,10 +157,10 @@ const sub_help_status =
 
 const sub_help_sync =
     \\NAME:
-    \\   gitstore sync — Push ghq working trees to an rclone remote
+    \\   zt sync — Push ghq working trees to an rclone remote
     \\
     \\USAGE:
-    \\   gitstore sync <remote>       e.g. gdrive:ghq
+    \\   zt sync <remote>             e.g. gdrive:ghq
     \\
     \\OPTIONS:
     \\   --dry-run                    Run rclone with --dry-run (shows what
@@ -148,16 +168,16 @@ const sub_help_sync =
     \\   --help, -h                   Show this help
     \\
     \\NOTES:
-    \\   Excludes .git/.jj internals + build artifacts; see `gitstore filter`.
+    \\   Excludes .git/.jj internals + build artifacts; see `zt filter`.
     \\
 ;
 
 const sub_help_filter =
     \\NAME:
-    \\   gitstore filter — Print rclone filter rules suitable for `--filter-from`
+    \\   zt filter — Print rclone filter rules suitable for `--filter-from`
     \\
     \\USAGE:
-    \\   gitstore filter > rclone-filter.txt
+    \\   zt filter > rclone-filter.txt
     \\
     \\OPTIONS:
     \\   --help, -h                   Show this help
@@ -166,10 +186,10 @@ const sub_help_filter =
 
 const sub_help_get =
     \\NAME:
-    \\   gitstore get — Clone repo(s); auto-adopt into gitstore unless --no-adopt
+    \\   zt get — Clone repo(s); auto-adopt into the store unless --no-adopt
     \\
     \\USAGE:
-    \\   gitstore get [options] <url>...
+    \\   zt get [options] <url>...
     \\
     \\OPTIONS:
     \\   -u, --update                 Pull latest if the repo already exists
@@ -181,7 +201,7 @@ const sub_help_get =
     \\   --help, -h                   Show this help
     \\
     \\URL FORMS:
-    \\   github.com/owner/repo, owner/repo, repo (uses gitstore.user default),
+    \\   github.com/owner/repo, owner/repo, repo (uses z3store.user default),
     \\   https://host/owner/repo[.git], git@host:owner/repo, ssh://...,
     \\   file:///abs/path
     \\
@@ -189,10 +209,10 @@ const sub_help_get =
 
 const sub_help_list =
     \\NAME:
-    \\   gitstore list — List repositories under the configured ghq root
+    \\   zt list — List repositories under the configured ghq root
     \\
     \\USAGE:
-    \\   gitstore list [options] [<pattern>]
+    \\   zt list [options] [<pattern>]
     \\
     \\OPTIONS:
     \\   -p, --full-path              Print full filesystem paths
@@ -212,11 +232,11 @@ const sub_help_list =
 
 const sub_help_root =
     \\NAME:
-    \\   gitstore root — Print the configured ghq/gitstore working-tree root
+    \\   zt root — Print the configured ghq/z3store working-tree root
     \\
     \\USAGE:
-    \\   gitstore root                Print the primary root
-    \\   gitstore root --all          Print all configured roots (v1: same as primary)
+    \\   zt root                      Print the primary root
+    \\   zt root --all                Print all configured roots (v1: same as primary)
     \\
     \\OPTIONS:
     \\   --all                        Print every root (v1 subset: prints primary)
@@ -226,28 +246,28 @@ const sub_help_root =
 
 const sub_help_rm =
     \\NAME:
-    \\   gitstore rm — Remove a repository (detaches adopted pointer first)
+    \\   zt rm — Remove a repository (detaches adopted pointer first)
     \\
     \\USAGE:
-    \\   gitstore rm [--dry-run] <repo>
+    \\   zt rm [--dry-run] <repo>
     \\
     \\OPTIONS:
     \\   --dry-run                    Print plan without touching disk
     \\   --help, -h                   Show this help
     \\
     \\<repo> is matched as exact rel_path or unique substring against
-    \\`gitstore list` output. If multiple repos match, the command refuses
+    \\`zt list` output. If multiple repos match, the command refuses
     \\to act and asks you to be more specific.
     \\
 ;
 
 const sub_help_create =
     \\NAME:
-    \\   gitstore create — Create a new git+jj repo and adopt in one shot
+    \\   zt create — Create a new git+jj repo and adopt in one shot
     \\
     \\USAGE:
-    \\   gitstore create <host/owner/name>
-    \\   gitstore create <owner/name>     (uses gitstore.user / default_host)
+    \\   zt create <host/owner/name>
+    \\   zt create <owner/name>       (uses z3store.user / default_host)
     \\
     \\OPTIONS:
     \\   --vcs git|jj                 (Accepted; v1 always git+jj colocate)
@@ -257,10 +277,10 @@ const sub_help_create =
 
 const sub_help_migrate =
     \\NAME:
-    \\   gitstore migrate — Move adopted repos under a new ghq root
+    \\   zt migrate — Move adopted repos under a new ghq root
     \\
     \\USAGE:
-    \\   gitstore migrate <new-root> --dry-run
+    \\   zt migrate <new-root> --dry-run
     \\
     \\OPTIONS:
     \\   --dry-run                    Print move plan without touching disk
@@ -271,9 +291,157 @@ const sub_help_migrate =
     \\
 ;
 
-fn getGitstoreRoot(gpa: Allocator, environ_map: *const std.process.Environ.Map) ![]u8 {
+/// True if an absolute directory path currently exists. Only genuine
+/// absence maps to false — other probe failures propagate so store-root
+/// selection can never silently fall back to the wrong store.
+fn dirExists(io: Io, path: []const u8) !bool {
+    var d = Dir.openDirAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    d.close(io);
+    return true;
+}
+
+fn statPathExists(io: Io, path: []const u8) !bool {
+    _ = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    return true;
+}
+
+/// True if `<dir>/<name>` exists (file, dir, or pointer). Used to probe for a
+/// repo's `.git`/`.jj` entries without allocating a persistent path.
+fn hasEntry(io: Io, dir: []const u8, name: []const u8) !bool {
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch return error.NameTooLong;
+    return statPathExists(io, p);
+}
+
+/// Resolve `p` against `base` when relative and report whether it exists. Lore's
+/// `shared_store_path` may be absolute or worktree-relative.
+fn sharedStoreExists(io: Io, base: []const u8, p: []const u8) !bool {
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const full = if (p.len > 0 and p[0] == '/')
+        std.fmt.bufPrint(&buf, "{s}", .{p}) catch return error.NameTooLong
+    else
+        std.fmt.bufPrint(&buf, "{s}/{s}", .{ base, p }) catch return error.NameTooLong;
+    return statPathExists(io, full);
+}
+
+/// Print the Lore workspace report for `path` to stdout and return whether it
+/// is healthy (instance present, and any configured shared store resolves).
+/// Read-only: never writes into `.lore/`.
+fn writeLoreReport(gpa: Allocator, io: Io, path: []const u8) !bool {
+    var st = try lore.loreStatus(gpa, io, path);
+    defer st.deinit(gpa);
+
+    var buf: [4096]u8 = undefined;
+    var w = File.stdout().writerStreaming(io, &buf);
+    try w.interface.print("lore: workspace metadata at {s}/.lore\n", .{path});
+    try w.interface.print("  instance:    {s}\n", .{if (st.has_instance) "present" else "MISSING"});
+    try w.interface.print("  config.toml: {s}\n", .{
+        if (st.config_parse_failed) "present (parse failed)" else if (st.has_config) "present" else "absent",
+    });
+
+    var ok = st.has_instance;
+    if (st.shared_store_configured) {
+        if (st.shared_store_path) |sp| {
+            if (sp.len == 0) {
+                // Enabled with an empty path is as unresolvable as no path.
+                try w.interface.print("  shared_store: enabled but shared_store_path is empty\n", .{});
+                ok = false;
+            } else {
+                const exists = try sharedStoreExists(io, path, sp);
+                try w.interface.print(
+                    "  shared_store: enabled -> {s} ({s})\n",
+                    .{ sp, if (exists) "exists" else "MISSING" },
+                );
+                if (!exists) ok = false;
+            }
+        } else {
+            try w.interface.print("  shared_store: enabled but no shared_store_path set\n", .{});
+            ok = false;
+        }
+    } else {
+        try w.interface.print("  shared_store: not configured\n", .{});
+    }
+    if (st.config_parse_failed) ok = false;
+    try w.flush();
+    return ok;
+}
+
+fn cmdLore(
+    gpa: Allocator,
+    io: Io,
+    args_iter: *std.process.Args.Iterator,
+) !u8 {
+    var path: ?[]const u8 = null;
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printOut(io, sub_help_lore);
+            return 0;
+        } else if (arg.len != 0 and arg[0] == '-') {
+            var buf: [512]u8 = undefined;
+            var w = File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("error: unknown flag for lore: {s}\n", .{arg});
+            try w.flush();
+            return 2;
+        } else {
+            if (path != null) {
+                var buf: [512]u8 = undefined;
+                var w = File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("error: lore takes at most one path: {s}\n", .{arg});
+                try w.flush();
+                return 2;
+            }
+            path = arg;
+        }
+    }
+
+    const p = path orelse {
+        try printErr(io, "error: lore requires <path>\n");
+        return 2;
+    };
+
+    if (!try lore.hasLoreWorkspaceMarker(io, p)) {
+        var buf: [1024]u8 = undefined;
+        var w = File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("error: {s} is not a Lore workspace (missing .lore/instance marker)\n", .{p});
+        try w.flush();
+        return 1;
+    }
+
+    const ok = try writeLoreReport(gpa, io, p);
+    return if (ok) 0 else 1;
+}
+
+/// Resolve the store root under $HOME.
+///
+/// Prefers `$HOME/.local/share/z3store` when it already exists; otherwise
+/// falls back to the LEGACY `$HOME/.local/share/gitstore` when only that
+/// exists (adopted repos hold absolute `gitdir:` pointer paths into it, so it
+/// must NEVER be moved or migrated); otherwise defaults to the new
+/// `$HOME/.local/share/z3store` for fresh stores. Caller owns the returned
+/// slice.
+fn getStoreRoot(gpa: Allocator, io: Io, environ_map: *const std.process.Environ.Map) ![]u8 {
     const home = environ_map.get("HOME") orelse return error.InvalidUserId;
-    return std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
+    // Each candidate's errdefer is scoped to its own block so it can never
+    // stay armed past the explicit free (double-free hazard otherwise).
+    {
+        const z3 = try std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
+        errdefer gpa.free(z3);
+        if (try dirExists(io, z3)) return z3;
+        gpa.free(z3);
+    }
+    {
+        const legacy = try std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
+        errdefer gpa.free(legacy);
+        if (try dirExists(io, legacy)) return legacy;
+        gpa.free(legacy);
+    }
+    return std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
 }
 
 fn getGhqRoot(gpa: Allocator, io: Io) ![]u8 {
@@ -320,24 +488,86 @@ fn resolveGhqRootOrHome(gpa: Allocator, io: Io, environ_map: *const std.process.
 // testing allocator's leak detector pins any allocPrint that is not released.
 // =========================================================
 
-test "getGitstoreRoot returns <HOME>/.local/share/gitstore" {
-    const gpa = std.testing.allocator;
-    var env_map: std.process.Environ.Map = .init(gpa);
-    defer env_map.deinit();
-    try env_map.put("HOME", "/test/home");
-
-    const root = try getGitstoreRoot(gpa, &env_map);
-    defer gpa.free(root);
-    try std.testing.expectEqualStrings("/test/home/.local/share/gitstore", root);
+fn deleteTreeIfExists(io: Io, path: []const u8) !void {
+    _ = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    try Dir.cwd().deleteTree(io, path);
 }
 
-test "getGitstoreRoot errors when HOME is absent" {
+fn deleteTreeIfExistsOrPanic(io: Io, path: []const u8) void {
+    deleteTreeIfExists(io, path) catch |err| {
+        std.debug.panic("test cleanup failed for {s}: {s}", .{ path, @errorName(err) });
+    };
+}
+
+test "getStoreRoot defaults to <HOME>/.local/share/z3store when neither dir exists" {
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home = "/tmp/z3s_test_home_none";
+    // Ensure a pristine HOME so neither store dir exists.
+    try deleteTreeIfExists(io, home);
+    defer deleteTreeIfExistsOrPanic(io, home);
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+
+    const root = try getStoreRoot(gpa, io, &env_map);
+    defer gpa.free(root);
+    try std.testing.expectEqualStrings("/tmp/z3s_test_home_none/.local/share/z3store", root);
+}
+
+test "getStoreRoot prefers z3store dir when it exists" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home = "/tmp/z3s_test_home_z3";
+    try deleteTreeIfExists(io, home);
+    defer deleteTreeIfExistsOrPanic(io, home);
+    // Both legacy and new dirs present -> new z3store must win.
+    try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_z3/.local/share/z3store");
+    try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_z3/.local/share/gitstore");
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+
+    const root = try getStoreRoot(gpa, io, &env_map);
+    defer gpa.free(root);
+    try std.testing.expectEqualStrings("/tmp/z3s_test_home_z3/.local/share/z3store", root);
+}
+
+test "getStoreRoot uses legacy gitstore dir when only it exists" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home = "/tmp/z3s_test_home_legacy";
+    try deleteTreeIfExists(io, home);
+    defer deleteTreeIfExistsOrPanic(io, home);
+    // Only the legacy gitstore dir exists (adopted repos point into it).
+    try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_legacy/.local/share/gitstore");
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+
+    const root = try getStoreRoot(gpa, io, &env_map);
+    defer gpa.free(root);
+    try std.testing.expectEqualStrings("/tmp/z3s_test_home_legacy/.local/share/gitstore", root);
+}
+
+test "getStoreRoot errors when HOME is absent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
     var env_map: std.process.Environ.Map = .init(gpa);
     defer env_map.deinit();
     // Intentionally leave HOME unset.
 
-    try std.testing.expectError(error.InvalidUserId, getGitstoreRoot(gpa, &env_map));
+    try std.testing.expectError(error.InvalidUserId, getStoreRoot(gpa, io, &env_map));
+}
+
+test "usage_text starts with 'Usage: zt'" {
+    try std.testing.expect(std.mem.startsWith(u8, usage_text, "Usage: zt"));
 }
 
 // DISCREPANCY vs the task's HELPERS testSpec: `std.testing.io` is a real
@@ -458,9 +688,6 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "init")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-
         // init with a path: create git+jj repo and adopt in one shot.
         // Scan ALL args (not just the first) so `init /path --help` and
         // `init --help /path` both surface help, and so unknown flags are
@@ -489,15 +716,19 @@ pub fn main(init: std.process.Init) !u8 {
             path = arg;
         }
         if (path) |p| {
+            const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
+            defer gpa.free(gitstore_root);
             const ghq_root = try getGhqRoot(gpa, io);
             defer gpa.free(ghq_root);
             try gitstore.initRepo(gpa, io, p, ghq_root, gitstore_root);
         } else {
+            const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
+            defer gpa.free(gitstore_root);
             // No path: just ensure gitstore root directory exists
             try gitstore.init(io, gitstore_root);
             var buf: [4096]u8 = undefined;
             var w = File.stdout().writerStreaming(io, &buf);
-            try w.interface.print("gitstore initialized at {s}\n", .{gitstore_root});
+            try w.interface.print("z3store initialized at {s}\n", .{gitstore_root});
             try w.flush();
         }
         return 0;
@@ -587,9 +818,35 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
 
+        // Lore awareness (before any root resolution or mutation): a workspace
+        // whose ONLY VCS is EpicGames Lore (`.lore/`) cannot be adopted. Unlike
+        // git/jj, `.lore/` exposes no pointer/symlink indirection and its
+        // on-disk formats are pre-1.0 (see src/lore.zig); relocating it would
+        // corrupt the workspace. Refuse cleanly, mutate nothing.
+        if (!all) {
+            if (path) |p| {
+                if (lore.detectLoreWorkspace(io, p)) {
+                    const has_git = try hasEntry(io, p, ".git");
+                    const has_jj = try hasEntry(io, p, ".jj");
+                    if (!has_git and !has_jj) {
+                        var buf: [1024]u8 = undefined;
+                        var w = File.stderr().writerStreaming(io, &buf);
+                        try w.interface.print(
+                            "error: {s} is an EpicGames Lore workspace (.lore/) with no git/jj to adopt.\n" ++
+                                "  .lore/ is not relocatable and z3store never writes into it.\n" ++
+                                "  To keep bulk data out of the worktree, use Lore's own shared store: `lore shared-store`.\n",
+                            .{p},
+                        );
+                        try w.flush();
+                        return 1;
+                    }
+                }
+            }
+        }
+
         // Resolve roots only after arg parse so `adopt --help` cannot fail
         // with error.ProcessFailed when ghq is not installed.
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
         defer gpa.free(gitstore_root);
         const ghq_root = try getGhqRoot(gpa, io);
         defer gpa.free(ghq_root);
@@ -599,6 +856,17 @@ pub fn main(init: std.process.Init) !u8 {
             try gitstore.adoptAll(gpa, io, ghq_root, gitstore_root, dry_run);
         } else if (path) |p| {
             try gitstore.adopt(gpa, io, p, ghq_root, gitstore_root, dry_run);
+            // git+lore repo: git was adopted normally; note that the Lore
+            // metadata stays put (z3store never touches `.lore/`).
+            if (!dry_run and lore.detectLoreWorkspace(io, p)) {
+                var buf: [1024]u8 = undefined;
+                var w = File.stdout().writerStreaming(io, &buf);
+                try w.interface.print(
+                    "note: {s}/.lore left in place (Lore workspace metadata is not relocatable)\n",
+                    .{p},
+                );
+                try w.flush();
+            }
         }
         return 0;
     }
@@ -638,7 +906,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // Resolve roots only after arg parse so `verify --help` cannot fail
         // when ghq is not installed.
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
         defer gpa.free(gitstore_root);
         const ghq_root = try getGhqRoot(gpa, io);
         defer gpa.free(ghq_root);
@@ -646,7 +914,24 @@ pub fn main(init: std.process.Init) !u8 {
         if (all) {
             try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
         } else if (path) |p| {
-            const ok = try gitstore.verify(gpa, io, p);
+            const has_git = try hasEntry(io, p, ".git");
+            const has_jj = try hasEntry(io, p, ".jj");
+            const is_lore = lore.detectLoreWorkspace(io, p);
+            var ok = true;
+            // Run the standard pointer/symlink verify whenever git is present,
+            // whenever jj metadata is present, or when the path is neither
+            // git/jj nor lore (so a genuinely broken path still surfaces the
+            // familiar "not adopted" failure). A lore-ONLY workspace skips git
+            // verify — it legitimately has no `.git` pointer.
+            if (has_git or has_jj or !is_lore) {
+                ok = try gitstore.verify(gpa, io, p);
+            }
+            // On a Lore workspace, additionally report instance/config presence
+            // and shared-store resolution.
+            if (is_lore) {
+                const lore_ok = try writeLoreReport(gpa, io, p);
+                if (!lore_ok) ok = false;
+            }
             if (!ok) {
                 return 1;
             }
@@ -694,7 +979,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // Resolve roots only after arg parse so `detach --help` cannot fail
         // when ghq is not installed.
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
         defer gpa.free(gitstore_root);
         const ghq_root = try getGhqRoot(gpa, io);
         defer gpa.free(ghq_root);
@@ -738,7 +1023,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // Resolve roots only after arg parse so `status --help` cannot fail
         // when ghq is not installed.
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
         defer gpa.free(gitstore_root);
         const ghq_root = try getGhqRoot(gpa, io);
         defer gpa.free(ghq_root);
@@ -781,7 +1066,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // Resolve roots only after arg parse so `sync --help` cannot fail
         // when ghq is not installed.
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
+        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
         defer gpa.free(gitstore_root);
         const ghq_root = try getGhqRoot(gpa, io);
         defer gpa.free(ghq_root);
@@ -819,7 +1104,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    // --- libgitstore v2 subcommands ---
+    // --- libz3store v2 subcommands ---
 
     if (std.mem.eql(u8, command, "get")) {
         return cmdGet(gpa, io, init.environ_map, &args_iter);
@@ -845,6 +1130,10 @@ pub fn main(init: std.process.Init) !u8 {
         return cmdMigrate(gpa, io, init.environ_map, &args_iter);
     }
 
+    if (std.mem.eql(u8, command, "lore")) {
+        return cmdLore(gpa, io, &args_iter);
+    }
+
     try printErr(io, "error: unknown command '");
     try printErr(io, command);
     try printErr(io, "'\n");
@@ -853,8 +1142,16 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 // =========================================================
-// libgitstore v2 subcommand implementations
+// libz3store v2 subcommand implementations
 // =========================================================
+
+fn printLegacyConfigHint(io: Io, cfg: *const config_mod.Config) !void {
+    if (!cfg.used_legacy) return;
+    try printErr(
+        io,
+        "warning: using legacy gitstore.*/ghq.* config or GITSTORE_ROOT/GHQ_ROOT; prefer z3store.* / Z3STORE_ROOT\n",
+    );
+}
 
 fn cmdGet(
     gpa: Allocator,
@@ -912,17 +1209,19 @@ fn cmdGet(
     };
     defer cfg.deinit(gpa);
 
-    if (cfg.used_legacy_ghq_keys) {
-        try printErr(
-            io,
-            "warning: using ghq.* config keys; prefer gitstore.* equivalents\n",
-        );
-    }
+    try printLegacyConfigHint(io, &cfg);
 
-    // Resolve gitstore root (for adoption side effect).
-    const gitstore_root = try getGitstoreRoot(gpa, environ_map);
-    defer gpa.free(gitstore_root);
-    try gitstore.init(io, gitstore_root);
+    // Resolve gitstore root only for the adoption side effect. With
+    // --no-adopt nothing will be written to the store, so don't require the
+    // store root to be discoverable or creatable.
+    var gitstore_root_owned: ?[]u8 = null;
+    defer if (gitstore_root_owned) |root| gpa.free(root);
+    const gitstore_root: []const u8 = if (opts.no_adopt) "" else blk: {
+        const root = try getStoreRoot(gpa, io, environ_map);
+        gitstore_root_owned = root;
+        try gitstore.init(io, root);
+        break :blk root;
+    };
 
     // Parse URLs into specs.
     var specs: std.ArrayList(url_mod.RepoSpec) = .empty;
@@ -1021,7 +1320,7 @@ fn cmdList(
         }
     }
 
-    const gitstore_root = try getGitstoreRoot(gpa, environ_map);
+    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
     defer gpa.free(gitstore_root);
     const ghq_root = try resolveGhqRootOrHome(gpa, io, environ_map);
     defer gpa.free(ghq_root);
@@ -1095,6 +1394,8 @@ fn cmdRoot(
     };
     defer cfg.deinit(gpa);
 
+    try printLegacyConfigHint(io, &cfg);
+
     var buf: [4096]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &buf);
     try w.interface.print("{s}\n", .{cfg.root});
@@ -1129,7 +1430,7 @@ fn cmdRm(
         return 2;
     };
 
-    const gitstore_root = try getGitstoreRoot(gpa, environ_map);
+    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
     defer gpa.free(gitstore_root);
     const ghq_root = try resolveGhqRootOrHome(gpa, io, environ_map);
     defer gpa.free(ghq_root);
@@ -1248,6 +1549,8 @@ fn cmdCreate(
     };
     defer cfg.deinit(gpa);
 
+    try printLegacyConfigHint(io, &cfg);
+
     // Parse via url.parse to canonicalize host/owner/name.
     var spec = url_mod.parse(gpa, name, .{
         .user = cfg.user,
@@ -1264,7 +1567,7 @@ fn cmdCreate(
     const repo_path = try spec.toStoragePath(gpa, cfg.root);
     defer gpa.free(repo_path);
 
-    const gitstore_root = try getGitstoreRoot(gpa, environ_map);
+    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
     defer gpa.free(gitstore_root);
 
     // initRepo already handles: git init, optional jj colocate, adopt.
@@ -1304,7 +1607,7 @@ fn cmdMigrate(
         return 2;
     };
 
-    const gitstore_root = try getGitstoreRoot(gpa, environ_map);
+    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
     defer gpa.free(gitstore_root);
     const ghq_root = try resolveGhqRootOrHome(gpa, io, environ_map);
     defer gpa.free(ghq_root);
@@ -1344,7 +1647,7 @@ fn cmdMigrate(
     // Real-mode migration is intentionally deferred: moving gitstore_root
     // entries, rewriting .git pointers, and running `git worktree repair`
     // require the WAL-backed operation log to stay crash-consistent. The
-    // libgitstore v2 plan explicitly permits a dry-run-only v1 subset.
+    // libz3store v2 plan explicitly permits a dry-run-only v1 subset.
     try printErr(
         io,
         "error: migrate real-mode not implemented; rerun with --dry-run\n",

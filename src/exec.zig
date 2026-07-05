@@ -27,8 +27,8 @@ pub const ExecError = std.process.RunError;
 /// `GIT_CONFIG_VALUE_<i>` and `GIT_DIR` / `GIT_OBJECT_DIRECTORY` /
 /// `GIT_*` overrides at runtime. A caller (or an attacker who controls a
 /// hook context, sudo wrapper, etc.) could otherwise inject e.g.
-/// `core.fsmonitor=/tmp/evil.sh` and have gitstore execute it. By passing
-/// only a fresh, scrubbed map to the child, gitstore neutralises this
+/// `core.fsmonitor=/tmp/evil.sh` and have z3store execute it. By passing
+/// only a fresh, scrubbed map to the child, z3store neutralises this
 /// injection vector while preserving the env vars users legitimately need
 /// (PATH for tool lookup, HOME / XDG_* for git config discovery,
 /// SSH_AUTH_SOCK for ssh-key clones, SSL_CERT_* for TLS, etc.).
@@ -39,6 +39,7 @@ const env_whitelist = [_][]const u8{
     "TMPDIR",         "SSH_AUTH_SOCK",     "SSL_CERT_FILE",
     "SSL_CERT_DIR",   "NIX_SSL_CERT_FILE", "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME", "GHQ_ROOT",          "GITSTORE_ROOT",
+    "Z3STORE_ROOT",
 };
 
 /// Build a fresh env map containing only `env_whitelist` entries that are
@@ -74,7 +75,7 @@ fn buildScrubbedEnv(gpa: Allocator) Allocator.Error!std.process.Environ.Map {
 /// `std.process.Environ.Map`. Builds from `std.c.environ` when libc is
 /// linked (the standard POSIX path, including under `zig build test`
 /// where the test binary inherits the parent shell's environ). Returns
-/// an empty map on no-libc targets — gitstore's spawned subprocesses
+/// an empty map on no-libc targets — z3store's spawned subprocesses
 /// then run with only the explicit whitelist values, which is the
 /// security contract this function exists to maintain.
 ///
@@ -154,19 +155,23 @@ const testing = std.testing;
 
 // ===== env_whitelist / buildScrubbedEnv tests =====
 
-test "env_whitelist contains GHQ_ROOT and GITSTORE_ROOT" {
-    // ghq honours GHQ_ROOT for repo location. gitstore-cli wraps `ghq root`
+test "env_whitelist contains GHQ_ROOT, GITSTORE_ROOT and Z3STORE_ROOT" {
+    // ghq honours GHQ_ROOT for repo location. zt wraps `ghq root`
     // and other ghq commands through exec() with a SCRUBBED env, so if
     // GHQ_ROOT is dropped here every adoptAll/detachAll/status call will
-    // resolve the wrong root. Same logic for gitstore's own GITSTORE_ROOT.
+    // resolve the wrong root. Same logic for the legacy GITSTORE_ROOT and the
+    // primary Z3STORE_ROOT store-root overrides.
     var has_ghq = false;
     var has_gitstore = false;
+    var has_z3store = false;
     for (env_whitelist) |key| {
         if (std.mem.eql(u8, key, "GHQ_ROOT")) has_ghq = true;
         if (std.mem.eql(u8, key, "GITSTORE_ROOT")) has_gitstore = true;
+        if (std.mem.eql(u8, key, "Z3STORE_ROOT")) has_z3store = true;
     }
     try testing.expect(has_ghq);
     try testing.expect(has_gitstore);
+    try testing.expect(has_z3store);
 }
 
 test "buildScrubbedEnv preserves whitelisted vars from parent env" {

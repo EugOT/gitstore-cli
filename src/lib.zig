@@ -1,13 +1,13 @@
-//! Public entry for libgitstore.
+//! Public entry for libz3store.
 //!
 //! Consumers import this as:
-//!   const gitstore = @import("gitstore");
-//!   _ = gitstore.url.parse(...);
-//!   _ = gitstore.clone.cloneMany(...);
-//!   _ = gitstore.list.walk(...);
-//!   // existing gitstore.zig surface also re-exported flat:
-//!   _ = gitstore.adopt(...);
-//!   _ = gitstore.verify(...);
+//!   const z3store = @import("z3store");
+//!   _ = z3store.url.parse(...);
+//!   _ = z3store.clone.cloneMany(...);
+//!   _ = z3store.list.walk(...);
+//!   // existing flat surface also re-exported for back-compat:
+//!   _ = z3store.adopt(...);
+//!   _ = z3store.verify(...);
 
 const std = @import("std");
 
@@ -20,8 +20,8 @@ pub const exec = @import("exec.zig");
 pub const log = @import("log.zig");
 pub const hooks = @import("hooks.zig");
 
-// Existing gitstore.zig surface — re-exported flat for back-compat.
-const gs = @import("gitstore.zig");
+// Existing flat surface — re-exported for back-compat.
+const gs = @import("z3store.zig");
 pub const adopt = gs.adopt;
 pub const adoptAll = gs.adoptAll;
 pub const detach = gs.detach;
@@ -42,10 +42,10 @@ pub const rewriteJjGitTargetRelative = gs.rewriteJjGitTargetRelative;
 
 test "lib: public url parser smoke" {
     const gpa = std.testing.allocator;
-    var spec = try url.parse(gpa, "github.com/EugOT/gitstore-cli", .{});
+    var spec = try url.parse(gpa, "github.com/EugOT/z3store", .{});
     defer spec.deinit(gpa);
 
     try std.testing.expectEqualStrings("github.com", spec.host);
     try std.testing.expectEqualStrings("EugOT", spec.owner);
-    try std.testing.expectEqualStrings("gitstore-cli", spec.name);
+    try std.testing.expectEqualStrings("z3store", spec.name);
 }

@@ -1,92 +1,95 @@
 /// Shell hook string literals and rclone filter rules.
-/// Printed to stdout by "gitstore hook --zsh", "gitstore hook --bash", "gitstore hook --nu".
+/// Printed to stdout by "zt hook --zsh", "zt hook --bash", "zt hook --nu".
 ///
-/// libgitstore v2 design: `gitstore` now has native get/list/root/rm/create/migrate
+/// z3store design: `zt` now has native get/list/root/rm/create/migrate
 /// subcommands. The ghq() shell function is a thin passthrough — no more
-/// before/after `ghq list` diff dance. Adoption happens inside `gitstore get`.
+/// before/after `ghq list` diff dance. Adoption happens inside `zt get`.
 pub const zsh_hook =
-    \\# gitstore-ghq-hook.zsh — transparent ghq→gitstore passthrough
+    \\# z3store-ghq-hook.zsh — transparent ghq→zt passthrough
     \\# Source this file in your .zshrc or place it in ~/.config/zsh/functions/
     \\#
-    \\# Shadows the ghq command with a passthrough to `gitstore`. All ghq
+    \\# Shadows the ghq command with a passthrough to `zt`. All ghq
     \\# subcommands (get, list, root, rm, create, migrate) map 1:1 to the same
-    \\# subcommand on `gitstore`. Adoption into the gitstore layout happens
-    \\# inside `gitstore get` — no shell-side diff dance.
+    \\# subcommand on `zt`. Adoption into the z3store layout happens
+    \\# inside `zt get` — no shell-side diff dance.
     \\#
-    \\# If `gitstore` is absent from PATH, falls back to the real ghq binary.
+    \\# If `zt` is absent from PATH, falls back to the real ghq binary.
     \\
     \\ghq() {
-    \\  if command -v gitstore >/dev/null 2>&1; then
-    \\    command gitstore "$@"
-    \\  elif command -v ghq >/dev/null 2>&1; then
+    \\  if whence -p zt >/dev/null 2>&1; then
+    \\    command zt "$@"
+    \\  elif whence -p ghq >/dev/null 2>&1; then
     \\    command ghq "$@"
     \\  else
-    \\    echo "ghq(): neither gitstore nor ghq found on PATH" >&2
+    \\    echo "ghq(): neither zt nor ghq found on PATH" >&2
     \\    return 127
     \\  fi
     \\}
 ;
 
 pub const bash_hook =
-    \\# gitstore-ghq-hook.bash — transparent ghq→gitstore passthrough
+    \\# z3store-ghq-hook.bash — transparent ghq→zt passthrough
     \\# Source this file in your .bashrc or .bash_profile.
     \\#
-    \\# Shadows the ghq command with a passthrough to `gitstore`. All ghq
-    \\# subcommands map 1:1. Adoption happens inside `gitstore get` — no
+    \\# Shadows the ghq command with a passthrough to `zt`. All ghq
+    \\# subcommands map 1:1. Adoption happens inside `zt get` — no
     \\# shell-side diff dance.
     \\#
-    \\# If `gitstore` is absent from PATH, falls back to the real ghq binary.
+    \\# If `zt` is absent from PATH, falls back to the real ghq binary.
     \\
     \\ghq() {
-    \\  if command -v gitstore >/dev/null 2>&1; then
-    \\    command gitstore "$@"
-    \\  elif command -v ghq >/dev/null 2>&1; then
+    \\  if type -P zt >/dev/null 2>&1; then
+    \\    command zt "$@"
+    \\  elif type -P ghq >/dev/null 2>&1; then
     \\    command ghq "$@"
     \\  else
-    \\    echo "ghq(): neither gitstore nor ghq found on PATH" >&2
+    \\    echo "ghq(): neither zt nor ghq found on PATH" >&2
     \\    return 127
     \\  fi
     \\}
 ;
 
 pub const nu_hook =
-    \\# gitstore.nu — nushell module for gitstore integration
-    \\# Usage: use gitstore.nu
+    \\# z3store.nu — nushell module for z3store integration
+    \\# Usage: use z3store.nu
     \\#
-    \\# Transparent ghq→gitstore passthrough. `gitstore` has native
+    \\# Transparent ghq→zt passthrough. `zt` has native
     \\# get/list/root/rm/create/migrate, so the wrapper forwards all args.
-    \\# Falls back to real ghq binary if gitstore is not installed.
+    \\# Falls back to real ghq binary if zt is not installed.
     \\
     \\export def --wrapped ghq [...args: string] {
-    \\  if (which gitstore | is-not-empty) {
-    \\    ^gitstore ...$args
-    \\  } else if (which ghq | is-not-empty) {
+    \\  if (which zt | where type == external | is-not-empty) {
+    \\    ^zt ...$args
+    \\  } else if (which ghq | where type == external | is-not-empty) {
     \\    ^ghq ...$args
     \\  } else {
-    \\    print -e "ghq(): neither gitstore nor ghq found on PATH"
-    \\    exit 127
+    \\    error make {msg: "ghq(): neither zt nor ghq found on PATH"}
     \\  }
     \\}
     \\
-    \\# Show gitstore status as a structured table
-    \\export def gitstore-status [] {
-    \\  let result = (do { ^gitstore status --json } | complete)
+    \\# Show z3store status as a structured table
+    \\export def zt-status [] {
+    \\  if (which zt | where type == external | is-empty) {
+    \\    error make { msg: "zt-status: zt not found on PATH" }
+    \\  }
+    \\
+    \\  let result = (do { ^zt status --json } | complete)
     \\
     \\  if $result.exit_code != 0 {
     \\    print -e $result.stderr
-    \\    error make { msg: "gitstore status failed" }
+    \\    error make { msg: "zt status failed" }
     \\  }
     \\
     \\  $result.stdout | from json
     \\}
 ;
 
-/// rclone filter rules for syncing ghq working trees to Google Drive.
+/// rclone filter rules for syncing zt/z3store working trees to Google Drive.
 /// Excludes VCS internals, build artifacts, caches, env files, OS junk.
-/// Used by "gitstore sync" and "gitstore filter".
+/// Used by "zt sync" and "zt filter".
 pub const rclone_filter =
-    \\# gitstore rclone filter rules
-    \\# Generated by: gitstore filter
+    \\# z3store rclone filter rules
+    \\# Generated by: zt filter
     \\# Use with: rclone sync --filter-from <this-file>
     \\
     \\# === VCS internals (should already be separated, belt-and-suspenders) ===
@@ -201,17 +204,23 @@ test "hook: zsh defines ghq() function" {
     try testing.expect(mem.indexOf(u8, zsh_hook, "ghq() {") != null);
 }
 
-test "hook: zsh prefers gitstore over ghq" {
-    const gs = mem.indexOf(u8, zsh_hook, "command -v gitstore").?;
-    const ghq = mem.indexOf(u8, zsh_hook, "command -v ghq").?;
-    try testing.expect(gs < ghq);
+test "hook: zsh prefers zt over ghq" {
+    const zt_cmd_index = mem.indexOf(u8, zsh_hook, "whence -p zt").?;
+    const ghq = mem.indexOf(u8, zsh_hook, "whence -p ghq").?;
+    try testing.expect(zt_cmd_index < ghq);
 }
 
-test "hook: zsh forwards all args to gitstore" {
-    try testing.expect(mem.indexOf(u8, zsh_hook, "command gitstore \"$@\"") != null);
+test "hook: zsh uses PATH-only executable probes" {
+    try testing.expect(mem.indexOf(u8, zsh_hook, "whence -p zt") != null);
+    try testing.expect(mem.indexOf(u8, zsh_hook, "whence -p ghq") != null);
+    try testing.expect(mem.indexOf(u8, zsh_hook, "command -v ghq") == null);
 }
 
-test "hook: zsh falls back to ghq when gitstore missing" {
+test "hook: zsh forwards all args to zt" {
+    try testing.expect(mem.indexOf(u8, zsh_hook, "command zt \"$@\"") != null);
+}
+
+test "hook: zsh falls back to ghq when zt missing" {
     try testing.expect(mem.indexOf(u8, zsh_hook, "command ghq \"$@\"") != null);
 }
 
@@ -229,11 +238,23 @@ test "hook: bash defines ghq() function" {
     try testing.expect(mem.indexOf(u8, bash_hook, "ghq() {") != null);
 }
 
-test "hook: bash forwards all args to gitstore" {
-    try testing.expect(mem.indexOf(u8, bash_hook, "command gitstore \"$@\"") != null);
+test "hook: bash prefers zt over ghq" {
+    const zt_cmd_index = mem.indexOf(u8, bash_hook, "type -P zt").?;
+    const ghq = mem.indexOf(u8, bash_hook, "type -P ghq").?;
+    try testing.expect(zt_cmd_index < ghq);
 }
 
-test "hook: bash falls back to ghq when gitstore missing" {
+test "hook: bash uses PATH-only executable probes" {
+    try testing.expect(mem.indexOf(u8, bash_hook, "type -P zt") != null);
+    try testing.expect(mem.indexOf(u8, bash_hook, "type -P ghq") != null);
+    try testing.expect(mem.indexOf(u8, bash_hook, "command -v ghq") == null);
+}
+
+test "hook: bash forwards all args to zt" {
+    try testing.expect(mem.indexOf(u8, bash_hook, "command zt \"$@\"") != null);
+}
+
+test "hook: bash falls back to ghq when zt missing" {
     try testing.expect(mem.indexOf(u8, bash_hook, "command ghq \"$@\"") != null);
 }
 
@@ -246,18 +267,19 @@ test "hook: nu defines wrapped ghq" {
     try testing.expect(mem.indexOf(u8, nu_hook, "export def --wrapped ghq") != null);
 }
 
-test "hook: nu prefers gitstore" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "which gitstore") != null);
-    try testing.expect(mem.indexOf(u8, nu_hook, "^gitstore ...$args") != null);
+test "hook: nu prefers zt" {
+    try testing.expect(mem.indexOf(u8, nu_hook, "which zt | where type == external") != null);
+    try testing.expect(mem.indexOf(u8, nu_hook, "^zt ...$args") != null);
 }
 
 test "hook: nu falls back to ghq" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "which ghq") != null);
+    try testing.expect(mem.indexOf(u8, nu_hook, "which ghq | where type == external") != null);
     try testing.expect(mem.indexOf(u8, nu_hook, "^ghq ...$args") != null);
 }
 
-test "hook: nu exits 127 when neither tool present" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "exit 127") != null);
+test "hook: nu raises an error when both tools are missing" {
+    try testing.expect(mem.indexOf(u8, nu_hook, "error make {msg: \"ghq(): neither zt nor ghq found on PATH\"}") != null);
+    try testing.expect(mem.indexOf(u8, nu_hook, "exit 127") == null);
 }
 
 test "hook: nu has no legacy diff-dance" {
@@ -266,9 +288,12 @@ test "hook: nu has no legacy diff-dance" {
     try testing.expect(mem.indexOf(u8, nu_hook, "let after") == null);
 }
 
-test "hook: nu retains gitstore-status helper for structured output" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "gitstore-status") != null);
-    try testing.expect(mem.indexOf(u8, nu_hook, "gitstore status --json") != null);
+test "hook: nu retains zt-status helper for structured output" {
+    try testing.expect(mem.indexOf(u8, nu_hook, "zt-status") != null);
+    const probe = mem.indexOf(u8, nu_hook, "which zt | where type == external | is-empty").?;
+    const status = mem.indexOf(u8, nu_hook, "zt status --json").?;
+    try testing.expect(probe < status);
+    try testing.expect(mem.indexOf(u8, nu_hook, "zt status --json") != null);
     try testing.expect(mem.indexOf(u8, nu_hook, "from json") != null);
 }
 
