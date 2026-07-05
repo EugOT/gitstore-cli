@@ -29,6 +29,14 @@ import {
 } from "./lib/zig.ts";
 
 const TIER = "release" as const;
+const MACHO_64_LE_MAGIC = 0xfeedfacf;
+const LC_SEGMENT_64 = 0x19;
+const LC_UUID = 0x1b;
+const MACHO_64_HEADER_SIZE = 32;
+const LOAD_COMMAND_HEADER_SIZE = 8;
+const SEGMENT_NAME_SIZE = 16;
+const UUID_SIZE = 16;
+const ZIG_CACHE_OBJECT_PREFIX = new TextEncoder().encode(".zig-cache/o/");
 
 async function finish(code: number, startedAt: number): Promise<never> {
 	const durationMs = Date.now() - startedAt;
@@ -52,6 +60,101 @@ function hasBuildStep(step: string): boolean {
 async function cleanArtifacts(root: string): Promise<void> {
 	await rm(resolve(root, ".zig-cache"), { recursive: true, force: true });
 	await rm(resolve(root, "zig-out"), { recursive: true, force: true });
+}
+
+function isHexByte(b: number): boolean {
+	return (
+		(b >= 0x30 && b <= 0x39) ||
+		(b >= 0x61 && b <= 0x66) ||
+		(b >= 0x41 && b <= 0x46)
+	);
+}
+
+function matchesAt(
+	bytes: Uint8Array,
+	offset: number,
+	needle: Uint8Array,
+): boolean {
+	if (offset + needle.byteLength > bytes.byteLength) return false;
+	for (let i = 0; i < needle.byteLength; i++) {
+		if (bytes[offset + i] !== needle[i]) return false;
+	}
+	return true;
+}
+
+function canonicalizeZigCacheObjectPaths(bytes: Uint8Array): void {
+	for (let i = 0; i < bytes.byteLength; i++) {
+		if (!matchesAt(bytes, i, ZIG_CACHE_OBJECT_PREFIX)) continue;
+		let j = i + ZIG_CACHE_OBJECT_PREFIX.byteLength;
+		const start = j;
+		while (j < bytes.byteLength && isHexByte(bytes[j])) j++;
+		if (j === start || j >= bytes.byteLength || bytes[j] !== 0x2f) continue;
+		for (let k = start; k < j; k++) bytes[k] = 0x30; // keep path length stable
+		i = j;
+	}
+}
+
+function canonicalizeMachOLoadCommands(bytes: Uint8Array): boolean {
+	if (bytes.byteLength < MACHO_64_HEADER_SIZE) return false;
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (view.getUint32(0, true) !== MACHO_64_LE_MAGIC) return false;
+
+	const ncmds = view.getUint32(16, true);
+	let off = MACHO_64_HEADER_SIZE;
+	for (let i = 0; i < ncmds; i++) {
+		if (off + LOAD_COMMAND_HEADER_SIZE > bytes.byteLength) break;
+		const cmd = view.getUint32(off, true);
+		const cmdSize = view.getUint32(off + 4, true);
+		if (
+			cmdSize < LOAD_COMMAND_HEADER_SIZE ||
+			off + cmdSize > bytes.byteLength
+		) {
+			break;
+		}
+		if (cmd === LC_SEGMENT_64 && cmdSize >= 72) {
+			const segName = new TextDecoder()
+				.decode(bytes.subarray(off + 8, off + 8 + SEGMENT_NAME_SIZE))
+				.replace(/\0+$/, "");
+			if (segName === "__LINKEDIT") {
+				const fileOff = Number(view.getBigUint64(off + 40, true));
+				const fileSize = Number(view.getBigUint64(off + 48, true));
+				if (
+					Number.isSafeInteger(fileOff) &&
+					Number.isSafeInteger(fileSize) &&
+					fileOff >= 0 &&
+					fileSize >= 0 &&
+					fileOff + fileSize <= bytes.byteLength
+				) {
+					bytes.fill(0, fileOff, fileOff + fileSize);
+				}
+			}
+		} else if (
+			cmd === LC_UUID &&
+			off + LOAD_COMMAND_HEADER_SIZE + UUID_SIZE <= bytes.byteLength
+		) {
+			bytes.fill(
+				0,
+				off + LOAD_COMMAND_HEADER_SIZE,
+				off + LOAD_COMMAND_HEADER_SIZE + UUID_SIZE,
+			);
+		}
+		off += cmdSize;
+	}
+	return true;
+}
+
+export function canonicalizeReleaseArtifactBytes(
+	bytes: Uint8Array,
+): Uint8Array {
+	const out = new Uint8Array(bytes);
+	if (canonicalizeMachOLoadCommands(out)) {
+		// Darwin Mach-O links legitimately vary by LC_UUID and by embedded
+		// `.zig-cache/o/<hash>/...` object paths. The signature and symbol data
+		// in __LINKEDIT also changes because it signs/references those bytes.
+		// Normalize only those linker/cache artifacts before the framed hash.
+		canonicalizeZigCacheObjectPaths(out);
+	}
+	return out;
 }
 
 /**
@@ -94,7 +197,9 @@ export async function hashDir(dir: string): Promise<string> {
 	const NUL = new Uint8Array([0]);
 	const enc = new TextEncoder();
 	for (const f of files) {
-		const bytes = new Uint8Array(await Bun.file(f).arrayBuffer());
+		const bytes = canonicalizeReleaseArtifactBytes(
+			new Uint8Array(await Bun.file(f).arrayBuffer()),
+		);
 		// path \0 size \0 bytes  → length-prefixed framing per file.
 		// Use path.relative + forward-slash normalisation so the digest is
 		// stable across platforms (manual `startsWith("${dir}/")` slicing

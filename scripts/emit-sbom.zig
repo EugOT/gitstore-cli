@@ -83,8 +83,8 @@ pub fn main(init: std.process.Init) !u8 {
 /// Render the CycloneDX document to `w`. Extracted from `main` so the
 /// failure path (manifest declares `.dependencies`, stub returns null) is
 /// reachable from inline tests without needing a real stdout. Returns
-/// `SbomError.IncompleteSbom` when the manifest has a `.dependencies`
-/// block but the dependency stub yields no entries.
+/// `SbomError.IncompleteSbom` when the manifest has dependency entries
+/// but the dependency stub yields no entries.
 fn emitSbomDocument(
     gpa: std.mem.Allocator,
     ast: std.zig.Ast,
@@ -129,11 +129,11 @@ fn emitSbomDocument(
     var first = true;
     // Find the `.dependencies = .{...}` init and walk its fields.
     const deps = findStructField(ast, "dependencies");
-    const declares_deps = findFieldValueToken(ast, "dependencies") != null;
-    // If the manifest declares a `.dependencies` block but our v1 stub
+    const declares_dep_entries = fieldDeclaresNonEmptyStruct(ast, "dependencies");
+    // If the manifest declares dependency entries but our v1 stub
     // returned nothing, the resulting SBOM would silently omit every
     // declared dependency. Fail closed instead of fail open.
-    if (deps == null and declares_deps) {
+    if (deps == null and declares_dep_entries) {
         return SbomError.IncompleteSbom;
     }
     if (deps) |dep_list| {
@@ -216,6 +216,15 @@ fn findFieldValueToken(ast: std.zig.Ast, field: []const u8) ?std.zig.Ast.TokenIn
         return @intCast(i + 3);
     }
     return null;
+}
+
+fn fieldDeclaresNonEmptyStruct(ast: std.zig.Ast, field: []const u8) bool {
+    const token_tags = ast.tokens.items(.tag);
+    const tok = findFieldValueToken(ast, field) orelse return false;
+    if (tok + 2 < token_tags.len and token_tags[tok] == .period and token_tags[tok + 1] == .l_brace) {
+        return token_tags[tok + 2] != .r_brace;
+    }
+    return true;
 }
 
 /// Return the inner bytes of a string-literal token (drops surrounding quotes).
@@ -349,6 +358,33 @@ test "emitSbomDocument succeeds for manifest with no dependencies block" {
     const written = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"bomFormat\": \"CycloneDX\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "leaf_pkg") != null);
+}
+
+test "emitSbomDocument succeeds for explicit empty dependencies block" {
+    const gpa = std.testing.allocator;
+    const fixture =
+        \\.{
+        \\    .name = .empty_deps_pkg,
+        \\    .version = "0.0.2",
+        \\    .fingerprint = 0xabcdef1234567890,
+        \\    .minimum_zig_version = "0.16.0",
+        \\    .dependencies = .{},
+        \\    .paths = .{""},
+        \\}
+    ;
+    const source_z = try gpa.dupeZ(u8, fixture);
+    defer gpa.free(source_z);
+
+    var ast = try std.zig.Ast.parse(gpa, source_z, .zon);
+    defer ast.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+
+    var out_buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_buf);
+
+    try emitSbomDocument(gpa, ast, fixture, &w);
+    const written = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "empty_deps_pkg") != null);
 }
 
 test "escapeJsonString round-trips quotes, backslashes, and control characters" {
