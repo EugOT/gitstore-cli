@@ -1,4 +1,4 @@
-# gitstore-cli
+# z3store (`zt`)
 
 <!-- badges: build, license, zig-version, zls-version go here -->
 

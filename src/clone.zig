@@ -1,9 +1,8 @@
-//! `gitstore get` clone orchestrator.
+//! `zt get` clone orchestrator.
 //!
-//! Phase-1 module per `/Users/etretiakov/.claude/plans/libgitstore-v2.md`
-//! (§ Concurrency model). Depends on `url.zig` (`RepoSpec.toStoragePath`)
-//! and calls `gitstore.adopt` after a successful clone to relocate `.git`
-//! into the gitstore layout.
+//! Phase-1 z3store clone module. Depends on `url.zig`
+//! (`RepoSpec.toStoragePath`) and calls the adopt flow after a successful
+//! clone to relocate `.git` into the z3store layout.
 //!
 //! All I/O is parametric on `std.Io` — no `std.fs.cwd`, no direct
 //! `std.posix.*`. Parallel clones use `std.Io.Group` + `std.Io.Semaphore`;
@@ -16,7 +15,7 @@ const Io = std.Io;
 const Dir = std.Io.Dir;
 
 const ex = @import("exec.zig");
-const gitstore = @import("gitstore.zig");
+const z3store = @import("z3store.zig");
 const url = @import("url.zig");
 
 /// Options threaded through `cloneOne` / `cloneMany`.
@@ -27,7 +26,7 @@ pub const CloneOptions = struct {
     /// `-P N`: maximum concurrent clones. 0 or 1 means serial.
     parallelism: u32 = 1,
     /// `--no-adopt`: clone into storage path but do **not** relocate
-    /// `.git` into gitstore layout.
+    /// `.git` into z3store layout.
     no_adopt: bool = false,
     /// `--shallow`: pass `--depth 1` to git.
     shallow: bool = false,
@@ -68,7 +67,7 @@ pub const CloneError = error{
     Canceled,
 } || Allocator.Error || ex.ExecError ||
     Dir.OpenError || Dir.StatFileError || Dir.CreateDirPathError ||
-    gitstore.Error;
+    z3store.Error;
 
 /// Clone a single repository into its canonical storage path.
 ///
@@ -200,9 +199,9 @@ pub fn cloneOne(
         };
     }
 
-    // Post-clone: relocate .git into gitstore layout unless caller opted out.
+    // Post-clone: relocate .git into z3store layout unless caller opted out.
     if (!opts.no_adopt) {
-        gitstore.adopt(gpa, io, storage_path, ghq_root, gitstore_root, false) catch |err| {
+        z3store.adopt(gpa, io, storage_path, ghq_root, gitstore_root, false) catch |err| {
             const msg = try std.fmt.allocPrint(
                 gpa,
                 "adopt failed: {s}",

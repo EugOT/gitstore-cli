@@ -1,4 +1,4 @@
-//! URL parsing for gitstore — matches ghq v1.8.0 shape handling.
+//! URL parsing for z3store — matches ghq v1.8.0 shape handling.
 //!
 //! Pure module: no I/O, no env, no threads. All slices in the returned
 //! `RepoSpec` are owned by the allocator passed to `parse()` and must be
@@ -203,7 +203,7 @@ pub fn cloneHost(web_host: []const u8) []const u8 {
     return web_host;
 }
 
-/// Parse any of the shapes documented in libgitstore-v2.md into a
+/// Parse any supported z3store repository reference shape into a
 /// `RepoSpec`. The returned struct owns its strings via `gpa`.
 ///
 /// Case is preserved (no lowercasing). A trailing `/` on the input is
