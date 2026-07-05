@@ -1039,6 +1039,35 @@ test "e2e detach round-trip jj+git" {
     try testing.expect(js.succeeded());
 }
 
+test "e2e detach propagates .jj backup rename failure" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createJjRepo("testorg", "detachjjbackupfail");
+    defer gpa.free(repo);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+
+    const jj_backup = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-old", .{repo});
+    defer gpa.free(jj_backup);
+    try Dir.cwd().createDirPath(io, jj_backup);
+    const blocker = try std.fmt.allocPrint(gpa, "{s}/blocker", .{jj_backup});
+    defer gpa.free(blocker);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = blocker,
+        .data = "occupied\n",
+    });
+
+    if (gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false)) {
+        return error.TestExpectedError;
+    } else |err| switch (err) {
+        error.PathAlreadyExists, error.IsDir, error.NotDir => {},
+        else => return err,
+    }
+}
+
 test "e2e detach rejects non-adopted repo" {
     const io = testing.io;
     const gpa = testing.allocator;

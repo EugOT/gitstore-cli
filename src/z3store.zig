@@ -717,6 +717,22 @@ pub fn verifyAll(
 }
 
 /// Show gitstore disk usage, repo count, and broken pointers.
+fn adoptedGitPointerBroken(gpa: Allocator, io: Io, repo_path: []const u8) bool {
+    const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path}) catch return false;
+    defer gpa.free(git_path);
+
+    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch return false;
+    defer gpa.free(content);
+
+    const trimmed = ex.trimTrailingNewline(content);
+    const prefix = "gitdir: ";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return false;
+
+    const git_dir = trimmed[prefix.len..];
+    _ = Dir.cwd().statFile(io, git_dir, .{}) catch return true;
+    return false;
+}
+
 pub fn status(
     gpa: Allocator,
     io: Io,
@@ -724,8 +740,6 @@ pub fn status(
     gitstore_root: []const u8,
     json_mode: bool,
 ) !void {
-    _ = ghq_root;
-
     const du_result = try ex.exec(gpa, io, &.{ "du", "-sh", gitstore_root }, null);
     defer {
         gpa.free(du_result.stdout);
@@ -735,35 +749,18 @@ pub fn status(
     var du_parts = std.mem.splitScalar(u8, du_line, '\t');
     const disk_usage = du_parts.next() orelse "unknown";
 
-    const list_result = try ex.exec(gpa, io, &.{ "ghq", "list", "--full-path" }, null);
-    defer {
-        gpa.free(list_result.stdout);
-        gpa.free(list_result.stderr);
-    }
-
     var total_repos: usize = 0;
     var adopted_count: usize = 0;
     var broken_count: usize = 0;
 
-    if (list_result.succeeded()) {
-        var lines = std.mem.splitScalar(u8, ex.trimTrailingNewline(list_result.stdout), '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            total_repos += 1;
-            if (isAdopted(io, line, gitstore_root, gpa)) {
-                adopted_count += 1;
-                const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{line}) catch continue;
-                defer gpa.free(git_path);
-                const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch continue;
-                defer gpa.free(content);
-                const trimmed = ex.trimTrailingNewline(content);
-                if (std.mem.startsWith(u8, trimmed, "gitdir: ")) {
-                    const git_dir = trimmed["gitdir: ".len..];
-                    _ = Dir.cwd().statFile(io, git_dir, .{}) catch {
-                        broken_count += 1;
-                    };
-                }
-            }
+    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch return error.ProcessFailed;
+    defer list_mod.freeEntries(gpa, entries);
+
+    for (entries) |e| {
+        total_repos += 1;
+        if (e.is_adopted) {
+            adopted_count += 1;
+            if (adoptedGitPointerBroken(gpa, io, e.abs_path)) broken_count += 1;
         }
     }
 
@@ -1120,7 +1117,7 @@ pub fn detach(
             Dir.rename(Dir.cwd(), jj_pointer_path, Dir.cwd(), jj_backup, io) catch |err| {
                 warn(io, "warn: could not rename .jj symlink ({s}); leaving symlink in place\n", .{@errorName(err)});
                 Dir.cwd().deleteTree(io, jj_new) catch {};
-                return;
+                return err;
             };
             // Now rename staged copy into place. On failure restore the symlink.
             Dir.rename(Dir.cwd(), jj_new, Dir.cwd(), jj_pointer_path, io) catch |err| {

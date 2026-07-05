@@ -125,7 +125,11 @@ pub fn load(
     defer gpa.free(index_path);
 
     const bytes = Dir.cwd().readFileAlloc(io, index_path, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return map,
+        error.FileNotFound => blk: {
+            const legacy_index_path = try legacyIndexPath(gpa, gitstore_root);
+            defer gpa.free(legacy_index_path);
+            break :blk Dir.cwd().readFileAlloc(io, legacy_index_path, gpa, .unlimited) catch return map;
+        },
         else => return map, // any other read error: return empty; callers rebuild
     };
     defer gpa.free(bytes);
@@ -266,6 +270,14 @@ fn indexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/index.json", .{dir});
 }
 
+fn legacyIndexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
+    var trimmed = gitstore_root;
+    while (trimmed.len > 1 and trimmed[trimmed.len - 1] == '/') {
+        trimmed = trimmed[0 .. trimmed.len - 1];
+    }
+    return std.fmt.allocPrint(gpa, "{s}/.gitstore/cache/index.json", .{trimmed});
+}
+
 // =========================================================
 // Tests — prefixed "cache:" for filtering.
 // =========================================================
@@ -404,6 +416,30 @@ test "cache: save + load roundtrip preserves entries" {
     try testing.expect(b.url == null);
     try testing.expect(b.head_sha == null);
     try testing.expect(b.last_fetched_unix == null);
+}
+
+test "cache: load falls back to legacy gitstore cache index" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const root = "/tmp/gitstore_cache_legacy_test";
+    Dir.cwd().deleteTree(io, root) catch {};
+    defer Dir.cwd().deleteTree(io, root) catch {};
+    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_legacy_test/.gitstore/cache");
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/gitstore_cache_legacy_test/.gitstore/cache/index.json",
+        .data =
+        \\{"version":1,"entries":[{"rel_path":"github.com/a/b","url":"https://github.com/a/b","head_sha":"abc123","last_fetched_unix":1700000000}]}
+        ,
+    });
+
+    var loaded = try load(gpa, io, root);
+    defer freeMap(gpa, &loaded);
+
+    try testing.expectEqual(@as(u32, 1), loaded.count());
+    const entry = loaded.get("github.com/a/b") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("https://github.com/a/b", entry.url.?);
+    try testing.expectEqualStrings("abc123", entry.head_sha.?);
+    try testing.expectEqual(@as(i64, 1_700_000_000), entry.last_fetched_unix.?);
 }
 
 test "cache: load on corrupt json returns empty map" {

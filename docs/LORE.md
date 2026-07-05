@@ -38,7 +38,7 @@ first-class but **immovable**.
 
 | Command | Behavior on a Lore workspace |
 |---------|------------------------------|
-| `zt list` | Lore workspaces are enumerated and suffixed with ` [lore]` in plain output; `--json` entries carry `"is_lore": true`. A dir with only `.lore/instance` (no `.git`/`.jj`) still appears. |
+| `zt list` | Lore workspaces are enumerated with a `[lore]` suffix (space-separated) in plain output; `--json` entries carry `"is_lore": true`. A dir with only `.lore/instance` (no `.git`/`.jj`) still appears. |
 | `zt lore <path>` | Prints a read-only report: `instance`/`config.toml` presence and the parsed `[shared_store_to_use]` settings (and whether `shared_store_path` resolves). |
 | `zt verify <path>` | On a Lore workspace, in addition to the normal git/jj pointer checks (for git+lore repos), reports instance/config presence and shared-store resolution. A configured-but-missing shared store fails verification. A lore-only workspace skips the git-pointer check (it legitimately has no `.git`). |
 | `zt adopt <path>` (lore-only) | **Refuses** with a non-zero exit and a message pointing at `lore shared-store`. **No mutation.** |

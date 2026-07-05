@@ -310,7 +310,7 @@ fn statPathExists(io: Io, path: []const u8) !bool {
 /// True if `<dir>/<name>` exists (file, dir, or pointer). Used to probe for a
 /// repo's `.git`/`.jj` entries without allocating a persistent path.
 fn hasEntry(io: Io, dir: []const u8, name: []const u8) !bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [Dir.max_path_bytes]u8 = undefined;
     const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch return error.NameTooLong;
     return statPathExists(io, p);
 }
@@ -318,7 +318,7 @@ fn hasEntry(io: Io, dir: []const u8, name: []const u8) !bool {
 /// Resolve `p` against `base` when relative and report whether it exists. Lore's
 /// `shared_store_path` may be absolute or worktree-relative.
 fn sharedStoreExists(io: Io, base: []const u8, p: []const u8) !bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [Dir.max_path_bytes]u8 = undefined;
     const full = if (p.len > 0 and p[0] == '/')
         std.fmt.bufPrint(&buf, "{s}", .{p}) catch return error.NameTooLong
     else
@@ -1113,6 +1113,14 @@ pub fn main(init: std.process.Init) !u8 {
 // libz3store v2 subcommand implementations
 // =========================================================
 
+fn printLegacyConfigHint(io: Io, cfg: *const config_mod.Config) !void {
+    if (!cfg.used_legacy) return;
+    try printErr(
+        io,
+        "warning: using legacy gitstore.*/ghq.* config or GITSTORE_ROOT/GHQ_ROOT; prefer z3store.* / Z3STORE_ROOT\n",
+    );
+}
+
 fn cmdGet(
     gpa: Allocator,
     io: Io,
@@ -1169,12 +1177,7 @@ fn cmdGet(
     };
     defer cfg.deinit(gpa);
 
-    if (cfg.used_legacy) {
-        try printErr(
-            io,
-            "warning: using legacy gitstore.*/ghq.* config or GITSTORE_ROOT/GHQ_ROOT; prefer z3store.* / Z3STORE_ROOT\n",
-        );
-    }
+    try printLegacyConfigHint(io, &cfg);
 
     // Resolve gitstore root (for adoption side effect).
     const gitstore_root = try getStoreRoot(gpa, io, environ_map);
@@ -1352,6 +1355,8 @@ fn cmdRoot(
     };
     defer cfg.deinit(gpa);
 
+    try printLegacyConfigHint(io, &cfg);
+
     var buf: [4096]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &buf);
     try w.interface.print("{s}\n", .{cfg.root});
@@ -1504,6 +1509,8 @@ fn cmdCreate(
         return err;
     };
     defer cfg.deinit(gpa);
+
+    try printLegacyConfigHint(io, &cfg);
 
     // Parse via url.parse to canonicalize host/owner/name.
     var spec = url_mod.parse(gpa, name, .{
