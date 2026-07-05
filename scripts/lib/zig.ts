@@ -1,6 +1,6 @@
 /**
  * Repo-owned Zig toolchain wrapper. Semantics match the validated
- * `scripts/zig-tool.sh` in gitstore-cli:
+ * `scripts/zig-tool.sh` in z3store:
  *
  *   1. If ZIG env var is set, honor it (escape hatch for CI/local overrides)
  *   2. Otherwise, if `mise` is available, resolve through

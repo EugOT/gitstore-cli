@@ -1,5 +1,5 @@
 /**
- * kcov coverage harness for gitstore-cli (G1 of the test-coverage plan).
+ * kcov coverage harness for z3store (G1 of the test-coverage plan).
  *
  * Builds the three test binaries (test-unit, test-lib, test-integration) in
  * Debug, runs each under kcov, merges the runs, and writes a normalized
