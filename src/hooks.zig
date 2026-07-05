@@ -69,6 +69,10 @@ pub const nu_hook =
     \\
     \\# Show z3store status as a structured table
     \\export def zt-status [] {
+    \\  if (which zt | where type == external | is-empty) {
+    \\    error make { msg: "zt-status: zt not found on PATH" }
+    \\  }
+    \\
     \\  let result = (do { ^zt status --json } | complete)
     \\
     \\  if $result.exit_code != 0 {
@@ -286,6 +290,9 @@ test "hook: nu has no legacy diff-dance" {
 
 test "hook: nu retains zt-status helper for structured output" {
     try testing.expect(mem.indexOf(u8, nu_hook, "zt-status") != null);
+    const probe = mem.indexOf(u8, nu_hook, "which zt | where type == external | is-empty").?;
+    const status = mem.indexOf(u8, nu_hook, "zt status --json").?;
+    try testing.expect(probe < status);
     try testing.expect(mem.indexOf(u8, nu_hook, "zt status --json") != null);
     try testing.expect(mem.indexOf(u8, nu_hook, "from json") != null);
 }

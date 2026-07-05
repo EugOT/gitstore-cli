@@ -372,16 +372,6 @@ fn writeLoreReport(gpa: Allocator, io: Io, path: []const u8) !bool {
     return ok;
 }
 
-fn hasLoreDirectory(gpa: Allocator, io: Io, path: []const u8) !bool {
-    const lore_dir = try std.fmt.allocPrint(gpa, "{s}/.lore", .{path});
-    defer gpa.free(lore_dir);
-    const stat = Dir.cwd().statFile(io, lore_dir, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return stat.kind == .directory;
-}
-
 fn cmdLore(
     gpa: Allocator,
     io: Io,
@@ -415,10 +405,10 @@ fn cmdLore(
         return 2;
     };
 
-    if (!try hasLoreDirectory(gpa, io, p)) {
+    if (!try lore.hasLoreWorkspaceMarker(io, p)) {
         var buf: [1024]u8 = undefined;
         var w = File.stderr().writerStreaming(io, &buf);
-        try w.interface.print("error: {s} is not a Lore workspace (no .lore directory)\n", .{p});
+        try w.interface.print("error: {s} is not a Lore workspace (missing .lore/instance marker)\n", .{p});
         try w.flush();
         return 1;
     }

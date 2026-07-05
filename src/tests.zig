@@ -458,6 +458,21 @@ test "e2e adopt rolls back partial gitstore copy when cp fails" {
         else => return err,
     }
 
+    const git_src = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(git_src);
+    const probe_dest = try std.fmt.allocPrint(gpa, "{s}/partial-copy-probe", .{env.base});
+    defer gpa.free(probe_dest);
+    defer Dir.cwd().deleteTree(io, probe_dest) catch {};
+    const cp_probe = try ex.exec(gpa, io, &.{ "cp", "-a", git_src, probe_dest }, null);
+    defer {
+        gpa.free(cp_probe.stdout);
+        gpa.free(cp_probe.stderr);
+    }
+    try testing.expect(!cp_probe.succeeded());
+    const copied_probe = try std.fmt.allocPrint(gpa, "{s}/00-copied-before-failure", .{probe_dest});
+    defer gpa.free(copied_probe);
+    _ = try Dir.cwd().statFile(io, copied_probe, .{});
+
     try testing.expectError(error.ProcessFailed, gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false));
 
     const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;

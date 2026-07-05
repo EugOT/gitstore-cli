@@ -243,6 +243,7 @@ pub fn enumerateLinkedWorktrees(gpa: Allocator, io: Io, repo_path: []const u8) !
             continue;
         }
         const owned = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned);
         try list.append(gpa, owned);
     }
     return try list.toOwnedSlice(gpa);

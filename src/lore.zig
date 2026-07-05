@@ -59,28 +59,39 @@ pub const LoreStatus = struct {
     }
 };
 
+/// True when `path` has Lore's load-bearing workspace marker:
+/// `.lore/instance` as a regular file. Genuine absence maps to `false`;
+/// unexpected probe failures propagate so command paths do not silently treat
+/// an unreadable workspace as non-Lore.
+pub fn hasLoreWorkspaceMarker(io: Io, path: []const u8) !bool {
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const probe = std.fmt.bufPrint(&buf, "{s}/.lore/instance", .{path}) catch return error.NameTooLong;
+    const stat = Dir.cwd().statFile(io, probe, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    return stat.kind == .file;
+}
+
 /// True when `path` is an EpicGames Lore workspace: a `.lore/` directory that
 /// contains an `instance` file. The `instance` file (not merely the directory)
 /// is the marker, matching Lore's own on-disk contract and avoiding false
 /// positives on an empty/partial `.lore/`.
 ///
-/// Signature is intentionally allocation-free: a stack buffer builds the probe
-/// path. An over-long path yields `false` (it cannot be a valid workspace we
-/// could act on anyway).
+/// Signature remains allocation-free and boolean for callers that scan many
+/// paths; command paths should call `hasLoreWorkspaceMarker` when they need
+/// unexpected filesystem errors surfaced.
 pub fn detectLoreWorkspace(io: Io, path: []const u8) bool {
-    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const probe = std.fmt.bufPrint(&buf, "{s}/.lore/instance", .{path}) catch return false;
-    _ = Dir.cwd().statFile(io, probe, .{}) catch return false;
-    return true;
+    return hasLoreWorkspaceMarker(io, path) catch false;
 }
 
 /// Inspect the `.lore/` metadata under `path` and report presence of the
 /// `instance`/`config.toml` files plus the parsed `[shared_store_to_use]`
 /// settings. Read-only: nothing under `.lore/` is ever written.
 ///
-/// Only the `OutOfMemory` failure propagates; a missing/unreadable config is
-/// reported as `has_config = false` rather than an error, so callers can report
-/// a partial Lore workspace instead of aborting.
+/// Out-of-memory and unexpected marker-probe errors propagate. A
+/// missing/unreadable config is reported as `has_config = false` rather than an
+/// error, so callers can report a partial Lore workspace instead of aborting.
 pub fn loreStatus(gpa: Allocator, io: Io, path: []const u8) !LoreStatus {
     var st: LoreStatus = .{
         .has_config = false,
@@ -90,11 +101,7 @@ pub fn loreStatus(gpa: Allocator, io: Io, path: []const u8) !LoreStatus {
         .shared_store_path = null,
     };
 
-    const instance_path = try std.fmt.allocPrint(gpa, "{s}/.lore/instance", .{path});
-    defer gpa.free(instance_path);
-    if (Dir.cwd().statFile(io, instance_path, .{})) |_| {
-        st.has_instance = true;
-    } else |_| {}
+    st.has_instance = try hasLoreWorkspaceMarker(io, path);
 
     const config_path = try std.fmt.allocPrint(gpa, "{s}/.lore/config.toml", .{path});
     defer gpa.free(config_path);
@@ -233,14 +240,24 @@ test "lore: detectLoreWorkspace true only with .lore/instance" {
     }
 
     // Bare dir: not a workspace.
+    try testing.expect(!try hasLoreWorkspaceMarker(io, ws));
     try testing.expect(!detectLoreWorkspace(io, ws));
 
     // .lore/ without instance: still not a workspace.
     try writeLoreFile(gpa, io, ws, "config.toml", "x = 1\n");
+    try testing.expect(!try hasLoreWorkspaceMarker(io, ws));
     try testing.expect(!detectLoreWorkspace(io, ws));
+
+    const instance_dir = try std.fmt.allocPrint(gpa, "{s}/.lore/instance", .{ws});
+    defer gpa.free(instance_dir);
+    try Dir.cwd().createDirPath(io, instance_dir);
+    try testing.expect(!try hasLoreWorkspaceMarker(io, ws));
+    try testing.expect(!detectLoreWorkspace(io, ws));
+    try Dir.cwd().deleteTree(io, instance_dir);
 
     // .lore/instance present: recognized.
     try writeLoreFile(gpa, io, ws, "instance", "0192f000-0000-7000-8000-000000000000\n");
+    try testing.expect(try hasLoreWorkspaceMarker(io, ws));
     try testing.expect(detectLoreWorkspace(io, ws));
 }
 
