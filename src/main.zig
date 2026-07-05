@@ -686,7 +686,7 @@ pub fn main(init: std.process.Init) !u8 {
             try gitstore.init(io, gitstore_root);
             var buf: [4096]u8 = undefined;
             var w = File.stdout().writerStreaming(io, &buf);
-            try w.interface.print("gitstore initialized at {s}\n", .{gitstore_root});
+            try w.interface.print("z3store initialized at {s}\n", .{gitstore_root});
             try w.flush();
         }
         return 0;
@@ -1060,7 +1060,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    // --- libgitstore v2 subcommands ---
+    // --- libz3store v2 subcommands ---
 
     if (std.mem.eql(u8, command, "get")) {
         return cmdGet(gpa, io, init.environ_map, &args_iter);
@@ -1098,7 +1098,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 // =========================================================
-// libgitstore v2 subcommand implementations
+// libz3store v2 subcommand implementations
 // =========================================================
 
 fn cmdGet(
@@ -1589,7 +1589,7 @@ fn cmdMigrate(
     // Real-mode migration is intentionally deferred: moving gitstore_root
     // entries, rewriting .git pointers, and running `git worktree repair`
     // require the WAL-backed operation log to stay crash-consistent. The
-    // libgitstore v2 plan explicitly permits a dry-run-only v1 subset.
+    // libz3store v2 plan explicitly permits a dry-run-only v1 subset.
     try printErr(
         io,
         "error: migrate real-mode not implemented; rerun with --dry-run\n",

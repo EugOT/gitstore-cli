@@ -27,8 +27,8 @@ pub const ExecError = std.process.RunError;
 /// `GIT_CONFIG_VALUE_<i>` and `GIT_DIR` / `GIT_OBJECT_DIRECTORY` /
 /// `GIT_*` overrides at runtime. A caller (or an attacker who controls a
 /// hook context, sudo wrapper, etc.) could otherwise inject e.g.
-/// `core.fsmonitor=/tmp/evil.sh` and have gitstore execute it. By passing
-/// only a fresh, scrubbed map to the child, gitstore neutralises this
+/// `core.fsmonitor=/tmp/evil.sh` and have z3store execute it. By passing
+/// only a fresh, scrubbed map to the child, z3store neutralises this
 /// injection vector while preserving the env vars users legitimately need
 /// (PATH for tool lookup, HOME / XDG_* for git config discovery,
 /// SSH_AUTH_SOCK for ssh-key clones, SSL_CERT_* for TLS, etc.).
@@ -75,7 +75,7 @@ fn buildScrubbedEnv(gpa: Allocator) Allocator.Error!std.process.Environ.Map {
 /// `std.process.Environ.Map`. Builds from `std.c.environ` when libc is
 /// linked (the standard POSIX path, including under `zig build test`
 /// where the test binary inherits the parent shell's environ). Returns
-/// an empty map on no-libc targets — gitstore's spawned subprocesses
+/// an empty map on no-libc targets — z3store's spawned subprocesses
 /// then run with only the explicit whitelist values, which is the
 /// security contract this function exists to maintain.
 ///

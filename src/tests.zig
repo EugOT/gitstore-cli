@@ -990,7 +990,7 @@ test "e2e detach round-trip git-only" {
     try testing.expect(gl.succeeded());
     try testing.expect(std.mem.indexOf(u8, gl.stdout, "init") != null);
 
-    // gitstore entry removed
+    // z3store entry removed
     const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
     const entry = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ env.gitstore_root, rel });
     defer gpa.free(entry);
@@ -1138,10 +1138,10 @@ test "e2e detach round-trip preserves linked worktree" {
 // the `ghq list --full-path` shell-out. Repos live under the ghq
 // host/owner/name layout (host == "github.com" so `looksLikeHost` passes);
 // no real `ghq` binary is involved. Adopted fixtures are produced by the
-// real `gitstore.adopt` so the on-disk pointer AND the gitstore git
+// real z3store adopt flow so the on-disk pointer AND the z3store git
 // database both exist (verify/detach need the database to be real).
 //
-// NOTE on output assertions: gitstore's `info()` helper early-returns under
+// NOTE on output assertions: z3store's `info()` helper early-returns under
 // `builtin.is_test`, so the human-facing summary lines ("would detach: 1",
 // "summary: N adopted ...") are intentionally suppressed during tests. G6
 // therefore asserts on the *observable state* — return counts surfaced via

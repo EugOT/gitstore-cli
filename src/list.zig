@@ -270,7 +270,7 @@ fn tryAppendRepo(
 
 /// A directory is considered a repo if it contains `.git` (dir or pointer
 /// file) or `.jj`. Non-git VCS (hg, svn, bzr) are intentionally skipped per
-/// libgitstore v2 scope.
+/// libz3store v2 scope.
 fn isRepoDir(io: Io, abs_path: []const u8, gpa: Allocator) bool {
     const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{abs_path}) catch return false;
     defer gpa.free(git_path);

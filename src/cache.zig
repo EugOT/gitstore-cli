@@ -1,6 +1,6 @@
 //! Per-root repository metadata cache.
 //!
-//! Stores a JSON index at `<gitstore_root>/.gitstore/cache/index.json`.
+//! Stores a JSON index at `<gitstore_root>/.z3store/cache/index.json`.
 //! Writes are atomic (temp-file + fsync + rename). The diff helper is pure and
 //! deterministic so list-walker can test it with `Io.failing`.
 //!
@@ -107,7 +107,7 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-/// Open (or initialize empty) the on-disk cache for a given gitstore root.
+/// Open (or initialize empty) the on-disk cache for a given store root.
 /// Never panics; a missing file returns an empty map. A corrupt file returns
 /// an empty map (callers will rebuild).
 ///
@@ -179,7 +179,7 @@ pub fn load(
 }
 
 /// Serialize the cache and write it atomically. The procedure:
-///   1. Ensure `<gitstore_root>/.gitstore/cache/` exists.
+///   1. Ensure `<gitstore_root>/.z3store/cache/` exists.
 ///   2. Write to `index.json.tmp`.
 ///   3. `rename()` over `index.json`.
 ///
@@ -256,7 +256,8 @@ fn cacheDir(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
     while (trimmed.len > 1 and trimmed[trimmed.len - 1] == '/') {
         trimmed = trimmed[0 .. trimmed.len - 1];
     }
-    return std.fmt.allocPrint(gpa, "{s}/.gitstore/cache", .{trimmed});
+    // a stale legacy `.gitstore/cache` left behind is harmless.
+    return std.fmt.allocPrint(gpa, "{s}/.z3store/cache", .{trimmed});
 }
 
 fn indexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
@@ -385,7 +386,7 @@ test "cache: save + load roundtrip preserves entries" {
     try save(gpa, io, root, &src);
 
     // Assert the final file exists (rename target).
-    const final_path = "/tmp/gitstore_cache_roundtrip_test/.gitstore/cache/index.json";
+    const final_path = "/tmp/gitstore_cache_roundtrip_test/.z3store/cache/index.json";
     _ = try Dir.cwd().statFile(io, final_path, .{});
     // Temp file must be gone after rename.
     try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, final_path ++ ".tmp", .{}));
@@ -411,9 +412,9 @@ test "cache: load on corrupt json returns empty map" {
     const root = "/tmp/gitstore_cache_corrupt_test";
     Dir.cwd().deleteTree(io, root) catch {};
     defer Dir.cwd().deleteTree(io, root) catch {};
-    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_corrupt_test/.gitstore/cache");
+    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_corrupt_test/.z3store/cache");
     try Dir.cwd().writeFile(io, .{
-        .sub_path = "/tmp/gitstore_cache_corrupt_test/.gitstore/cache/index.json",
+        .sub_path = "/tmp/gitstore_cache_corrupt_test/.z3store/cache/index.json",
         .data = "{not valid json",
     });
 

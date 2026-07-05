@@ -728,10 +728,10 @@ pub fn status(
 
     if (json_mode) {
         info(io,
-            \\{{"disk_usage":"{s}","gitstore_root":"{s}","total_repos":{d},"adopted":{d},"broken":{d}}}
+            \\{{"disk_usage":"{s}","z3store_root":"{s}","total_repos":{d},"adopted":{d},"broken":{d}}}
         ++ "\n", .{ disk_usage, gitstore_root, total_repos, adopted_count, broken_count });
     } else {
-        info(io, "gitstore: {s}\n", .{gitstore_root});
+        info(io, "z3store: {s}\n", .{gitstore_root});
         info(io, "disk usage: {s}\n", .{disk_usage});
         info(io, "total repos: {d}\n", .{total_repos});
         info(io, "adopted: {d}\n", .{adopted_count});
@@ -855,7 +855,7 @@ pub fn sync(
 }
 
 /// Detach an adopted repo: restore .git/.jj from gitstore to working tree,
-/// rewrite linked worktree pointers back, optionally archive the gitstore entry.
+/// rewrite linked worktree pointers back, optionally archive the z3store entry.
 /// `ghq_root` is kept for API symmetry with adopt() but is not needed for detach
 /// (the gitstore location is encoded in the pointer file).
 pub fn detach(
@@ -1018,9 +1018,9 @@ pub fn detach(
         if (has_jj_link) info(io, "  restore {s} -> {s}/.jj\n", .{ jj_src, repo_path });
         for (worktrees) |wt| info(io, "  rewrite worktree pointer {s}/.git -> {s}/.git/worktrees/...\n", .{ wt, repo_path });
         if (keep_backup) {
-            info(io, "  rename gitstore entry {s} -> {s}.detached-<ts>\n", .{ repo_store_dir, repo_store_dir });
+            info(io, "  rename z3store entry {s} -> {s}.detached-<ts>\n", .{ repo_store_dir, repo_store_dir });
         } else {
-            info(io, "  remove gitstore entry {s}\n", .{repo_store_dir});
+            info(io, "  remove z3store entry {s}\n", .{repo_store_dir});
         }
         return;
     }
@@ -1111,7 +1111,7 @@ pub fn detach(
         info(io, "worktree: {s}/.git -> {s}/worktrees/...\n", .{ wt, restored_git });
     }
 
-    // --- Step 6: Archive or remove gitstore entry ---
+    // --- Step 6: Archive or remove z3store entry ---
     if (keep_backup) {
         var ts_buf: [30]u8 = undefined;
         const ts = oplog.timestamp(io, &ts_buf);
@@ -1125,16 +1125,16 @@ pub fn detach(
         );
         defer gpa.free(archived);
         Dir.rename(Dir.cwd(), repo_store_dir, Dir.cwd(), archived, io) catch |err| {
-            warn(io, "warn: could not archive gitstore entry ({s}); left in place\n", .{@errorName(err)});
+            warn(io, "warn: could not archive z3store entry ({s}); left in place\n", .{@errorName(err)});
         };
         try oplog.logOperation(io, log_path, .remove, repo_store_dir, archived, "ok: detach archived");
         info(io, "archived: {s} -> {s}\n", .{ repo_store_dir, archived });
     } else {
         Dir.cwd().deleteTree(io, repo_store_dir) catch |err| {
-            warn(io, "warn: could not remove gitstore entry ({s})\n", .{@errorName(err)});
+            warn(io, "warn: could not remove z3store entry ({s})\n", .{@errorName(err)});
         };
         try oplog.logOperation(io, log_path, .remove, repo_store_dir, "", "ok: detach removed");
-        info(io, "removed gitstore entry: {s}\n", .{repo_store_dir});
+        info(io, "removed z3store entry: {s}\n", .{repo_store_dir});
     }
 }
 
