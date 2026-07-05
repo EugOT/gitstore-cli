@@ -298,25 +298,32 @@ fn dirExists(io: Io, path: []const u8) bool {
     return true;
 }
 
+fn statPathExists(io: Io, path: []const u8) !bool {
+    _ = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        error.NameTooLong, error.SystemResources => return err,
+        else => return false,
+    };
+    return true;
+}
+
 /// True if `<dir>/<name>` exists (file, dir, or pointer). Used to probe for a
 /// repo's `.git`/`.jj` entries without allocating a persistent path.
-fn hasEntry(gpa: Allocator, io: Io, dir: []const u8, name: []const u8) bool {
-    const p = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name }) catch return false;
-    defer gpa.free(p);
-    _ = Dir.cwd().statFile(io, p, .{}) catch return false;
-    return true;
+fn hasEntry(io: Io, dir: []const u8, name: []const u8) !bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch return error.NameTooLong;
+    return statPathExists(io, p);
 }
 
 /// Resolve `p` against `base` when relative and report whether it exists. Lore's
 /// `shared_store_path` may be absolute or worktree-relative.
-fn sharedStoreExists(gpa: Allocator, io: Io, base: []const u8, p: []const u8) bool {
+fn sharedStoreExists(io: Io, base: []const u8, p: []const u8) !bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
     const full = if (p.len > 0 and p[0] == '/')
-        gpa.dupe(u8, p) catch return false
+        std.fmt.bufPrint(&buf, "{s}", .{p}) catch return error.NameTooLong
     else
-        std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, p }) catch return false;
-    defer gpa.free(full);
-    _ = Dir.cwd().statFile(io, full, .{}) catch return false;
-    return true;
+        std.fmt.bufPrint(&buf, "{s}/{s}", .{ base, p }) catch return error.NameTooLong;
+    return statPathExists(io, full);
 }
 
 /// Print the Lore workspace report for `path` to stdout and return whether it
@@ -337,7 +344,7 @@ fn writeLoreReport(gpa: Allocator, io: Io, path: []const u8) !bool {
     var ok = st.has_instance;
     if (st.shared_store_configured) {
         if (st.shared_store_path) |sp| {
-            const exists = sharedStoreExists(gpa, io, path, sp);
+            const exists = try sharedStoreExists(io, path, sp);
             try w.interface.print(
                 "  shared_store: enabled -> {s} ({s})\n",
                 .{ sp, if (exists) "exists" else "MISSING" },
@@ -787,20 +794,21 @@ pub fn main(init: std.process.Init) !u8 {
         // corrupt the workspace. Refuse cleanly, mutate nothing.
         if (!all) {
             if (path) |p| {
-                if (lore.detectLoreWorkspace(io, p) and
-                    !hasEntry(gpa, io, p, ".git") and
-                    !hasEntry(gpa, io, p, ".jj"))
-                {
-                    var buf: [1024]u8 = undefined;
-                    var w = File.stderr().writerStreaming(io, &buf);
-                    try w.interface.print(
-                        "error: {s} is an EpicGames Lore workspace (.lore/) with no git/jj to adopt.\n" ++
-                            "  .lore/ is not relocatable and z3store never writes into it.\n" ++
-                            "  To keep bulk data out of the worktree, use Lore's own shared store: `lore shared-store`.\n",
-                        .{p},
-                    );
-                    try w.flush();
-                    return 1;
+                if (lore.detectLoreWorkspace(io, p)) {
+                    const has_git = try hasEntry(io, p, ".git");
+                    const has_jj = try hasEntry(io, p, ".jj");
+                    if (!has_git and !has_jj) {
+                        var buf: [1024]u8 = undefined;
+                        var w = File.stderr().writerStreaming(io, &buf);
+                        try w.interface.print(
+                            "error: {s} is an EpicGames Lore workspace (.lore/) with no git/jj to adopt.\n" ++
+                                "  .lore/ is not relocatable and z3store never writes into it.\n" ++
+                                "  To keep bulk data out of the worktree, use Lore's own shared store: `lore shared-store`.\n",
+                            .{p},
+                        );
+                        try w.flush();
+                        return 1;
+                    }
                 }
             }
         }
@@ -875,7 +883,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (all) {
             try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
         } else if (path) |p| {
-            const has_git = hasEntry(gpa, io, p, ".git");
+            const has_git = try hasEntry(io, p, ".git");
             const is_lore = lore.detectLoreWorkspace(io, p);
             var ok = true;
             // Run the standard pointer/symlink verify whenever git is present,

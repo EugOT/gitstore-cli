@@ -123,6 +123,38 @@ fn stripQuotes(v: []const u8) []const u8 {
     return v;
 }
 
+/// Strip TOML inline comments while preserving `#` bytes inside quoted values.
+fn stripUnquotedInlineComment(line: []const u8) []const u8 {
+    var in_single = false;
+    var in_double = false;
+    var escaped = false;
+
+    for (line, 0..) |c, i| {
+        if (in_double) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_double = false;
+            }
+            continue;
+        }
+        if (in_single) {
+            if (c == '\'') in_single = false;
+            continue;
+        }
+
+        switch (c) {
+            '#' => return line[0..i],
+            '"' => in_double = true,
+            '\'' => in_single = true,
+            else => {},
+        }
+    }
+    return line;
+}
+
 /// Minimal line scanner for the ONLY keys z3store cares about:
 /// `[shared_store_to_use].use_shared_store` and `.shared_store_path`. This is
 /// deliberately not a general TOML parser — it tracks the current `[table]`
@@ -132,7 +164,7 @@ fn parseSharedStore(gpa: Allocator, content: []const u8, st: *LoreStatus) !void 
     var in_section = false;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
+        const line = std.mem.trim(u8, stripUnquotedInlineComment(raw), " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
 
         if (line[0] == '[') {
@@ -244,6 +276,52 @@ test "lore: loreStatus parses shared_store_to_use table" {
     try testing.expect(st.shared_store_configured);
     try testing.expect(st.shared_store_path != null);
     try testing.expectEqualStrings("/srv/lore/shared", st.shared_store_path.?);
+}
+
+test "lore: loreStatus parses bool with unquoted inline comment" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const ws = try uniqueWs(gpa, io, "inline_bool_comment");
+    defer {
+        Dir.cwd().deleteTree(io, ws) catch {};
+        gpa.free(ws);
+    }
+
+    try writeLoreFile(gpa, io, ws, "instance", "id\n");
+    try writeLoreFile(gpa, io, ws, "config.toml",
+        \\[shared_store_to_use]
+        \\use_shared_store = true # enabled for this workspace
+        \\
+    );
+
+    var st = try loreStatus(gpa, io, ws);
+    defer st.deinit(gpa);
+
+    try testing.expect(st.shared_store_configured);
+}
+
+test "lore: loreStatus preserves hash inside quoted shared_store_path" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const ws = try uniqueWs(gpa, io, "quoted_hash");
+    defer {
+        Dir.cwd().deleteTree(io, ws) catch {};
+        gpa.free(ws);
+    }
+
+    try writeLoreFile(gpa, io, ws, "instance", "id\n");
+    try writeLoreFile(gpa, io, ws, "config.toml",
+        \\[shared_store_to_use] # selected store
+        \\use_shared_store = true
+        \\shared_store_path = "/srv/lore#shared" # literal # is inside quotes
+        \\
+    );
+
+    var st = try loreStatus(gpa, io, ws);
+    defer st.deinit(gpa);
+
+    try testing.expect(st.shared_store_path != null);
+    try testing.expectEqualStrings("/srv/lore#shared", st.shared_store_path.?);
 }
 
 test "lore: loreStatus without config reports partial workspace" {

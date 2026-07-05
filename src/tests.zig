@@ -2504,6 +2504,26 @@ test "e2e verify on a lore-only workspace reports metadata, exit 0" {
     try testing.expect(std.mem.indexOf(u8, out.stdout, "shared_store: not configured") != null);
 }
 
+test "e2e verify fails when lore shared store is enabled without a path" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const ws = try makeLoreFixture(gpa, io,
+        \\[shared_store_to_use]
+        \\use_shared_store = true
+        \\
+    );
+    defer {
+        Dir.cwd().deleteTree(io, ws) catch {};
+        gpa.free(ws);
+    }
+
+    var out = try spawnZt(gpa, io, &.{ "verify", ws });
+    defer out.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 1), out.exit);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "shared_store: enabled but no shared_store_path set") != null);
+}
+
 test "e2e lore subcommand help prints to stdout, exit 0" {
     try runE2eCase(testing.allocator, testing.io, .{
         .argv_tail = &.{ "lore", "--help" },
