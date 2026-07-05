@@ -291,9 +291,14 @@ const sub_help_migrate =
     \\
 ;
 
-/// True if an absolute directory path currently exists.
-fn dirExists(io: Io, path: []const u8) bool {
-    var d = Dir.openDirAbsolute(io, path, .{}) catch return false;
+/// True if an absolute directory path currently exists. Only genuine
+/// absence maps to false — other probe failures propagate so store-root
+/// selection can never silently fall back to the wrong store.
+fn dirExists(io: Io, path: []const u8) !bool {
+    var d = Dir.openDirAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
     d.close(io);
     return true;
 }
@@ -343,12 +348,18 @@ fn writeLoreReport(gpa: Allocator, io: Io, path: []const u8) !bool {
     var ok = st.has_instance;
     if (st.shared_store_configured) {
         if (st.shared_store_path) |sp| {
-            const exists = try sharedStoreExists(io, path, sp);
-            try w.interface.print(
-                "  shared_store: enabled -> {s} ({s})\n",
-                .{ sp, if (exists) "exists" else "MISSING" },
-            );
-            if (!exists) ok = false;
+            if (sp.len == 0) {
+                // Enabled with an empty path is as unresolvable as no path.
+                try w.interface.print("  shared_store: enabled but shared_store_path is empty\n", .{});
+                ok = false;
+            } else {
+                const exists = try sharedStoreExists(io, path, sp);
+                try w.interface.print(
+                    "  shared_store: enabled -> {s} ({s})\n",
+                    .{ sp, if (exists) "exists" else "MISSING" },
+                );
+                if (!exists) ok = false;
+            }
         } else {
             try w.interface.print("  shared_store: enabled but no shared_store_path set\n", .{});
             ok = false;
@@ -417,11 +428,13 @@ fn cmdLore(
 fn getStoreRoot(gpa: Allocator, io: Io, environ_map: *const std.process.Environ.Map) ![]u8 {
     const home = environ_map.get("HOME") orelse return error.InvalidUserId;
     const z3 = try std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
-    if (dirExists(io, z3)) return z3;
+    errdefer gpa.free(z3);
+    if (try dirExists(io, z3)) return z3;
     gpa.free(z3);
 
     const legacy = try std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
-    if (dirExists(io, legacy)) return legacy;
+    errdefer gpa.free(legacy);
+    if (try dirExists(io, legacy)) return legacy;
     gpa.free(legacy);
 
     return std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
@@ -1178,10 +1191,11 @@ fn cmdGet(
 
     try printLegacyConfigHint(io, &cfg);
 
-    // Resolve gitstore root (for adoption side effect).
+    // Resolve gitstore root (for adoption side effect). With --no-adopt
+    // nothing will be written to the store, so don't create it either.
     const gitstore_root = try getStoreRoot(gpa, io, environ_map);
     defer gpa.free(gitstore_root);
-    try gitstore.init(io, gitstore_root);
+    if (!opts.no_adopt) try gitstore.init(io, gitstore_root);
 
     // Parse URLs into specs.
     var specs: std.ArrayList(url_mod.RepoSpec) = .empty;

@@ -2139,6 +2139,11 @@ const ZtOut = struct {
     }
 };
 
+const ZtRunHarness = struct {
+    home_prefix: []const u8,
+    git_config_prefix: []const u8,
+};
+
 /// Build a controlled child environment. HOME and GIT_CONFIG_GLOBAL point at
 /// the supplied throwaway paths; PATH is copied from the test environ so the
 /// child can still resolve git/jj if a code path reaches an exec (the
@@ -2163,21 +2168,20 @@ fn controlledEnv(
 }
 
 /// Spawn the built zt binary with `argv_tail` and a controlled env.
-fn spawnZtControlled(
+fn runZtControlled(
     gpa: Allocator,
     io: Io,
     argv_tail: []const []const u8,
-    home_prefix: []const u8,
-    git_config_prefix: []const u8,
+    harness: ZtRunHarness,
 ) !ZtOut {
     // Throwaway HOME dir + empty global gitconfig, unique per invocation so
     // parallel test execution cannot collide.
-    const home = try uniqueTempDir(gpa, io, home_prefix);
+    const home = try uniqueTempDir(gpa, io, harness.home_prefix);
     defer {
         Dir.cwd().deleteTree(io, home) catch {};
         gpa.free(home);
     }
-    const git_config = try uniqueTempFile(gpa, io, git_config_prefix, ".gitconfig");
+    const git_config = try uniqueTempFile(gpa, io, harness.git_config_prefix, ".gitconfig");
     defer {
         Dir.cwd().deleteFile(io, git_config) catch {};
         gpa.free(git_config);
@@ -2203,6 +2207,19 @@ fn spawnZtControlled(
     return .{ .exit = result.term.exited, .stdout = result.stdout, .stderr = result.stderr };
 }
 
+fn spawnZtControlled(
+    gpa: Allocator,
+    io: Io,
+    argv_tail: []const []const u8,
+    home_prefix: []const u8,
+    git_config_prefix: []const u8,
+) !ZtOut {
+    return runZtControlled(gpa, io, argv_tail, .{
+        .home_prefix = home_prefix,
+        .git_config_prefix = git_config_prefix,
+    });
+}
+
 /// Spawn the built zt binary with `argv_tail` and a controlled env,
 /// then assert the expected exit code and that `needle` appears in the
 /// selected stream. Uses std.process.run (the same high-level spawn API
@@ -2213,7 +2230,10 @@ fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
     const argv_desc = try std.mem.join(gpa, " ", case.argv_tail);
     defer gpa.free(argv_desc);
 
-    var result = try spawnZtControlled(gpa, io, case.argv_tail, "/tmp/gitstore_e2e_home", "/tmp/gitstore_e2e");
+    var result = try runZtControlled(gpa, io, case.argv_tail, .{
+        .home_prefix = "/tmp/gitstore_e2e_home",
+        .git_config_prefix = "/tmp/gitstore_e2e",
+    });
     defer result.deinit(gpa);
 
     // Exit-code assertion.
@@ -2438,6 +2458,66 @@ fn spawnZt(gpa: Allocator, io: Io, argv_tail: []const []const u8) !ZtOut {
     return spawnZtControlled(gpa, io, argv_tail, "/tmp/gitstore_lore_home", "/tmp/gitstore_lore");
 }
 
+const LoreFileSnapshot = struct {
+    name: []const u8,
+    bytes: []const u8,
+
+    fn deinit(self: *LoreFileSnapshot, gpa: Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.bytes);
+    }
+};
+
+const LoreSnapshot = struct {
+    files: []LoreFileSnapshot,
+
+    fn deinit(self: *LoreSnapshot, gpa: Allocator) void {
+        for (self.files) |*file| file.deinit(gpa);
+        gpa.free(self.files);
+    }
+};
+
+fn loreSnapshotLessThan(_: void, lhs: LoreFileSnapshot, rhs: LoreFileSnapshot) bool {
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
+fn snapshotLoreFiles(gpa: Allocator, io: Io, ws: []const u8) !LoreSnapshot {
+    const lore_dir = try std.fmt.allocPrint(gpa, "{s}/.lore", .{ws});
+    defer gpa.free(lore_dir);
+
+    var dir = try Dir.openDirAbsolute(io, lore_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    var files: std.ArrayList(LoreFileSnapshot) = .empty;
+    errdefer {
+        for (files.items) |*file| file.deinit(gpa);
+        files.deinit(gpa);
+    }
+
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ lore_dir, entry.name });
+        defer gpa.free(path);
+        const name = try gpa.dupe(u8, entry.name);
+        errdefer gpa.free(name);
+        const bytes = try Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+        errdefer gpa.free(bytes);
+        try files.append(gpa, .{ .name = name, .bytes = bytes });
+    }
+
+    std.mem.sort(LoreFileSnapshot, files.items, {}, loreSnapshotLessThan);
+    return .{ .files = try files.toOwnedSlice(gpa) };
+}
+
+fn expectLoreSnapshotEqual(expected: LoreSnapshot, actual: LoreSnapshot) !void {
+    try testing.expectEqual(expected.files.len, actual.files.len);
+    for (expected.files, actual.files) |expected_file, actual_file| {
+        try testing.expectEqualStrings(expected_file.name, actual_file.name);
+        try testing.expectEqualSlices(u8, expected_file.bytes, actual_file.bytes);
+    }
+}
+
 /// Create a Lore workspace fixture at a unique /tmp dir. When `config_body` is
 /// non-null it is written to `.lore/config.toml`. Caller owns/deletes the dir.
 fn makeLoreFixture(gpa: Allocator, io: Io, config_body: ?[]const u8) ![]u8 {
@@ -2465,15 +2545,20 @@ test "e2e adopt refuses a lore-only workspace and mutates nothing" {
         gpa.free(ws);
     }
 
+    var before = try snapshotLoreFiles(gpa, io, ws);
+    defer before.deinit(gpa);
+
     var out = try spawnZt(gpa, io, &.{ "adopt", ws });
     defer out.deinit(gpa);
 
-    try testing.expect(out.exit != 0);
+    try testing.expectEqual(@as(u8, 1), out.exit);
     try testing.expect(std.mem.indexOf(u8, out.stderr, "Lore workspace") != null);
     try testing.expect(std.mem.indexOf(u8, out.stderr, "lore shared-store") != null);
 
-    // No mutation: `.lore/instance` still present, no `.git` pointer created.
-    try testing.expect(lore.detectLoreWorkspace(io, ws));
+    // No mutation: `.lore` file list and contents unchanged; no `.git` pointer created.
+    var after = try snapshotLoreFiles(gpa, io, ws);
+    defer after.deinit(gpa);
+    try expectLoreSnapshotEqual(before, after);
     const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{ws});
     defer gpa.free(git_path);
     try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, git_path, .{}));

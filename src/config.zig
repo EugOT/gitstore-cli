@@ -130,6 +130,7 @@ fn ghUser(gpa: Allocator, io: Io) LoadError!?[]u8 {
         return null;
     }
     if (trimmed.len == result.stdout.len) return result.stdout;
+    errdefer gpa.free(result.stdout);
     const owned = try gpa.dupe(u8, trimmed);
     gpa.free(result.stdout);
     return owned;
@@ -414,6 +415,7 @@ pub fn resolveRootForUrlWithConfigFile(
             const trimmed = exec.trimTrailingNewline(result.stdout);
             if (trimmed.len != 0) {
                 if (trimmed.len == result.stdout.len) return result.stdout;
+                errdefer gpa.free(result.stdout);
                 const owned = try gpa.dupe(u8, trimmed);
                 gpa.free(result.stdout);
                 return owned;
@@ -438,6 +440,7 @@ pub fn resolveRootForUrlWithConfigFile(
             const trimmed = exec.trimTrailingNewline(result.stdout);
             if (trimmed.len != 0) {
                 if (trimmed.len == result.stdout.len) return result.stdout;
+                errdefer gpa.free(result.stdout);
                 const owned = try gpa.dupe(u8, trimmed);
                 gpa.free(result.stdout);
                 return owned;
@@ -461,6 +464,7 @@ pub fn resolveRootForUrlWithConfigFile(
             const trimmed = exec.trimTrailingNewline(result.stdout);
             if (trimmed.len != 0) {
                 if (trimmed.len == result.stdout.len) return result.stdout;
+                errdefer gpa.free(result.stdout);
                 const owned = try gpa.dupe(u8, trimmed);
                 gpa.free(result.stdout);
                 return owned;

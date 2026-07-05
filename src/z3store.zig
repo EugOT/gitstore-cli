@@ -133,7 +133,9 @@ pub fn initRepo(
         var dir = Dir.openDirAbsolute(io, git_path, .{}) catch |err| switch (err) {
             error.NotDir => break :blk true, // .git is a pointer file — a real repo
             error.FileNotFound => break :blk false,
-            else => break :blk false,
+            // Transient probe failures must not silently trigger `git init`
+            // inside an existing repo — propagate them.
+            else => return err,
         };
         dir.close(io);
         break :blk true;
@@ -147,11 +149,21 @@ pub fn initRepo(
         if (!git_init.succeeded()) return error.ProcessFailed;
 
         info(io, "jj init: {s}\n", .{repo_path});
-        const jj_init = try ex.exec(gpa, io, &.{ "jj", "git", "init", "--colocate" }, repo_path);
-        gpa.free(jj_init.stdout);
-        gpa.free(jj_init.stderr);
-        if (!jj_init.succeeded()) {
-            warn(io, "warn: jj init failed (continuing git-only)\n", .{});
+        // #22 parity with adopt(): a missing jj binary is best-effort here
+        // too — the git repo is already initialized, so continue git-only.
+        const jj_init: ?ex.ExecResult = ex.exec(gpa, io, &.{ "jj", "git", "init", "--colocate" }, repo_path) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                warn(io, "warn: jj init unavailable (non-fatal): jj not found\n", .{});
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (jj_init) |ji| {
+            gpa.free(ji.stdout);
+            gpa.free(ji.stderr);
+            if (!ji.succeeded()) {
+                warn(io, "warn: jj init failed (continuing git-only)\n", .{});
+            }
         }
     }
 
@@ -419,6 +431,23 @@ pub fn adoptWithJjBinary(
     }
     try Dir.cwd().createDirPath(io, repo_store_dir);
 
+    // Refuse a pre-existing store target: `cp -a` would merge into a stale
+    // git dir from an earlier adopt and can silently mix refs/objects.
+    if (Dir.openDirAbsolute(io, git_dest, .{})) |d| {
+        var dd = d;
+        dd.close(io);
+        warn(io, "error: store target already exists: {s} (verify or remove it first)\n", .{git_dest});
+        try oplog.logOperation(io, log_path, .copy, git_src, git_dest, "error: target exists");
+        return error.AlreadyAdopted;
+    } else |probe_err| switch (probe_err) {
+        error.FileNotFound => {},
+        error.NotDir => {
+            warn(io, "error: store target exists as a file: {s}\n", .{git_dest});
+            return error.GitDirMalformed;
+        },
+        else => return probe_err,
+    }
+
     // --- Step 2: Copy .git to gitstore ---
     info(io, "copy: {s} -> {s}\n", .{ git_src, git_dest });
     const cp_result = try ex.exec(gpa, io, &.{ "cp", "-a", git_src, git_dest }, null);
@@ -517,10 +546,20 @@ pub fn adoptWithJjBinary(
 
         try rewriteJjGitTarget(gpa, io, jj_dest, git_dest);
 
-        try Dir.cwd().deleteTree(io, jj_src);
+        // Move the original .jj aside instead of deleting it before the
+        // symlink exists — restore it on failure so there is no window
+        // where the worktree has no .jj at all.
+        const jj_aside = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-old", .{repo_path});
+        defer gpa.free(jj_aside);
+        Dir.cwd().deleteTree(io, jj_aside) catch {};
+        try Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io);
+        Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true }) catch |err| {
+            warn(io, "error: .jj symlink failed ({s}); restoring original .jj\n", .{@errorName(err)});
+            Dir.rename(Dir.cwd(), jj_aside, Dir.cwd(), jj_src, io) catch {};
+            return err;
+        };
+        try Dir.cwd().deleteTree(io, jj_aside);
         try oplog.logOperation(io, log_path, .remove, jj_src, "", "ok");
-
-        try Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true });
         try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
         info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
     } else {
@@ -769,9 +808,23 @@ pub fn status(
     }
 
     if (json_mode) {
-        info(io,
-            \\{{"disk_usage":"{s}","z3store_root":"{s}","total_repos":{d},"adopted":{d},"broken":{d}}}
-        ++ "\n", .{ disk_usage, gitstore_root, total_repos, adopted_count, broken_count });
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        var s: std.json.Stringify = .{ .writer = &aw.writer };
+        try s.beginObject();
+        try s.objectField("disk_usage");
+        try s.write(disk_usage);
+        try s.objectField("z3store_root");
+        try s.write(gitstore_root);
+        try s.objectField("total_repos");
+        try s.write(total_repos);
+        try s.objectField("adopted");
+        try s.write(adopted_count);
+        try s.objectField("broken");
+        try s.write(broken_count);
+        try s.endObject();
+        try aw.writer.writeByte('\n');
+        info(io, "{s}", .{aw.written()});
     } else {
         info(io, "z3store: {s}\n", .{gitstore_root});
         info(io, "disk usage: {s}\n", .{disk_usage});
@@ -848,6 +901,7 @@ pub fn sync(
         try createExclusiveFilterTmp(gpa, io, hooks.rclone_filter)
     else blk: {
         const p = try std.fmt.allocPrint(gpa, "{s}/rclone-filter.txt", .{gitstore_root});
+        errdefer gpa.free(p);
         try Dir.cwd().writeFile(io, .{ .sub_path = p, .data = hooks.rclone_filter });
         break :blk p;
     };
@@ -1112,8 +1166,11 @@ pub fn detach(
         Dir.cwd().deleteTree(io, jj_new) catch {};
         info(io, "copy: {s} -> {s}\n", .{ jj_src, jj_new });
         const jcp = try ex.exec(gpa, io, &.{ "cp", "-aL", jj_src, jj_new }, null);
-        gpa.free(jcp.stdout);
-        gpa.free(jcp.stderr);
+        // Freed via defer — the failure branch below still reads jcp.stderr.
+        defer {
+            gpa.free(jcp.stdout);
+            gpa.free(jcp.stderr);
+        }
         if (jcp.succeeded()) {
             // Rename the symlink aside first — do NOT delete it until the new .jj is in place.
             const jj_backup = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-old", .{repo_path});
@@ -1174,13 +1231,17 @@ pub fn detach(
         );
         defer gpa.free(archived);
         Dir.rename(Dir.cwd(), repo_store_dir, Dir.cwd(), archived, io) catch |err| {
-            warn(io, "warn: could not archive z3store entry ({s}); left in place\n", .{@errorName(err)});
+            warn(io, "error: could not archive z3store entry ({s}); left in place\n", .{@errorName(err)});
+            try oplog.logOperation(io, log_path, .remove, repo_store_dir, archived, "error: archive failed (left in place)");
+            return err;
         };
         try oplog.logOperation(io, log_path, .remove, repo_store_dir, archived, "ok: detach archived");
         info(io, "archived: {s} -> {s}\n", .{ repo_store_dir, archived });
     } else {
         Dir.cwd().deleteTree(io, repo_store_dir) catch |err| {
-            warn(io, "warn: could not remove z3store entry ({s})\n", .{@errorName(err)});
+            warn(io, "error: could not remove z3store entry ({s})\n", .{@errorName(err)});
+            try oplog.logOperation(io, log_path, .remove, repo_store_dir, "", "error: remove failed (left in place)");
+            return err;
         };
         try oplog.logOperation(io, log_path, .remove, repo_store_dir, "", "ok: detach removed");
         info(io, "removed z3store entry: {s}\n", .{repo_store_dir});

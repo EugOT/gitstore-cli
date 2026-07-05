@@ -229,6 +229,12 @@ test "hook: bash defines ghq() function" {
     try testing.expect(mem.indexOf(u8, bash_hook, "ghq() {") != null);
 }
 
+test "hook: bash prefers zt over ghq" {
+    const zt_cmd_index = mem.indexOf(u8, bash_hook, "command -v zt").?;
+    const ghq = mem.indexOf(u8, bash_hook, "command -v ghq").?;
+    try testing.expect(zt_cmd_index < ghq);
+}
+
 test "hook: bash forwards all args to zt" {
     try testing.expect(mem.indexOf(u8, bash_hook, "command zt \"$@\"") != null);
 }

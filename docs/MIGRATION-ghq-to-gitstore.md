@@ -87,16 +87,36 @@ ROOT=$(git config --global --get z3store.root \
 USER=$(git config --global --get z3store.user \
   || git config --global --get gitstore.user \
   || git config --global --get ghq.user || true)
+DEFAULT_HOST=$(git config --global --get z3store.defaultHost \
+  || git config --global --get gitstore.defaultHost \
+  || git config --global --get ghq.defaultHost || echo "github.com")
+COMPLETE_USER=$(git config --global --get z3store.completeUser \
+  || git config --global --get gitstore.completeUser \
+  || git config --global --get ghq.completeUser || echo "true")
+ADOPT_ON_CLONE=$(git config --global --get z3store.adoptOnClone \
+  || git config --global --get gitstore.adoptOnClone || echo "true")
+JJ_COLOCATE=$(git config --global --get z3store.jjColocate \
+  || git config --global --get gitstore.jjColocate || echo "true")
 
 # Set z3store.* equivalents
 git config --global z3store.root "$ROOT"
 [ -n "$USER" ] && git config --global z3store.user "$USER"
+git config --global z3store.defaultHost "$DEFAULT_HOST"
+git config --global z3store.completeUser "$COMPLETE_USER"
+git config --global z3store.adoptOnClone "$ADOPT_ON_CLONE"
+git config --global z3store.jjColocate "$JJ_COLOCATE"
 
 # Optional — remove the old keys once parity is confirmed
 # git config --global --unset ghq.root
 # git config --global --unset ghq.user
+# git config --global --unset ghq.defaultHost
+# git config --global --unset ghq.completeUser
 # git config --global --unset gitstore.root
 # git config --global --unset gitstore.user
+# git config --global --unset gitstore.defaultHost
+# git config --global --unset gitstore.completeUser
+# git config --global --unset gitstore.adoptOnClone
+# git config --global --unset gitstore.jjColocate
 ```
 
 ### Config key cross-reference
@@ -125,7 +145,7 @@ precedence over `$GHQ_ROOT`.
 
 - **`ghq` still runs the Go binary after `chezmoi apply`** — reload the shell function/command cache for your shell. zsh: restart the shell or `source ~/.config/zsh/functions.zsh`. bash: `source ~/.bashrc` and `hash -r`. Nushell: `exec nu` or re-source the config that defines the alias/function. Shell functions don't re-load automatically.
 - **`zt list` shows nothing** — check `zt root` matches where your repos live; if empty, `git config --global z3store.root <path>`.
-- **Deprecation warning on every run** — indicates `z3store.*` is absent and a legacy `gitstore.*` / `ghq.*` fallback is being used; see Phase 3 above.
+- **Deprecation warning on every run** — indicates a `z3store.*` key is absent and the matching legacy `gitstore.*` / `ghq.*` key is being used for that setting; see Phase 3 above.
 - **Want to fall back to real ghq for a single invocation** — use `command ghq <args>` (the `command` builtin bypasses the shell function).
 
 ## Related
