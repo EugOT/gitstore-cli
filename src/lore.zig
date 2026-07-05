@@ -34,12 +34,18 @@ const Io = std.Io;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 
+/// Lore configs are small client metadata; cap reads so a corrupt file cannot
+/// make `zt lore` allocate unbounded memory.
+const max_lore_config_bytes = 1 * 1024 * 1024;
+
 /// Result of inspecting a candidate Lore workspace. `shared_store_path` (when
 /// present) is heap-owned by the allocator passed to `loreStatus`; call
 /// `deinit` to release it.
 pub const LoreStatus = struct {
     /// `.lore/config.toml` exists and was readable.
     has_config: bool,
+    /// `.lore/config.toml` exists but could not be parsed/read within limits.
+    config_parse_failed: bool,
     /// `.lore/instance` exists (the load-bearing marker of a Lore workspace).
     has_instance: bool,
     /// `[shared_store_to_use].use_shared_store` parsed as `true`.
@@ -78,6 +84,7 @@ pub fn detectLoreWorkspace(io: Io, path: []const u8) bool {
 pub fn loreStatus(gpa: Allocator, io: Io, path: []const u8) !LoreStatus {
     var st: LoreStatus = .{
         .has_config = false,
+        .config_parse_failed = false,
         .has_instance = false,
         .shared_store_configured = false,
         .shared_store_path = null,
@@ -91,8 +98,13 @@ pub fn loreStatus(gpa: Allocator, io: Io, path: []const u8) !LoreStatus {
 
     const config_path = try std.fmt.allocPrint(gpa, "{s}/.lore/config.toml", .{path});
     defer gpa.free(config_path);
-    const content = Dir.cwd().readFileAlloc(io, config_path, gpa, .unlimited) catch |err| {
+    const content = Dir.cwd().readFileAlloc(io, config_path, gpa, .limited(max_lore_config_bytes)) catch |err| {
         if (err == error.OutOfMemory) return err;
+        if (err == error.StreamTooLong) {
+            st.has_config = true;
+            st.config_parse_failed = true;
+            return st;
+        }
         // Absent / not-a-file / permission: report as no config, keep going.
         return st;
     };
@@ -250,6 +262,31 @@ test "lore: loreStatus without config reports partial workspace" {
 
     try testing.expect(st.has_instance);
     try testing.expect(!st.has_config);
+    try testing.expect(!st.shared_store_configured);
+    try testing.expect(st.shared_store_path == null);
+}
+
+test "lore: loreStatus treats oversized config as parse failure" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const ws = try uniqueWs(gpa, io, "oversize");
+    defer {
+        Dir.cwd().deleteTree(io, ws) catch {};
+        gpa.free(ws);
+    }
+
+    try writeLoreFile(gpa, io, ws, "instance", "0192f000-0000-7000-8000-000000000000\n");
+    const big = try gpa.alloc(u8, max_lore_config_bytes + 1);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    try writeLoreFile(gpa, io, ws, "config.toml", big);
+
+    var st = try loreStatus(gpa, io, ws);
+    defer st.deinit(gpa);
+
+    try testing.expect(st.has_instance);
+    try testing.expect(st.has_config);
+    try testing.expect(st.config_parse_failed);
     try testing.expect(!st.shared_store_configured);
     try testing.expect(st.shared_store_path == null);
 }

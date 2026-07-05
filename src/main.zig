@@ -330,7 +330,9 @@ fn writeLoreReport(gpa: Allocator, io: Io, path: []const u8) !bool {
     var w = File.stdout().writerStreaming(io, &buf);
     try w.interface.print("lore: workspace metadata at {s}/.lore\n", .{path});
     try w.interface.print("  instance:    {s}\n", .{if (st.has_instance) "present" else "MISSING"});
-    try w.interface.print("  config.toml: {s}\n", .{if (st.has_config) "present" else "absent"});
+    try w.interface.print("  config.toml: {s}\n", .{
+        if (st.config_parse_failed) "present (parse failed)" else if (st.has_config) "present" else "absent",
+    });
 
     var ok = st.has_instance;
     if (st.shared_store_configured) {
@@ -343,10 +345,12 @@ fn writeLoreReport(gpa: Allocator, io: Io, path: []const u8) !bool {
             if (!exists) ok = false;
         } else {
             try w.interface.print("  shared_store: enabled but no shared_store_path set\n", .{});
+            ok = false;
         }
     } else {
         try w.interface.print("  shared_store: not configured\n", .{});
     }
+    if (st.config_parse_failed) ok = false;
     try w.flush();
     return ok;
 }
@@ -392,8 +396,8 @@ fn cmdLore(
         return 1;
     }
 
-    _ = try writeLoreReport(gpa, io, p);
-    return 0;
+    const ok = try writeLoreReport(gpa, io, p);
+    return if (ok) 0 else 1;
 }
 
 /// Resolve the store root under $HOME.

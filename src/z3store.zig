@@ -15,6 +15,8 @@ pub const Error = error{
     NotAdopted,
     InvalidGhqRoot,
     VerifyFailed,
+    GitDirMalformed,
+    TempFileCollision,
 } || Allocator.Error || ex.ExecError || Dir.WriteFileError || Dir.SymLinkError ||
     Dir.DeleteTreeError || Dir.OpenError || Dir.CreateDirPathError ||
     File.OpenError || File.StatError || Dir.ReadFileAllocError;
@@ -292,12 +294,12 @@ pub fn adoptWithJjBinary(
         return error.InvalidGhqRoot;
     };
 
-    // Round-5 hardening: parity with detach. Refuse insecure gitstore_root
-    // and reject empty / "." / ".." segments in rel_path so a crafted
-    // repo_path (e.g. /foo/../etc) cannot resolve outside gitstore_root
-    // when later concatenated with cp/rename ops.
+    // Round-5 hardening: parity with detach. Refuse insecure gitstore_root,
+    // reject empty / "." / ".." segments, and canonicalize existing store
+    // components so a symlinked ancestor cannot redirect createDirPath/cp
+    // outside gitstore_root.
+    var root_norm = gitstore_root;
     {
-        var root_norm = gitstore_root;
         while (root_norm.len > 1 and root_norm[root_norm.len - 1] == '/') root_norm = root_norm[0 .. root_norm.len - 1];
         if (root_norm.len < 2) {
             warn(io, "error: refusing to adopt with insecure gitstore_root: {s}\n", .{gitstore_root});
@@ -340,6 +342,8 @@ pub fn adoptWithJjBinary(
     defer gpa.free(jj_dest);
     const log_path = try std.fmt.allocPrint(gpa, "{s}/operations.log", .{gitstore_root});
     defer gpa.free(log_path);
+    const repo_store_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ gitstore_root, rel_path });
+    defer gpa.free(repo_store_dir);
 
     if (dry_run) {
         info(io, "dry-run: would adopt {s}\n", .{repo_path});
@@ -372,8 +376,45 @@ pub fn adoptWithJjBinary(
     }
 
     // --- Step 1: Create gitstore directory structure ---
-    const repo_store_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ gitstore_root, rel_path });
-    defer gpa.free(repo_store_dir);
+    try Dir.cwd().createDirPath(io, root_norm);
+    {
+        var canon_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var canon_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const canon_root_len = Dir.cwd().realPathFile(io, root_norm, &canon_root_buf) catch |err| {
+            warn(io, "error: could not canonicalize gitstore root {s}: {s}\n", .{ root_norm, @errorName(err) });
+            return error.GitDirMalformed;
+        };
+        const canon_root = canon_root_buf[0..canon_root_len];
+
+        var current = try gpa.dupe(u8, root_norm);
+        defer gpa.free(current);
+        var comps = std.mem.splitScalar(u8, rel_path, '/');
+        while (comps.next()) |seg| {
+            const next = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ current, seg });
+            const real_len = Dir.cwd().realPathFile(io, next, &canon_path_buf) catch |err| switch (err) {
+                error.FileNotFound => {
+                    gpa.free(next);
+                    break;
+                },
+                else => {
+                    warn(io, "error: could not canonicalize gitstore path {s}: {s}\n", .{ next, @errorName(err) });
+                    gpa.free(next);
+                    return error.GitDirMalformed;
+                },
+            };
+            const canon_path = canon_path_buf[0..real_len];
+            if (!std.mem.startsWith(u8, canon_path, canon_root) or
+                canon_path.len <= canon_root.len or
+                canon_path[canon_root.len] != '/')
+            {
+                warn(io, "error: canonicalized gitstore path {s} escapes canonicalized gitstore root {s}\n", .{ canon_path, canon_root });
+                gpa.free(next);
+                return error.GitDirMalformed;
+            }
+            gpa.free(current);
+            current = next;
+        }
+    }
     try Dir.cwd().createDirPath(io, repo_store_dir);
 
     // --- Step 2: Copy .git to gitstore ---

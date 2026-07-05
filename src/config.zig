@@ -80,19 +80,16 @@ fn parseBool(s: []const u8) bool {
     return false;
 }
 
-/// Returns a trimmed, heap-allocated copy of the stdout of
-/// `git config --get <key>` if the key is set. Returns `null` if the key is
-/// absent (non-zero exit) or if its value is empty after trimming.
-///
-/// Caller owns returned memory.
-fn gitConfigGet(
+/// Capture git config once and resolve individual keys from the snapshot.
+/// Missing/unreadable config behaves like repeated `git config --get` misses:
+/// it is not fatal, and every key falls through to later precedence tiers.
+fn gitConfigSnapshot(
     gpa: Allocator,
     io: Io,
-    key: []const u8,
     config_file: ?[]const u8,
 ) LoadError!?[]u8 {
-    const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get", key } else undefined;
-    const global_argv = [_][]const u8{ "git", "config", "--global", "--get", key };
+    const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--list" } else undefined;
+    const global_argv = [_][]const u8{ "git", "config", "--global", "--list" };
     const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
     var result = try exec.exec(gpa, io, argv, null);
     defer gpa.free(result.stderr);
@@ -100,15 +97,19 @@ fn gitConfigGet(
         gpa.free(result.stdout);
         return null;
     }
-    const trimmed = exec.trimTrailingNewline(result.stdout);
-    if (trimmed.len == 0) {
-        gpa.free(result.stdout);
-        return null;
+    return result.stdout;
+}
+
+fn snapshotValue(snapshot: ?[]const u8, key: []const u8) ?[]const u8 {
+    const content = snapshot orelse return null;
+    var found: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r");
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..eq], key)) found = line[eq + 1 ..];
     }
-    if (trimmed.len == result.stdout.len) return result.stdout;
-    const owned = try gpa.dupe(u8, trimmed);
-    gpa.free(result.stdout);
-    return owned;
+    return found;
 }
 
 /// Run `gh api user -q .login` to derive the GitHub username. Returns null on
@@ -153,16 +154,15 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     var used_legacy = false;
 
     const config_file = env.get("GIT_CONFIG_GLOBAL");
+    const config_snapshot = try gitConfigSnapshot(gpa, io, config_file);
+    defer if (config_snapshot) |s| gpa.free(s);
 
     // --- root ---
     // Primary z3store.* / $Z3STORE_ROOT, then legacy gitstore.* / ghq.* and
     // $GITSTORE_ROOT / $GHQ_ROOT.
-    const z3_root_raw = try gitConfigGet(gpa, io, "z3store.root", config_file);
-    defer if (z3_root_raw) |v| gpa.free(v);
-    const gitstore_root_raw = try gitConfigGet(gpa, io, "gitstore.root", config_file);
-    defer if (gitstore_root_raw) |v| gpa.free(v);
-    const ghq_root_raw = try gitConfigGet(gpa, io, "ghq.root", config_file);
-    defer if (ghq_root_raw) |v| gpa.free(v);
+    const z3_root_raw = snapshotValue(config_snapshot, "z3store.root");
+    const gitstore_root_raw = snapshotValue(config_snapshot, "gitstore.root");
+    const ghq_root_raw = snapshotValue(config_snapshot, "ghq.root");
     const env_z3_root = env.get("Z3STORE_ROOT");
     const env_gitstore_root = env.get("GITSTORE_ROOT");
     const env_ghq_root = env.get("GHQ_ROOT");
@@ -190,37 +190,33 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     if (root_res.legacy) used_legacy = true;
 
     // --- user ---
-    const z3_user_raw = try gitConfigGet(gpa, io, "z3store.user", config_file);
-    defer if (z3_user_raw) |v| gpa.free(v);
-    const gitstore_user_raw = try gitConfigGet(gpa, io, "gitstore.user", config_file);
-    defer if (gitstore_user_raw) |v| gpa.free(v);
-    const ghq_user_raw = try gitConfigGet(gpa, io, "ghq.user", config_file);
-    defer if (ghq_user_raw) |v| gpa.free(v);
+    const z3_user_raw = snapshotValue(config_snapshot, "z3store.user");
+    const gitstore_user_raw = snapshotValue(config_snapshot, "gitstore.user");
+    const ghq_user_raw = snapshotValue(config_snapshot, "ghq.user");
     const gh_user_raw = try ghUser(gpa, io);
     defer if (gh_user_raw) |v| gpa.free(v);
     const env_user = env.get("USER");
 
     var user: ?[]const u8 = null;
-    if (z3_user_raw) |v| {
+    if (nonEmpty(z3_user_raw)) |v| {
         user = try ownStatic(&owned_strings, gpa, v);
-    } else if (gitstore_user_raw) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
-        used_legacy = true;
-    } else if (ghq_user_raw) |v| {
+    } else if (nonEmpty(gitstore_user_raw)) |v| {
         user = try ownStatic(&owned_strings, gpa, v);
         used_legacy = true;
-    } else if (gh_user_raw) |v| {
+    } else if (nonEmpty(ghq_user_raw)) |v| {
         user = try ownStatic(&owned_strings, gpa, v);
-    } else if (env_user) |v| {
-        if (v.len != 0) user = try ownStatic(&owned_strings, gpa, v);
+        used_legacy = true;
+    } else if (nonEmpty(gh_user_raw)) |v| {
+        user = try ownStatic(&owned_strings, gpa, v);
+    } else if (nonEmpty(env_user)) |v| {
+        user = try ownStatic(&owned_strings, gpa, v);
     }
 
     // --- defaultHost ---
     const default_host = try resolveCfgTriple(
         gpa,
-        io,
         &owned_strings,
-        config_file,
+        config_snapshot,
         "z3store.defaultHost",
         "gitstore.defaultHost",
         "ghq.defaultHost",
@@ -231,9 +227,8 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     // --- completeUser ---
     const cu_val = try resolveCfgTriple(
         gpa,
-        io,
         &owned_strings,
-        config_file,
+        config_snapshot,
         "z3store.completeUser",
         "gitstore.completeUser",
         "ghq.completeUser",
@@ -245,9 +240,8 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     // --- adoptOnClone (no ghq fallback) ---
     const aoc_val = try resolveCfgPair(
         gpa,
-        io,
         &owned_strings,
-        config_file,
+        config_snapshot,
         "z3store.adoptOnClone",
         "gitstore.adoptOnClone",
         "true",
@@ -258,9 +252,8 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     // --- jjColocate (no ghq fallback) ---
     const jj_val = try resolveCfgPair(
         gpa,
-        io,
         &owned_strings,
-        config_file,
+        config_snapshot,
         "z3store.jjColocate",
         "gitstore.jjColocate",
         "true",
@@ -285,21 +278,17 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
 /// flips `used_legacy`. The returned slice is registered in `owned_strings`.
 fn resolveCfgTriple(
     gpa: Allocator,
-    io: Io,
     owned_strings: *std.ArrayList([]const u8),
-    config_file: ?[]const u8,
+    config_snapshot: ?[]const u8,
     z3_key: []const u8,
     gitstore_key: []const u8,
     ghq_key: []const u8,
     default_val: []const u8,
     used_legacy: *bool,
 ) LoadError![]const u8 {
-    const z3_raw = try gitConfigGet(gpa, io, z3_key, config_file);
-    defer if (z3_raw) |v| gpa.free(v);
-    const gitstore_raw = try gitConfigGet(gpa, io, gitstore_key, config_file);
-    defer if (gitstore_raw) |v| gpa.free(v);
-    const ghq_raw = try gitConfigGet(gpa, io, ghq_key, config_file);
-    defer if (ghq_raw) |v| gpa.free(v);
+    const z3_raw = snapshotValue(config_snapshot, z3_key);
+    const gitstore_raw = snapshotValue(config_snapshot, gitstore_key);
+    const ghq_raw = snapshotValue(config_snapshot, ghq_key);
 
     if (nonEmpty(z3_raw)) |v| return ownStatic(owned_strings, gpa, v);
     if (nonEmpty(gitstore_raw)) |v| {
@@ -316,18 +305,15 @@ fn resolveCfgTriple(
 /// Like `resolveCfgTriple` but with no `ghq.*` fallback tier.
 fn resolveCfgPair(
     gpa: Allocator,
-    io: Io,
     owned_strings: *std.ArrayList([]const u8),
-    config_file: ?[]const u8,
+    config_snapshot: ?[]const u8,
     z3_key: []const u8,
     gitstore_key: []const u8,
     default_val: []const u8,
     used_legacy: *bool,
 ) LoadError![]const u8 {
-    const z3_raw = try gitConfigGet(gpa, io, z3_key, config_file);
-    defer if (z3_raw) |v| gpa.free(v);
-    const gitstore_raw = try gitConfigGet(gpa, io, gitstore_key, config_file);
-    defer if (gitstore_raw) |v| gpa.free(v);
+    const z3_raw = snapshotValue(config_snapshot, z3_key);
+    const gitstore_raw = snapshotValue(config_snapshot, gitstore_key);
 
     if (nonEmpty(z3_raw)) |v| return ownStatic(owned_strings, gpa, v);
     if (nonEmpty(gitstore_raw)) |v| {

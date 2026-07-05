@@ -1993,6 +1993,31 @@ test "adopt rejects repo_path with '.' segment under storage path" {
     try testing.expectError(error.GitDirMalformed, r);
 }
 
+test "adopt rejects symlinked root component before creating store path" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "adopt_symlink_root");
+    defer gpa.free(repo);
+
+    const outside = try std.fmt.allocPrint(gpa, "{s}/outside_adopt_store", .{env.base});
+    defer gpa.free(outside);
+    try Dir.cwd().createDirPath(io, outside);
+
+    const root_component = try std.fmt.allocPrint(gpa, "{s}/testorg", .{env.gitstore_root});
+    defer gpa.free(root_component);
+    try Dir.symLinkAbsolute(io, outside, root_component, .{ .is_directory = true });
+
+    const r = gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+    try testing.expectError(error.GitDirMalformed, r);
+
+    const escaped_repo_dir = try std.fmt.allocPrint(gpa, "{s}/adopt_symlink_root", .{outside});
+    defer gpa.free(escaped_repo_dir);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, escaped_repo_dir, .{}));
+}
+
 // =========================================================
 // G3 — CLI end-to-end tests: spawn the BUILT `gitstore` binary
 // =========================================================
@@ -2372,6 +2397,8 @@ fn spawnZt(gpa: Allocator, io: Io, argv_tail: []const []const u8) !ZtOut {
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
     });
+    errdefer gpa.free(result.stdout);
+    errdefer gpa.free(result.stderr);
     try testing.expect(result.term == .exited);
     return .{ .exit = result.term.exited, .stdout = result.stdout, .stderr = result.stderr };
 }
@@ -2417,7 +2444,7 @@ test "e2e adopt refuses a lore-only workspace and mutates nothing" {
     try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, git_path, .{}));
 }
 
-test "e2e lore subcommand reports shared-store config" {
+test "e2e lore subcommand reports missing shared-store config as unhealthy" {
     const gpa = testing.allocator;
     const io = testing.io;
     const ws = try makeLoreFixture(gpa, io,
@@ -2434,7 +2461,7 @@ test "e2e lore subcommand reports shared-store config" {
     var out = try spawnZt(gpa, io, &.{ "lore", ws });
     defer out.deinit(gpa);
 
-    try testing.expectEqual(@as(u8, 0), out.exit);
+    try testing.expectEqual(@as(u8, 1), out.exit);
     try testing.expect(std.mem.indexOf(u8, out.stdout, "instance:") != null);
     try testing.expect(std.mem.indexOf(u8, out.stdout, "shared_store: enabled") != null);
     try testing.expect(std.mem.indexOf(u8, out.stdout, "MISSING") != null);

@@ -121,7 +121,7 @@ precedence over `$GHQ_ROOT`.
 
 ## Troubleshooting
 
-- **`ghq` still runs the Go binary after `chezmoi apply`** — restart your shell or `source ~/.config/zsh/functions.zsh` manually. Shell functions don't re-load automatically.
+- **`ghq` still runs the Go binary after `chezmoi apply`** — reload the shell function/command cache for your shell. zsh: restart the shell or `source ~/.config/zsh/functions.zsh`. bash: `source ~/.bashrc` and `hash -r`. Nushell: `exec nu` or re-source the config that defines the alias/function. Shell functions don't re-load automatically.
 - **`zt list` shows nothing** — check `zt root` matches where your repos live; if empty, `git config --global z3store.root <path>`.
 - **Deprecation warning on every run** — indicates legacy `gitstore.*` / `ghq.*` keys are still authoritative; see Phase 3 above.
 - **Want to fall back to real ghq for a single invocation** — use `command ghq <args>` (the `command` builtin bypasses the shell function).
