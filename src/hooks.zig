@@ -81,7 +81,7 @@ pub const nu_hook =
     \\}
 ;
 
-/// rclone filter rules for syncing ghq working trees to Google Drive.
+/// rclone filter rules for syncing zt/z3store working trees to Google Drive.
 /// Excludes VCS internals, build artifacts, caches, env files, OS junk.
 /// Used by "zt sync" and "zt filter".
 pub const rclone_filter =
@@ -202,9 +202,9 @@ test "hook: zsh defines ghq() function" {
 }
 
 test "hook: zsh prefers zt over ghq" {
-    const gs = mem.indexOf(u8, zsh_hook, "command -v zt").?;
+    const zt_cmd_index = mem.indexOf(u8, zsh_hook, "command -v zt").?;
     const ghq = mem.indexOf(u8, zsh_hook, "command -v ghq").?;
-    try testing.expect(gs < ghq);
+    try testing.expect(zt_cmd_index < ghq);
 }
 
 test "hook: zsh forwards all args to zt" {

@@ -80,10 +80,12 @@ z3store resolves `z3store.*` first, then falls back to legacy `gitstore.*` and
 stderr. To suppress the hint, migrate your keys:
 
 ```sh
-# Preserve existing values (checks legacy keys too)
-ROOT=$(git config --global --get gitstore.root \
+# Preserve existing values (z3store first, then legacy fallbacks)
+ROOT=$(git config --global --get z3store.root \
+  || git config --global --get gitstore.root \
   || git config --global --get ghq.root || echo "$HOME/ghq")
-USER=$(git config --global --get gitstore.user \
+USER=$(git config --global --get z3store.user \
+  || git config --global --get gitstore.user \
   || git config --global --get ghq.user || true)
 
 # Set z3store.* equivalents
@@ -123,7 +125,7 @@ precedence over `$GHQ_ROOT`.
 
 - **`ghq` still runs the Go binary after `chezmoi apply`** — reload the shell function/command cache for your shell. zsh: restart the shell or `source ~/.config/zsh/functions.zsh`. bash: `source ~/.bashrc` and `hash -r`. Nushell: `exec nu` or re-source the config that defines the alias/function. Shell functions don't re-load automatically.
 - **`zt list` shows nothing** — check `zt root` matches where your repos live; if empty, `git config --global z3store.root <path>`.
-- **Deprecation warning on every run** — indicates legacy `gitstore.*` / `ghq.*` keys are still authoritative; see Phase 3 above.
+- **Deprecation warning on every run** — indicates `z3store.*` is absent and a legacy `gitstore.*` / `ghq.*` fallback is being used; see Phase 3 above.
 - **Want to fall back to real ghq for a single invocation** — use `command ghq <args>` (the `command` builtin bypasses the shell function).
 
 ## Related

@@ -364,11 +364,10 @@ test "rewriteJjGitTarget writes absolute path" {
     try testing.expectEqualStrings("/store/path/git", content);
 }
 
-test "rewriteJjGitTarget does not error when file missing" {
+test "rewriteJjGitTarget propagates write failure when file missing" {
     const io = testing.io;
     const gpa = testing.allocator;
-    // Should not fail even if the path doesn't exist
-    try gitstore.rewriteJjGitTarget(gpa, io, "/tmp/no_such_jj_dir_12345", "/some/git");
+    try testing.expectError(error.FileNotFound, gitstore.rewriteJjGitTarget(gpa, io, "/tmp/no_such_jj_dir_12345", "/some/git"));
 }
 
 // =========================================================
@@ -1060,12 +1059,35 @@ test "e2e detach propagates .jj backup rename failure" {
         .data = "occupied\n",
     });
 
-    if (gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false)) {
-        return error.TestExpectedError;
-    } else |err| switch (err) {
-        error.PathAlreadyExists, error.IsDir, error.NotDir => {},
-        else => return err,
-    }
+    try testing.expectError(error.IsDir, gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false));
+}
+
+test "e2e detach aborts before store removal when .jj restore copy fails" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createJjRepo("testorg", "detachjjcopyfail");
+    defer gpa.free(repo);
+
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const repo_store_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ env.gitstore_root, rel });
+    defer gpa.free(repo_store_dir);
+    const jj_dest = try std.fmt.allocPrint(gpa, "{s}/jj", .{repo_store_dir});
+    defer gpa.free(jj_dest);
+
+    try Dir.cwd().deleteTree(io, jj_dest);
+
+    try testing.expectError(error.ProcessFailed, gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false));
+    _ = try Dir.cwd().statFile(io, repo_store_dir, .{});
+
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    _ = try Dir.readLinkAbsolute(io, jj_path, &link_buf);
 }
 
 test "e2e detach rejects non-adopted repo" {
@@ -2048,7 +2070,7 @@ test "adopt rejects symlinked root component before creating store path" {
 }
 
 // =========================================================
-// G3 — CLI end-to-end tests: spawn the BUILT `gitstore` binary
+// G3 — CLI end-to-end tests: spawn the built `zt` binary
 // =========================================================
 //
 // These tests exercise the real argument dispatcher in src/main.zig by
@@ -2057,7 +2079,7 @@ test "adopt rejects symlinked root component before creating store path" {
 // baked in hermetically at build time:
 //
 //   build.zig:
-//     integration_tests.step.dependOn(&exe.step);   // build gitstore first
+//     integration_tests.step.dependOn(&exe.step);   // build zt first
 //     e2e_opts.addOptionPath("zt_bin", exe.getEmittedBin());
 //     integration_mod.addOptions("build_options", e2e_opts);
 //
@@ -2084,7 +2106,7 @@ test "adopt rejects symlinked root component before creating store path" {
 //
 // Each test runs with a controlled environment (HOME + GIT_CONFIG_GLOBAL
 // pointed at throwaway temp paths, plus the real PATH) so no test can touch
-// the operator's real HOME, ghq config, or gitstore root.
+// the operator's real HOME, ghq config, or z3store root.
 
 const build_options = @import("build_options");
 
@@ -2105,6 +2127,16 @@ const E2eCase = struct {
     expect: ExpectExit,
     stream: Stream,
     needle: []const u8,
+};
+
+const ZtOut = struct {
+    exit: u8,
+    stdout: []u8,
+    stderr: []u8,
+    fn deinit(self: *ZtOut, gpa: Allocator) void {
+        gpa.free(self.stdout);
+        gpa.free(self.stderr);
+    }
 };
 
 /// Build a controlled child environment. HOME and GIT_CONFIG_GLOBAL point at
@@ -2130,34 +2162,31 @@ fn controlledEnv(
     return map;
 }
 
-/// Spawn the built gitstore binary with `argv_tail` and a controlled env,
-/// then assert the expected exit code and that `needle` appears in the
-/// selected stream. Uses std.process.run (the same high-level spawn API
-/// exec.zig builds on) so pipe wiring and full-output capture are handled.
-fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
+/// Spawn the built zt binary with `argv_tail` and a controlled env.
+fn spawnZtControlled(
+    gpa: Allocator,
+    io: Io,
+    argv_tail: []const []const u8,
+    home_prefix: []const u8,
+    git_config_prefix: []const u8,
+) !ZtOut {
     // Throwaway HOME dir + empty global gitconfig, unique per invocation so
     // parallel test execution cannot collide.
-    const home = try uniqueTempDir(gpa, io, "/tmp/gitstore_e2e_home");
+    const home = try uniqueTempDir(gpa, io, home_prefix);
     defer {
         Dir.cwd().deleteTree(io, home) catch {};
         gpa.free(home);
     }
-    const git_config = try uniqueTempFile(gpa, io, "/tmp/gitstore_e2e", ".gitconfig");
+    const git_config = try uniqueTempFile(gpa, io, git_config_prefix, ".gitconfig");
     defer {
         Dir.cwd().deleteFile(io, git_config) catch {};
         gpa.free(git_config);
     }
 
-    // argv = [binary, tail...]
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, build_options.zt_bin);
-    for (case.argv_tail) |a| try argv.append(gpa, a);
-
-    // Space-joined tail for diagnostics. In Zig 0.16 `{s}` only formats a
-    // single `[]const u8`, so a `[]const []const u8` must be joined first.
-    const argv_desc = try std.mem.join(gpa, " ", case.argv_tail);
-    defer gpa.free(argv_desc);
+    for (argv_tail) |a| try argv.append(gpa, a);
 
     var env_map = try controlledEnv(gpa, home, git_config);
     defer env_map.deinit();
@@ -2168,20 +2197,35 @@ fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
     });
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
+    errdefer gpa.free(result.stdout);
+    errdefer gpa.free(result.stderr);
+    try testing.expect(result.term == .exited);
+    return .{ .exit = result.term.exited, .stdout = result.stdout, .stderr = result.stderr };
+}
+
+/// Spawn the built zt binary with `argv_tail` and a controlled env,
+/// then assert the expected exit code and that `needle` appears in the
+/// selected stream. Uses std.process.run (the same high-level spawn API
+/// exec.zig builds on) so pipe wiring and full-output capture are handled.
+fn runE2eCase(gpa: Allocator, io: Io, case: E2eCase) !void {
+    // Space-joined tail for diagnostics. In Zig 0.16 `{s}` only formats a
+    // single `[]const u8`, so a `[]const []const u8` must be joined first.
+    const argv_desc = try std.mem.join(gpa, " ", case.argv_tail);
+    defer gpa.free(argv_desc);
+
+    var result = try spawnZtControlled(gpa, io, case.argv_tail, "/tmp/gitstore_e2e_home", "/tmp/gitstore_e2e");
+    defer result.deinit(gpa);
 
     // Exit-code assertion.
-    try testing.expect(result.term == .exited);
     switch (case.expect) {
-        .code => |c| testing.expectEqual(c, result.term.exited) catch |err| {
+        .code => |c| testing.expectEqual(c, result.exit) catch |err| {
             std.debug.print(
                 "e2e argv={s} expected exit {d}, got {d}\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
-                .{ argv_desc, c, result.term.exited, result.stdout, result.stderr },
+                .{ argv_desc, c, result.exit, result.stdout, result.stderr },
             );
             return err;
         },
-        .nonzero => testing.expect(result.term.exited != 0) catch |err| {
+        .nonzero => testing.expect(result.exit != 0) catch |err| {
             std.debug.print(
                 "e2e argv={s} expected non-zero exit, got 0\nstdout=<<{s}>>\nstderr=<<{s}>>\n",
                 .{ argv_desc, result.stdout, result.stderr },
@@ -2386,50 +2430,12 @@ test "e2e migrate real-mode is unimplemented, non-zero exit with stderr" {
 
 const lore = @import("lore.zig");
 
-const ZtOut = struct {
-    exit: u8,
-    stdout: []u8,
-    stderr: []u8,
-    fn deinit(self: *ZtOut, gpa: Allocator) void {
-        gpa.free(self.stdout);
-        gpa.free(self.stderr);
-    }
-};
-
 /// Spawn the built `zt` with an absolute-path argument and a throwaway HOME.
 /// Unlike `runE2eCase`, this returns the captured output so a test can assert
 /// on both streams AND inspect on-disk state afterwards (the no-mutation
 /// property for adopt-refusal).
 fn spawnZt(gpa: Allocator, io: Io, argv_tail: []const []const u8) !ZtOut {
-    const home = try uniqueTempDir(gpa, io, "/tmp/gitstore_lore_home");
-    defer {
-        Dir.cwd().deleteTree(io, home) catch {};
-        gpa.free(home);
-    }
-    const git_config = try uniqueTempFile(gpa, io, "/tmp/gitstore_lore", ".gitconfig");
-    defer {
-        Dir.cwd().deleteFile(io, git_config) catch {};
-        gpa.free(git_config);
-    }
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try argv.append(gpa, build_options.zt_bin);
-    for (argv_tail) |a| try argv.append(gpa, a);
-
-    var env_map = try controlledEnv(gpa, home, git_config);
-    defer env_map.deinit();
-
-    const result = try std.process.run(gpa, io, .{
-        .argv = argv.items,
-        .environ_map = &env_map,
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    });
-    errdefer gpa.free(result.stdout);
-    errdefer gpa.free(result.stderr);
-    try testing.expect(result.term == .exited);
-    return .{ .exit = result.term.exited, .stdout = result.stdout, .stderr = result.stderr };
+    return spawnZtControlled(gpa, io, argv_tail, "/tmp/gitstore_lore_home", "/tmp/gitstore_lore");
 }
 
 /// Create a Lore workspace fixture at a unique /tmp dir. When `config_body` is

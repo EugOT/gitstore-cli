@@ -15,7 +15,7 @@ const Io = std.Io;
 const Dir = std.Io.Dir;
 
 const ex = @import("exec.zig");
-const gitstore = @import("z3store.zig");
+const z3store = @import("z3store.zig");
 const url = @import("url.zig");
 
 /// Options threaded through `cloneOne` / `cloneMany`.
@@ -67,7 +67,7 @@ pub const CloneError = error{
     Canceled,
 } || Allocator.Error || ex.ExecError ||
     Dir.OpenError || Dir.StatFileError || Dir.CreateDirPathError ||
-    gitstore.Error;
+    z3store.Error;
 
 /// Clone a single repository into its canonical storage path.
 ///
@@ -201,7 +201,7 @@ pub fn cloneOne(
 
     // Post-clone: relocate .git into z3store layout unless caller opted out.
     if (!opts.no_adopt) {
-        gitstore.adopt(gpa, io, storage_path, ghq_root, gitstore_root, false) catch |err| {
+        z3store.adopt(gpa, io, storage_path, ghq_root, gitstore_root, false) catch |err| {
             const msg = try std.fmt.allocPrint(
                 gpa,
                 "adopt failed: {s}",

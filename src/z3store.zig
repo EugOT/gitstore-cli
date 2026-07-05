@@ -174,8 +174,9 @@ pub fn rewriteJjGitTarget(
     Dir.cwd().writeFile(io, .{
         .sub_path = git_target_path,
         .data = new_content,
-    }) catch {
-        warn(io, "warn: could not rewrite jj git_target at {s}\n", .{git_target_path});
+    }) catch |err| {
+        warn(io, "warn: could not rewrite jj git_target at {s}: {s}\n", .{ git_target_path, @errorName(err) });
+        return err;
     };
 }
 
@@ -187,8 +188,9 @@ pub fn rewriteJjGitTargetRelative(gpa: Allocator, io: Io, jj_dir: []const u8) !v
     Dir.cwd().writeFile(io, .{
         .sub_path = git_target_path,
         .data = "../../../.git",
-    }) catch {
-        warn(io, "warn: could not rewrite jj git_target at {s}\n", .{git_target_path});
+    }) catch |err| {
+        warn(io, "warn: could not rewrite jj git_target at {s}: {s}\n", .{ git_target_path, @errorName(err) });
+        return err;
     };
 }
 
@@ -553,7 +555,9 @@ pub fn adoptWithJjBinary(
                 gpa.free(jj_cp2.stdout);
                 gpa.free(jj_cp2.stderr);
                 if (jj_cp2.succeeded()) {
-                    try rewriteJjGitTarget(gpa, io, jj_dest, git_dest);
+                    rewriteJjGitTarget(gpa, io, jj_dest, git_dest) catch |err| {
+                        warn(io, "warn: could not rewrite optional jj git_target at {s}: {s}\n", .{ jj_dest, @errorName(err) });
+                    };
                     try Dir.cwd().deleteTree(io, jj_src);
                     try Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true });
                     try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
@@ -1126,14 +1130,21 @@ pub fn detach(
                 Dir.cwd().deleteTree(io, jj_new) catch {};
                 return err;
             };
+            rewriteJjGitTargetRelative(gpa, io, jj_pointer_path) catch |err| {
+                warn(io, "error: rewrite restored .jj git_target failed ({s}); restoring symlink\n", .{@errorName(err)});
+                Dir.cwd().deleteTree(io, jj_pointer_path) catch {};
+                Dir.rename(Dir.cwd(), jj_backup, Dir.cwd(), jj_pointer_path, io) catch {};
+                return err;
+            };
             // Success — delete the old symlink backup.
             Dir.cwd().deleteFile(io, jj_backup) catch {};
-            try rewriteJjGitTargetRelative(gpa, io, jj_pointer_path);
             try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_pointer_path, "ok: detach restore .jj");
             info(io, "restored: {s}/.jj\n", .{repo_path});
         } else {
-            warn(io, "warn: cp .jj failed; leaving symlink in place\n", .{});
+            warn(io, "error: cp .jj failed: {s}\n", .{jcp.stderr});
             Dir.cwd().deleteTree(io, jj_new) catch {};
+            try oplog.logOperation(io, log_path, .copy, jj_src, jj_new, "error: cp .jj failed (detach)");
+            return error.ProcessFailed;
         }
     }
 

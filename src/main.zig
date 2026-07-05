@@ -301,8 +301,7 @@ fn dirExists(io: Io, path: []const u8) bool {
 fn statPathExists(io: Io, path: []const u8) !bool {
     _ = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return false,
-        error.NameTooLong, error.SystemResources => return err,
-        else => return false,
+        else => return err,
     };
     return true;
 }
