@@ -30,11 +30,9 @@ import {
 
 const TIER = "release" as const;
 const MACHO_64_LE_MAGIC = 0xfeedfacf;
-const LC_SEGMENT_64 = 0x19;
 const LC_UUID = 0x1b;
 const MACHO_64_HEADER_SIZE = 32;
 const LOAD_COMMAND_HEADER_SIZE = 8;
-const SEGMENT_NAME_SIZE = 16;
 const UUID_SIZE = 16;
 const ZIG_CACHE_OBJECT_PREFIX = new TextEncoder().encode(".zig-cache/o/");
 
@@ -111,25 +109,9 @@ function canonicalizeMachOLoadCommands(bytes: Uint8Array): boolean {
 		) {
 			break;
 		}
-		if (cmd === LC_SEGMENT_64 && cmdSize >= 72) {
-			const segName = new TextDecoder()
-				.decode(bytes.subarray(off + 8, off + 8 + SEGMENT_NAME_SIZE))
-				.replace(/\0+$/, "");
-			if (segName === "__LINKEDIT") {
-				const fileOff = Number(view.getBigUint64(off + 40, true));
-				const fileSize = Number(view.getBigUint64(off + 48, true));
-				if (
-					Number.isSafeInteger(fileOff) &&
-					Number.isSafeInteger(fileSize) &&
-					fileOff >= 0 &&
-					fileSize >= 0 &&
-					fileOff + fileSize <= bytes.byteLength
-				) {
-					bytes.fill(0, fileOff, fileOff + fileSize);
-				}
-			}
-		} else if (
+		if (
 			cmd === LC_UUID &&
+			cmdSize >= LOAD_COMMAND_HEADER_SIZE + UUID_SIZE &&
 			off + LOAD_COMMAND_HEADER_SIZE + UUID_SIZE <= bytes.byteLength
 		) {
 			bytes.fill(
@@ -149,9 +131,8 @@ export function canonicalizeReleaseArtifactBytes(
 	const out = new Uint8Array(bytes);
 	if (canonicalizeMachOLoadCommands(out)) {
 		// Darwin Mach-O links legitimately vary by LC_UUID and by embedded
-		// `.zig-cache/o/<hash>/...` object paths. The signature and symbol data
-		// in __LINKEDIT also changes because it signs/references those bytes.
-		// Normalize only those linker/cache artifacts before the framed hash.
+		// `.zig-cache/o/<hash>/...` object paths. Keep other linker data in the
+		// framed hash so release drift outside those fields remains visible.
 		canonicalizeZigCacheObjectPaths(out);
 	}
 	return out;
