@@ -915,14 +915,15 @@ pub fn main(init: std.process.Init) !u8 {
             try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
         } else if (path) |p| {
             const has_git = try hasEntry(io, p, ".git");
+            const has_jj = try hasEntry(io, p, ".jj");
             const is_lore = lore.detectLoreWorkspace(io, p);
             var ok = true;
             // Run the standard pointer/symlink verify whenever git is present,
-            // or when the path is neither git nor lore (so a genuinely broken
-            // path still surfaces the familiar "not adopted" failure). A
-            // lore-ONLY workspace skips git verify — it legitimately has no
-            // `.git` pointer.
-            if (has_git or !is_lore) {
+            // whenever jj metadata is present, or when the path is neither
+            // git/jj nor lore (so a genuinely broken path still surfaces the
+            // familiar "not adopted" failure). A lore-ONLY workspace skips git
+            // verify — it legitimately has no `.git` pointer.
+            if (has_git or has_jj or !is_lore) {
                 ok = try gitstore.verify(gpa, io, p);
             }
             // On a Lore workspace, additionally report instance/config presence

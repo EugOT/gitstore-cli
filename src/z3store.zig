@@ -17,6 +17,8 @@ pub const Error = error{
     VerifyFailed,
     GitDirMalformed,
     TempFileCollision,
+    BatchFailures,
+    PartialRestore,
 } || Allocator.Error || ex.ExecError || Dir.WriteFileError || Dir.SymLinkError ||
     Dir.DeleteTreeError || Dir.OpenError || Dir.CreateDirPathError ||
     File.OpenError || File.StatError || Dir.ReadFileAllocError;
@@ -38,6 +40,105 @@ fn warn(io: Io, comptime fmt: []const u8, args: anytype) void {
     var w = File.stderr().writerStreaming(io, &buf);
     w.interface.print(fmt, args) catch {};
     w.flush() catch {};
+}
+
+/// Adopt/detach policy: real filesystem/process failures propagate. Once a
+/// destructive swap has started, operation-log writes are observability only:
+/// warn on log failure, but never abort a half-completed swap.
+fn logOperationBestEffort(
+    io: Io,
+    log_path: []const u8,
+    action: oplog.Action,
+    source: []const u8,
+    destination: []const u8,
+    op_status: []const u8,
+) void {
+    oplog.logOperation(io, log_path, action, source, destination, op_status) catch |err| {
+        warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn deleteEntryBestEffort(io: Io, path: []const u8) void {
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (Dir.cwd().readLink(io, path, &link_buf)) |_| {
+        Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => warn(io, "warn: could not delete symlink {s}: {s}\n", .{ path, @errorName(err) }),
+        };
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => return,
+        else => {},
+    }
+
+    Dir.cwd().deleteTree(io, path) catch |tree_err| switch (tree_err) {
+        // No FileNotFound prong: Zig 0.16 deleteTree treats a missing path
+        // as success, so DeleteTreeError has no such member.
+        error.NotDir => Dir.cwd().deleteFile(io, path) catch |file_err| switch (file_err) {
+            error.FileNotFound => {},
+            else => warn(io, "warn: could not delete file {s}: {s}\n", .{ path, @errorName(file_err) }),
+        },
+        else => warn(io, "warn: could not delete tree {s}: {s}\n", .{ path, @errorName(tree_err) }),
+    };
+}
+
+fn restoreGitDirFromStoreBestEffort(gpa: Allocator, io: Io, git_src: []const u8, git_dest: []const u8) void {
+    if (Dir.openDirAbsolute(io, git_src, .{})) |d| {
+        var dir = d;
+        dir.close(io);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        error.NotDir => Dir.cwd().deleteFile(io, git_src) catch |delete_err| switch (delete_err) {
+            error.FileNotFound => {},
+            else => warn(io, "warn: could not remove .git pointer during rollback: {s}\n", .{@errorName(delete_err)}),
+        },
+        else => warn(io, "warn: could not inspect .git during rollback: {s}\n", .{@errorName(err)}),
+    }
+
+    if (Dir.openDirAbsolute(io, git_src, .{})) |d| {
+        var dir = d;
+        dir.close(io);
+        return;
+    } else |_| {}
+
+    const restore = ex.exec(gpa, io, &.{ "cp", "-a", git_dest, git_src }, null) catch |err| {
+        warn(io, "CRITICAL: could not restore .git from {s}: {s}\n", .{ git_dest, @errorName(err) });
+        return;
+    };
+    defer {
+        gpa.free(restore.stdout);
+        gpa.free(restore.stderr);
+    }
+    if (!restore.succeeded()) {
+        warn(io, "CRITICAL: restore cp failed from {s}: {s}\n", .{ git_dest, restore.stderr });
+    }
+}
+
+fn rollbackAdoptAfterGitSwap(
+    gpa: Allocator,
+    io: Io,
+    git_src: []const u8,
+    git_dest: []const u8,
+    jj_src: []const u8,
+    jj_dest: []const u8,
+    repo_store_dir: []const u8,
+    repo_store_preexisting: bool,
+    worktrees: [][]u8,
+    remove_jj_src: bool,
+    log_path: []const u8,
+) void {
+    warn(io, "error: post-adopt failure; rolling back .git swap for {s}\n", .{git_src});
+    for (worktrees) |wt| {
+        rewriteLinkedWorktreePointer(gpa, io, wt, git_src) catch |err| {
+            warn(io, "warn: could not restore worktree pointer at {s}: {s}\n", .{ wt, @errorName(err) });
+        };
+    }
+    if (remove_jj_src) deleteEntryBestEffort(io, jj_src);
+    deleteEntryBestEffort(io, jj_dest);
+    restoreGitDirFromStoreBestEffort(gpa, io, git_src, git_dest);
+    deleteEntryBestEffort(io, git_dest);
+    if (!repo_store_preexisting) deleteEntryBestEffort(io, repo_store_dir);
+    logOperationBestEffort(io, log_path, .write_pointer, git_src, git_dest, "error: post-adopt failure, rolled back");
 }
 
 fn uniqueSidePath(gpa: Allocator, io: Io, base_path: []const u8, label: []const u8) ![]u8 {
@@ -440,6 +541,13 @@ pub fn adoptWithJjBinary(
             current = next;
         }
     }
+    const repo_store_preexisting = blk: {
+        _ = Dir.cwd().statFile(io, repo_store_dir, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
     try Dir.cwd().createDirPath(io, repo_store_dir);
 
     // Refuse a pre-existing store target: `cp -a` would merge into a stale
@@ -496,7 +604,7 @@ pub fn adoptWithJjBinary(
 
     // --- Step 4: Remove original .git directory and write pointer file ---
     try Dir.cwd().deleteTree(io, git_src);
-    try oplog.logOperation(io, log_path, .remove, git_src, "", "ok");
+    logOperationBestEffort(io, log_path, .remove, git_src, "", "ok");
 
     const pointer_content = try std.fmt.allocPrint(gpa, "gitdir: {s}\n", .{git_dest});
     defer gpa.free(pointer_content);
@@ -519,26 +627,25 @@ pub fn adoptWithJjBinary(
         Dir.cwd().deleteTree(io, git_dest) catch {};
         return err;
     };
-    try oplog.logOperation(io, log_path, .write_pointer, git_src, git_dest, "ok");
+    logOperationBestEffort(io, log_path, .write_pointer, git_src, git_dest, "ok");
     info(io, "pointer: {s} -> {s}\n", .{ git_src, git_dest });
+
+    const jj_src = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo_path});
+    defer gpa.free(jj_src);
 
     // --- Step 4b: Rewrite linked worktree .git pointers ---
     for (worktrees) |wt| {
         rewriteLinkedWorktreePointer(gpa, io, wt, git_dest) catch |err| {
             warn(io, "warn: could not rewrite worktree pointer at {s}: {s}\n", .{ wt, @errorName(err) });
-            oplog.logOperation(io, log_path, .write_pointer, wt, git_dest, "error: worktree rewrite failed") catch |log_err| {
-                warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
-            };
+            logOperationBestEffort(io, log_path, .write_pointer, wt, git_dest, "error: worktree rewrite failed");
+            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
             return err;
         };
-        try oplog.logOperation(io, log_path, .write_pointer, wt, git_dest, "ok: worktree");
+        logOperationBestEffort(io, log_path, .write_pointer, wt, git_dest, "ok: worktree");
         info(io, "worktree: {s}/.git -> {s}/worktrees/...\n", .{ wt, git_dest });
     }
 
     // --- Step 5: Handle .jj ---
-    const jj_src = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo_path});
-    defer gpa.free(jj_src);
-
     const has_jj = blk: {
         _ = Dir.cwd().statFile(io, jj_src, .{}) catch break :blk false;
         break :blk true;
@@ -553,27 +660,41 @@ pub fn adoptWithJjBinary(
         }
         if (!jj_cp.succeeded()) {
             warn(io, "error: cp .jj failed: {s}\n", .{jj_cp.stderr});
-            try oplog.logOperation(io, log_path, .copy, jj_src, jj_dest, "error: cp failed");
+            logOperationBestEffort(io, log_path, .copy, jj_src, jj_dest, "error: cp failed");
+            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
             return error.ProcessFailed;
         }
-        try oplog.logOperation(io, log_path, .copy, jj_src, jj_dest, "ok");
+        logOperationBestEffort(io, log_path, .copy, jj_src, jj_dest, "ok");
 
-        try rewriteJjGitTarget(gpa, io, jj_dest, git_dest);
+        rewriteJjGitTarget(gpa, io, jj_dest, git_dest) catch |err| {
+            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            return err;
+        };
 
         // Move the original .jj aside instead of deleting it before the
         // symlink exists — restore it on failure so there is no window
         // where the worktree has no .jj at all.
         const jj_aside = try uniqueSidePath(gpa, io, jj_src, "gs-old");
         defer gpa.free(jj_aside);
-        try Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io);
+        Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io) catch |err| {
+            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            return err;
+        };
         Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true }) catch |err| {
             warn(io, "error: .jj symlink failed ({s}); restoring original .jj\n", .{@errorName(err)});
             Dir.rename(Dir.cwd(), jj_aside, Dir.cwd(), jj_src, io) catch {};
+            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
             return err;
         };
-        try Dir.cwd().deleteTree(io, jj_aside);
-        try oplog.logOperation(io, log_path, .remove, jj_src, "", "ok");
-        try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
+        Dir.cwd().deleteTree(io, jj_aside) catch |err| {
+            warn(io, "error: could not remove staged original .jj ({s}); restoring original layout\n", .{@errorName(err)});
+            Dir.cwd().deleteFile(io, jj_src) catch {};
+            Dir.rename(Dir.cwd(), jj_aside, Dir.cwd(), jj_src, io) catch {};
+            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            return err;
+        };
+        logOperationBestEffort(io, log_path, .remove, jj_src, "", "ok");
+        logOperationBestEffort(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
         info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
     } else {
         info(io, "init: jj colocated in {s}\n", .{repo_path});
@@ -584,9 +705,7 @@ pub fn adoptWithJjBinary(
             // (#22) — the same leniency the non-zero-exit path below gets.
             // A failed log write must not resurrect the fatal path either.
             error.FileNotFound => {
-                oplog.logOperation(io, log_path, .init_jj, repo_path, "", "error: jj spawn failed") catch |log_err| {
-                    warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
-                };
+                logOperationBestEffort(io, log_path, .init_jj, repo_path, "", "error: jj spawn failed");
                 warn(io, "warn: jj init unavailable (non-fatal): jj not found\n", .{});
                 return;
             },
@@ -599,7 +718,7 @@ pub fn adoptWithJjBinary(
             gpa.free(jj_init.stderr);
         }
         if (jj_init.succeeded()) {
-            try oplog.logOperation(io, log_path, .init_jj, repo_path, "", "ok");
+            logOperationBestEffort(io, log_path, .init_jj, repo_path, "", "ok");
 
             const jj_check = Dir.cwd().statFile(io, jj_src, .{}) catch null;
             if (jj_check != null) {
@@ -611,31 +730,44 @@ pub fn adoptWithJjBinary(
                 if (!jj_cp2.succeeded()) {
                     warn(io, "error: cp auto-created .jj failed: {s}\n", .{jj_cp2.stderr});
                     Dir.cwd().deleteTree(io, jj_dest) catch {};
-                    try oplog.logOperation(io, log_path, .copy, jj_src, jj_dest, "error: cp .jj failed");
+                    logOperationBestEffort(io, log_path, .copy, jj_src, jj_dest, "error: cp .jj failed");
+                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, true, log_path);
                     return error.ProcessFailed;
                 }
 
                 rewriteJjGitTarget(gpa, io, jj_dest, git_dest) catch |err| {
                     warn(io, "error: could not rewrite optional jj git_target at {s}: {s}\n", .{ jj_dest, @errorName(err) });
                     Dir.cwd().deleteTree(io, jj_dest) catch {};
+                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, true, log_path);
                     return err;
                 };
 
                 const jj_aside = try uniqueSidePath(gpa, io, jj_src, "gs-old");
                 defer gpa.free(jj_aside);
-                try Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io);
-                Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true }) catch |err| {
-                    warn(io, "error: auto-created .jj symlink failed ({s}); restoring original .jj\n", .{@errorName(err)});
-                    Dir.rename(Dir.cwd(), jj_aside, Dir.cwd(), jj_src, io) catch {};
+                Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io) catch |err| {
                     Dir.cwd().deleteTree(io, jj_dest) catch {};
+                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, true, log_path);
                     return err;
                 };
-                try Dir.cwd().deleteTree(io, jj_aside);
-                try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
+                Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true }) catch |err| {
+                    warn(io, "error: auto-created .jj symlink failed ({s}); restoring original layout\n", .{@errorName(err)});
+                    deleteEntryBestEffort(io, jj_aside);
+                    Dir.cwd().deleteTree(io, jj_dest) catch {};
+                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, true, log_path);
+                    return err;
+                };
+                Dir.cwd().deleteTree(io, jj_aside) catch |err| {
+                    warn(io, "error: could not remove auto-created .jj aside ({s}); restoring original layout\n", .{@errorName(err)});
+                    deleteEntryBestEffort(io, jj_src);
+                    deleteEntryBestEffort(io, jj_aside);
+                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+                    return err;
+                };
+                logOperationBestEffort(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
                 info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
             }
         } else {
-            try oplog.logOperation(io, log_path, .init_jj, repo_path, "", "error: jj init failed");
+            logOperationBestEffort(io, log_path, .init_jj, repo_path, "", "error: jj init failed");
             warn(io, "warn: jj init failed (non-fatal): {s}\n", .{jj_init.stderr});
         }
     }
@@ -679,6 +811,7 @@ pub fn adoptAll(
     } else {
         info(io, "\nsummary: {d} adopted, {d} skipped, {d} failed\n", .{ adopted, skipped, failed });
     }
+    if (failed > 0) return error.BatchFailures;
 }
 
 /// Verify a single repo's gitstore integrity.
@@ -798,6 +931,7 @@ pub fn verifyAll(
     }
 
     info(io, "\nverify: {d} ok, {d} failed\n", .{ ok_count, fail_count });
+    if (fail_count > 0) return error.BatchFailures;
 }
 
 /// Show gitstore disk usage, repo count, and broken pointers.
@@ -920,6 +1054,72 @@ fn createExclusiveFilterTmp(gpa: Allocator, io: Io, contents: []const u8) ![]u8 
     return error.TempFileCollision;
 }
 
+fn redactRemoteUserinfo(gpa: Allocator, remote: []const u8) ![]u8 {
+    const scheme_idx = std.mem.indexOf(u8, remote, "://") orelse return try gpa.dupe(u8, remote);
+    const authority_start = scheme_idx + "://".len;
+    var authority_end = remote.len;
+    var i = authority_start;
+    while (i < remote.len) : (i += 1) {
+        switch (remote[i]) {
+            '/', '?', '#' => {
+                authority_end = i;
+                break;
+            },
+            else => {},
+        }
+    }
+    const authority = remote[authority_start..authority_end];
+    const at_rel = std.mem.lastIndexOfScalar(u8, authority, '@') orelse return try gpa.dupe(u8, remote);
+    const userinfo_end = authority_start + at_rel + 1;
+    const out = try gpa.alloc(u8, remote.len - (userinfo_end - authority_start));
+    @memcpy(out[0..authority_start], remote[0..authority_start]);
+    @memcpy(out[authority_start..], remote[userinfo_end..]);
+    return out;
+}
+
+fn infoRedactingRemote(io: Io, text: []const u8, remote: []const u8, safe_remote: []const u8) void {
+    if (text.len == 0) return;
+    if (std.mem.eql(u8, remote, safe_remote)) {
+        info(io, "{s}", .{text});
+        return;
+    }
+    var start: usize = 0;
+    while (std.mem.indexOf(u8, text[start..], remote)) |rel| {
+        const hit = start + rel;
+        info(io, "{s}", .{text[start..hit]});
+        info(io, "{s}", .{safe_remote});
+        start = hit + remote.len;
+    }
+    info(io, "{s}", .{text[start..]});
+}
+
+fn warnRedactingRemote(io: Io, text: []const u8, remote: []const u8, safe_remote: []const u8) void {
+    if (text.len == 0) return;
+    if (std.mem.eql(u8, remote, safe_remote)) {
+        warn(io, "{s}", .{text});
+        return;
+    }
+    var start: usize = 0;
+    while (std.mem.indexOf(u8, text[start..], remote)) |rel| {
+        const hit = start + rel;
+        warn(io, "{s}", .{text[start..hit]});
+        warn(io, "{s}", .{safe_remote});
+        start = hit + remote.len;
+    }
+    warn(io, "{s}", .{text[start..]});
+}
+
+test "redactRemoteUserinfo removes URL credentials" {
+    const gpa = std.testing.allocator;
+    const redacted = try redactRemoteUserinfo(gpa, "sftp://user:secret@example.com/repos");
+    defer gpa.free(redacted);
+    try std.testing.expectEqualStrings("sftp://example.com/repos", redacted);
+
+    const named = try redactRemoteUserinfo(gpa, "gdrive:ghq");
+    defer gpa.free(named);
+    try std.testing.expectEqualStrings("gdrive:ghq", named);
+}
+
 /// Write the rclone filter file to gitstore root and run rclone sync.
 pub fn sync(
     gpa: Allocator,
@@ -951,10 +1151,12 @@ pub fn sync(
     defer if (dry_run) {
         Dir.cwd().deleteFile(io, filter_path) catch {};
     };
+    const safe_remote = try redactRemoteUserinfo(gpa, remote);
+    defer gpa.free(safe_remote);
 
     // Build rclone command
     if (dry_run) {
-        info(io, "dry-run: rclone sync {s} {s} --filter-from {s} --dry-run\n", .{ ghq_root, remote, filter_path });
+        info(io, "dry-run: rclone sync {s} {s} --filter-from {s} --dry-run\n", .{ ghq_root, safe_remote, filter_path });
         const result = try ex.exec(gpa, io, &.{
             "rclone",        "sync",
             ghq_root,        remote,
@@ -966,13 +1168,15 @@ pub fn sync(
             gpa.free(result.stderr);
         }
         if (!result.succeeded()) {
-            warn(io, "error: rclone dry-run failed\n{s}\n", .{result.stderr});
+            warn(io, "error: rclone dry-run failed\n", .{});
+            warnRedactingRemote(io, result.stderr, remote, safe_remote);
+            warn(io, "\n", .{});
             return error.ProcessFailed;
         }
-        info(io, "{s}", .{result.stdout});
-        if (result.stderr.len > 0) info(io, "{s}", .{result.stderr});
+        infoRedactingRemote(io, result.stdout, remote, safe_remote);
+        if (result.stderr.len > 0) infoRedactingRemote(io, result.stderr, remote, safe_remote);
     } else {
-        info(io, "sync: {s} -> {s}\n", .{ ghq_root, remote });
+        info(io, "sync: {s} -> {s}\n", .{ ghq_root, safe_remote });
         const result = try ex.exec(gpa, io, &.{
             "rclone",        "sync",
             ghq_root,        remote,
@@ -984,10 +1188,12 @@ pub fn sync(
             gpa.free(result.stderr);
         }
         if (!result.succeeded()) {
-            warn(io, "error: rclone sync failed\n{s}\n", .{result.stderr});
+            warn(io, "error: rclone sync failed\n", .{});
+            warnRedactingRemote(io, result.stderr, remote, safe_remote);
+            warn(io, "\n", .{});
             return error.ProcessFailed;
         }
-        info(io, "{s}", .{result.stderr}); // rclone stats go to stderr
+        infoRedactingRemote(io, result.stderr, remote, safe_remote); // rclone stats go to stderr
     }
 }
 
@@ -1203,7 +1409,7 @@ pub fn detach(
     const git_pointer_aside = try uniqueSidePath(gpa, io, git_pointer_path, "gs-old");
     defer gpa.free(git_pointer_aside);
     try Dir.rename(Dir.cwd(), git_pointer_path, Dir.cwd(), git_pointer_aside, io);
-    try oplog.logOperation(io, log_path, .remove, git_pointer_path, git_pointer_aside, "ok: detach pointer aside");
+    logOperationBestEffort(io, log_path, .remove, git_pointer_path, git_pointer_aside, "ok: detach pointer aside");
     Dir.rename(Dir.cwd(), git_new, Dir.cwd(), git_pointer_path, io) catch |err| {
         warn(io, "error: restoring .git pointer after staged rename failed ({s})\n", .{@errorName(err)});
         Dir.rename(Dir.cwd(), git_pointer_aside, Dir.cwd(), git_pointer_path, io) catch {};
@@ -1211,11 +1417,13 @@ pub fn detach(
         return err;
     };
     try Dir.cwd().deleteFile(io, git_pointer_aside);
-    try oplog.logOperation(io, log_path, .write_pointer, git_src, git_pointer_path, "ok: detach restore .git");
+    logOperationBestEffort(io, log_path, .write_pointer, git_src, git_pointer_path, "ok: detach restore .git");
     info(io, "restored: {s}/.git\n", .{repo_path});
 
+    var post_restore_err: ?anyerror = null;
+
     // --- Step 4: Handle .jj ---
-    if (has_jj_link) {
+    if (has_jj_link) jj_restore: {
         const jj_new = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-new", .{repo_path});
         defer gpa.free(jj_new);
         Dir.cwd().deleteTree(io, jj_new) catch {};
@@ -1233,30 +1441,34 @@ pub fn detach(
             Dir.rename(Dir.cwd(), jj_pointer_path, Dir.cwd(), jj_backup, io) catch |err| {
                 warn(io, "warn: could not rename .jj symlink ({s}); leaving symlink in place\n", .{@errorName(err)});
                 Dir.cwd().deleteTree(io, jj_new) catch {};
-                return err;
+                post_restore_err = err;
+                break :jj_restore;
             };
             // Now rename staged copy into place. On failure restore the symlink.
             Dir.rename(Dir.cwd(), jj_new, Dir.cwd(), jj_pointer_path, io) catch |err| {
                 warn(io, "error: rename staged .jj failed ({s}); restoring symlink\n", .{@errorName(err)});
                 Dir.rename(Dir.cwd(), jj_backup, Dir.cwd(), jj_pointer_path, io) catch {};
                 Dir.cwd().deleteTree(io, jj_new) catch {};
-                return err;
+                post_restore_err = err;
+                break :jj_restore;
             };
             rewriteJjGitTargetRelative(gpa, io, jj_pointer_path) catch |err| {
                 warn(io, "error: rewrite restored .jj git_target failed ({s}); restoring symlink\n", .{@errorName(err)});
                 Dir.cwd().deleteTree(io, jj_pointer_path) catch {};
                 Dir.rename(Dir.cwd(), jj_backup, Dir.cwd(), jj_pointer_path, io) catch {};
-                return err;
+                post_restore_err = err;
+                break :jj_restore;
             };
             // Success — delete the old symlink backup.
             Dir.cwd().deleteFile(io, jj_backup) catch {};
-            try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_pointer_path, "ok: detach restore .jj");
+            logOperationBestEffort(io, log_path, .create_symlink, jj_src, jj_pointer_path, "ok: detach restore .jj");
             info(io, "restored: {s}/.jj\n", .{repo_path});
         } else {
             warn(io, "error: cp .jj failed: {s}\n", .{jcp.stderr});
             Dir.cwd().deleteTree(io, jj_new) catch {};
-            try oplog.logOperation(io, log_path, .copy, jj_src, jj_new, "error: cp .jj failed (detach)");
-            return error.ProcessFailed;
+            logOperationBestEffort(io, log_path, .copy, jj_src, jj_new, "error: cp .jj failed (detach)");
+            post_restore_err = error.ProcessFailed;
+            break :jj_restore;
         }
     }
 
@@ -1266,13 +1478,17 @@ pub fn detach(
     for (worktrees) |wt| {
         rewriteLinkedWorktreePointer(gpa, io, wt, restored_git) catch |err| {
             warn(io, "warn: could not rewrite worktree pointer {s}: {s}\n", .{ wt, @errorName(err) });
-            oplog.logOperation(io, log_path, .write_pointer, wt, restored_git, "error: detach worktree rewrite failed") catch |log_err| {
-                warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
-            };
-            return err;
+            logOperationBestEffort(io, log_path, .write_pointer, wt, restored_git, "error: detach worktree rewrite failed");
+            if (post_restore_err == null) post_restore_err = err;
+            continue;
         };
-        try oplog.logOperation(io, log_path, .write_pointer, wt, restored_git, "ok: detach worktree");
+        logOperationBestEffort(io, log_path, .write_pointer, wt, restored_git, "ok: detach worktree");
         info(io, "worktree: {s}/.git -> {s}/worktrees/...\n", .{ wt, restored_git });
+    }
+
+    if (post_restore_err) |err| {
+        warn(io, "CRITICAL: partial detach after .git restore; leaving z3store entry intact: {s}\n", .{repo_store_dir});
+        return err;
     }
 
     // --- Step 6: Archive or remove z3store entry ---
@@ -1290,18 +1506,18 @@ pub fn detach(
         defer gpa.free(archived);
         Dir.rename(Dir.cwd(), repo_store_dir, Dir.cwd(), archived, io) catch |err| {
             warn(io, "error: could not archive z3store entry ({s}); left in place\n", .{@errorName(err)});
-            try oplog.logOperation(io, log_path, .remove, repo_store_dir, archived, "error: archive failed (left in place)");
+            logOperationBestEffort(io, log_path, .remove, repo_store_dir, archived, "error: archive failed (left in place)");
             return err;
         };
-        try oplog.logOperation(io, log_path, .remove, repo_store_dir, archived, "ok: detach archived");
+        logOperationBestEffort(io, log_path, .remove, repo_store_dir, archived, "ok: detach archived");
         info(io, "archived: {s} -> {s}\n", .{ repo_store_dir, archived });
     } else {
         Dir.cwd().deleteTree(io, repo_store_dir) catch |err| {
             warn(io, "error: could not remove z3store entry ({s})\n", .{@errorName(err)});
-            try oplog.logOperation(io, log_path, .remove, repo_store_dir, "", "error: remove failed (left in place)");
+            logOperationBestEffort(io, log_path, .remove, repo_store_dir, "", "error: remove failed (left in place)");
             return err;
         };
-        try oplog.logOperation(io, log_path, .remove, repo_store_dir, "", "ok: detach removed");
+        logOperationBestEffort(io, log_path, .remove, repo_store_dir, "", "ok: detach removed");
         info(io, "removed z3store entry: {s}\n", .{repo_store_dir});
     }
 }
@@ -1341,4 +1557,5 @@ pub fn detachAll(
     } else {
         info(io, "\ndetach summary: {d} detached, {d} not adopted, {d} failed\n", .{ detached, skipped, failed });
     }
+    if (failed > 0) return error.BatchFailures;
 }

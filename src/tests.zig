@@ -90,6 +90,16 @@ fn uniqueTempFile(gpa: Allocator, io: Io, prefix: []const u8, suffix: []const u8
     return error.PathAlreadyExists;
 }
 
+fn dirHasAnyEntry(io: Io, path: []const u8) !bool {
+    var dir = Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer dir.close(io);
+    var iter = dir.iterate();
+    return (try iter.next(io)) != null;
+}
+
 const TestEnv = struct {
     base: []const u8,
     ghq_root: []const u8,
@@ -341,14 +351,20 @@ test "repoStoragePath returns null for non-absolute path" {
 test "rewriteJjGitTarget writes absolute path" {
     const io = testing.io;
     const gpa = testing.allocator;
-    const jj_dir = "/tmp/gitstore_test_jj_target";
-    Dir.cwd().deleteTree(io, jj_dir) catch {};
-    try Dir.cwd().createDirPath(io, "/tmp/gitstore_test_jj_target/repo/store");
-    defer Dir.cwd().deleteTree(io, jj_dir) catch {};
+    const jj_dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_jj_target");
+    defer {
+        Dir.cwd().deleteTree(io, jj_dir) catch {};
+        gpa.free(jj_dir);
+    }
+    const store_dir = try std.fmt.allocPrint(gpa, "{s}/repo/store", .{jj_dir});
+    defer gpa.free(store_dir);
+    try Dir.cwd().createDirPath(io, store_dir);
 
     // Write initial relative content
+    const git_target = try std.fmt.allocPrint(gpa, "{s}/repo/store/git_target", .{jj_dir});
+    defer gpa.free(git_target);
     try Dir.cwd().writeFile(io, .{
-        .sub_path = "/tmp/gitstore_test_jj_target/repo/store/git_target",
+        .sub_path = git_target,
         .data = "../../../.git",
     });
 
@@ -356,7 +372,7 @@ test "rewriteJjGitTarget writes absolute path" {
 
     const content = try Dir.cwd().readFileAlloc(
         io,
-        "/tmp/gitstore_test_jj_target/repo/store/git_target",
+        git_target,
         gpa,
         .unlimited,
     );
@@ -367,7 +383,12 @@ test "rewriteJjGitTarget writes absolute path" {
 test "rewriteJjGitTarget propagates write failure when file missing" {
     const io = testing.io;
     const gpa = testing.allocator;
-    try testing.expectError(error.FileNotFound, gitstore.rewriteJjGitTarget(gpa, io, "/tmp/no_such_jj_dir_12345", "/some/git"));
+    const jj_dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_jj_missing_target");
+    defer {
+        Dir.cwd().deleteTree(io, jj_dir) catch {};
+        gpa.free(jj_dir);
+    }
+    try testing.expectError(error.FileNotFound, gitstore.rewriteJjGitTarget(gpa, io, jj_dir, "/some/git"));
 }
 
 // =========================================================
@@ -448,7 +469,10 @@ test "e2e adopt rolls back partial gitstore copy when cp fails" {
     defer gpa.free(unreadable);
     try Dir.cwd().writeFile(io, .{ .sub_path = unreadable, .data = "blocked\n" });
     try Dir.cwd().setFilePermissions(io, unreadable, .fromMode(0), .{});
-    defer Dir.cwd().setFilePermissions(io, unreadable, .default_file, .{}) catch {};
+    defer Dir.cwd().setFilePermissions(io, unreadable, .default_file, .{}) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => std.debug.panic("failed to restore test file permissions: {s}", .{@errorName(err)}),
+    };
     if (Dir.cwd().openFile(io, unreadable, .{})) |opened| {
         var file = opened;
         file.close(io);
@@ -469,9 +493,7 @@ test "e2e adopt rolls back partial gitstore copy when cp fails" {
         gpa.free(cp_probe.stderr);
     }
     try testing.expect(!cp_probe.succeeded());
-    const copied_probe = try std.fmt.allocPrint(gpa, "{s}/00-copied-before-failure", .{probe_dest});
-    defer gpa.free(copied_probe);
-    _ = try Dir.cwd().statFile(io, copied_probe, .{});
+    try testing.expect(try dirHasAnyEntry(io, probe_dest));
 
     try testing.expectError(error.ProcessFailed, gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false));
 
@@ -483,6 +505,34 @@ test "e2e adopt rolls back partial gitstore copy when cp fails" {
     const original_git = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
     defer gpa.free(original_git);
     _ = try Dir.cwd().statFile(io, original_git, .{});
+}
+
+test "e2e adopt rolls back git pointer when jj rewrite fails" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "adopt_jj_rewrite_failure");
+    defer gpa.free(repo);
+
+    const jj_src = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_src);
+    try Dir.cwd().createDirPath(io, jj_src);
+
+    try testing.expectError(error.FileNotFound, gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false));
+
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    _ = try Dir.cwd().statFile(io, jj_src, .{});
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const git_dest = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(git_dest);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, git_dest, .{}));
+
+    const jj_dest = try std.fmt.allocPrint(gpa, "{s}/{s}/jj", .{ env.gitstore_root, rel });
+    defer gpa.free(jj_dest);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_dest, .{}));
 }
 
 // =========================================================
@@ -1258,8 +1308,9 @@ test "e2e detach round-trip preserves linked worktree" {
 // merely reports. `warn()` is NOT suppressed, so the absence of a `FAIL:`/
 // `error:` line for a skipped repo is still a meaningful negative signal.
 //
-// `adoptAll`/`verifyAll`/`detachAll` print their counts rather than
-// returning them, so each test re-derives the expected end state from disk.
+// `adoptAll`/`verifyAll`/`detachAll` print their counts and return
+// BatchFailures when those counts include one or more failures, so tests
+// re-derive the expected end state from disk and assert the error path.
 // =========================================================
 
 /// Read a repo's `.git` and report whether it is a `gitdir:` pointer file.
@@ -1396,8 +1447,28 @@ test "G6-5 verifyAll surfaces a broken pointer as a failure" {
     try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
     try testing.expect(!try gitstore.verify(gpa, io, r1));
 
-    // verifyAll completes (failures are tallied, not propagated as errors).
-    try gitstore.verifyAll(gpa, io, env.ghq_root, env.gitstore_root);
+    try testing.expectError(error.BatchFailures, gitstore.verifyAll(gpa, io, env.ghq_root, env.gitstore_root));
+}
+
+test "G6-5b adoptAll returns BatchFailures when any repo fails" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const good = try env.createHostRepo("github.com", "o", "good");
+    defer gpa.free(good);
+
+    const bad = try std.fmt.allocPrint(gpa, "{s}/github.com/o/bad_jj_only", .{env.ghq_root});
+    defer gpa.free(bad);
+    try Dir.cwd().createDirPath(io, bad);
+    const bad_jj = try std.fmt.allocPrint(gpa, "{s}/.jj", .{bad});
+    defer gpa.free(bad_jj);
+    try Dir.cwd().createDirPath(io, bad_jj);
+
+    try testing.expectError(error.BatchFailures, gitstore.adoptAll(gpa, io, env.ghq_root, env.gitstore_root, false));
+    try testing.expect(try gitIsPointer(gpa, io, good));
+    try testing.expect(!gitstore.isAdopted(io, bad, env.gitstore_root, gpa));
 }
 
 test "G6-6 detachAll detaches adopted and skips non-adopted" {
@@ -1467,6 +1538,24 @@ test "G6-8 detachAll on empty root returns without error" {
 
     // No repos under ghq_root at all (the root dir itself exists, empty).
     try gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false);
+}
+
+test "G6-9 detachAll returns BatchFailures when any repo fails" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const r1 = try env.createHostRepo("github.com", "o", "r1");
+    defer gpa.free(r1);
+    try gitstore.adopt(gpa, io, r1, env.ghq_root, env.gitstore_root, false);
+
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/github.com/o/r1/git", .{env.gitstore_root});
+    defer gpa.free(store_git);
+    try Dir.cwd().deleteTree(io, store_git);
+
+    try testing.expectError(error.BatchFailures, gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false));
+    try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
 }
 
 // =========================================================
@@ -1728,6 +1817,28 @@ test "config: load uses env Z3STORE_ROOT and does not flag legacy" {
 
     try testing.expectEqualStrings("/from/env/z3store", cfg.root);
     try testing.expect(!cfg.used_legacy);
+}
+
+test "config: load uses env USER before gh api fallback" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/nonexistent_test_home");
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
+    try env_map.put("USER", "env_user_sentinel");
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expect(cfg.user != null);
+    try testing.expectEqualStrings("env_user_sentinel", cfg.user.?);
 }
 
 test "config: load prefers z3store.root over gitstore.root git config" {

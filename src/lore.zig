@@ -212,12 +212,15 @@ const testing = std.testing;
 /// Create a unique throwaway workspace dir. Caller frees the path
 /// and is responsible for deleting the tree.
 fn uniqueWs(gpa: Allocator, io: Io, tag: []const u8) ![]u8 {
-    _ = tag;
     var tmp = testing.tmpDir(.{});
     errdefer tmp.cleanup();
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const original = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer gpa.free(original);
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}-{s}", .{ tag, tmp.sub_path[0..] });
+    errdefer gpa.free(path);
     tmp.dir.close(io);
     tmp.parent_dir.close(io);
+    try Dir.rename(Dir.cwd(), original, Dir.cwd(), path, io);
     return path;
 }
 

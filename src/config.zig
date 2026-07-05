@@ -7,7 +7,7 @@
 //! Precedence:
 //!   root: z3store.root -> gitstore.root -> ghq.root
 //!         -> $Z3STORE_ROOT -> $GITSTORE_ROOT -> $GHQ_ROOT -> ~/ghq
-//!   user: z3store.user -> gitstore.user -> ghq.user -> gh-user -> $USER
+//!   user: z3store.user -> gitstore.user -> ghq.user -> $USER -> gh-user
 //!   defaultHost:  z3store.defaultHost  -> gitstore.defaultHost  -> ghq.defaultHost  -> "github.com"
 //!   completeUser: z3store.completeUser -> gitstore.completeUser -> ghq.completeUser -> "true"
 //!   adoptOnClone: z3store.adoptOnClone -> gitstore.adoptOnClone -> "true" (no ghq fallback)
@@ -194,8 +194,6 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     const z3_user_raw = snapshotValue(config_snapshot, "z3store.user");
     const gitstore_user_raw = snapshotValue(config_snapshot, "gitstore.user");
     const ghq_user_raw = snapshotValue(config_snapshot, "ghq.user");
-    const gh_user_raw = try ghUser(gpa, io);
-    defer if (gh_user_raw) |v| gpa.free(v);
     const env_user = env.get("USER");
 
     var user: ?[]const u8 = null;
@@ -207,10 +205,14 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     } else if (nonEmpty(ghq_user_raw)) |v| {
         user = try ownStatic(&owned_strings, gpa, v);
         used_legacy = true;
-    } else if (nonEmpty(gh_user_raw)) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
     } else if (nonEmpty(env_user)) |v| {
         user = try ownStatic(&owned_strings, gpa, v);
+    } else {
+        const gh_user_raw = try ghUser(gpa, io);
+        defer if (gh_user_raw) |v| gpa.free(v);
+        if (nonEmpty(gh_user_raw)) |v| {
+            user = try ownStatic(&owned_strings, gpa, v);
+        }
     }
 
     // --- defaultHost ---
