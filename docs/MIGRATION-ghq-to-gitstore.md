@@ -21,7 +21,8 @@ local). z3store absorbs ghq's role — no more shell-side diff dance.
   entries; z3store nests them under their parent.
 - **jj-native.** ghq sees a colocated jj repo as plain git; z3store colocates
   on clone and round-trips via `jj git`.
-- **Zero dependencies.** No Go runtime, no libgit2. Single Zig binary.
+- **Small runtime footprint.** No Go runtime or libgit2 dependency in the
+  `zt` binary.
 
 ## Subcommand parity
 

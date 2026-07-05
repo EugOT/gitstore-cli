@@ -128,9 +128,12 @@ pub fn load(
         error.FileNotFound => blk: {
             const legacy_index_path = try legacyIndexPath(gpa, gitstore_root);
             defer gpa.free(legacy_index_path);
-            break :blk Dir.cwd().readFileAlloc(io, legacy_index_path, gpa, .unlimited) catch return map;
+            break :blk Dir.cwd().readFileAlloc(io, legacy_index_path, gpa, .unlimited) catch |legacy_err| switch (legacy_err) {
+                error.FileNotFound => return map,
+                else => return legacy_err,
+            };
         },
-        else => return map, // any other read error: return empty; callers rebuild
+        else => return err,
     };
     defer gpa.free(bytes);
 

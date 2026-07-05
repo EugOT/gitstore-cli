@@ -16,9 +16,9 @@ pub const zsh_hook =
     \\# If `zt` is absent from PATH, falls back to the real ghq binary.
     \\
     \\ghq() {
-    \\  if command -v zt >/dev/null 2>&1; then
+    \\  if whence -p zt >/dev/null 2>&1; then
     \\    command zt "$@"
-    \\  elif command -v ghq >/dev/null 2>&1; then
+    \\  elif whence -p ghq >/dev/null 2>&1; then
     \\    command ghq "$@"
     \\  else
     \\    echo "ghq(): neither zt nor ghq found on PATH" >&2
@@ -38,9 +38,9 @@ pub const bash_hook =
     \\# If `zt` is absent from PATH, falls back to the real ghq binary.
     \\
     \\ghq() {
-    \\  if command -v zt >/dev/null 2>&1; then
+    \\  if type -P zt >/dev/null 2>&1; then
     \\    command zt "$@"
-    \\  elif command -v ghq >/dev/null 2>&1; then
+    \\  elif type -P ghq >/dev/null 2>&1; then
     \\    command ghq "$@"
     \\  else
     \\    echo "ghq(): neither zt nor ghq found on PATH" >&2
@@ -58,12 +58,12 @@ pub const nu_hook =
     \\# Falls back to real ghq binary if zt is not installed.
     \\
     \\export def --wrapped ghq [...args: string] {
-    \\  if (which zt | is-not-empty) {
+    \\  if (which zt | where type == external | is-not-empty) {
     \\    ^zt ...$args
-    \\  } else if (which ghq | is-not-empty) {
+    \\  } else if (which ghq | where type == external | is-not-empty) {
     \\    ^ghq ...$args
     \\  } else {
-    \\    error make {msg: "ghq(): zt not found on PATH"}
+    \\    error make {msg: "ghq(): neither zt nor ghq found on PATH"}
     \\  }
     \\}
     \\
@@ -201,9 +201,15 @@ test "hook: zsh defines ghq() function" {
 }
 
 test "hook: zsh prefers zt over ghq" {
-    const zt_cmd_index = mem.indexOf(u8, zsh_hook, "command -v zt").?;
-    const ghq = mem.indexOf(u8, zsh_hook, "command -v ghq").?;
+    const zt_cmd_index = mem.indexOf(u8, zsh_hook, "whence -p zt").?;
+    const ghq = mem.indexOf(u8, zsh_hook, "whence -p ghq").?;
     try testing.expect(zt_cmd_index < ghq);
+}
+
+test "hook: zsh uses PATH-only executable probes" {
+    try testing.expect(mem.indexOf(u8, zsh_hook, "whence -p zt") != null);
+    try testing.expect(mem.indexOf(u8, zsh_hook, "whence -p ghq") != null);
+    try testing.expect(mem.indexOf(u8, zsh_hook, "command -v ghq") == null);
 }
 
 test "hook: zsh forwards all args to zt" {
@@ -229,9 +235,15 @@ test "hook: bash defines ghq() function" {
 }
 
 test "hook: bash prefers zt over ghq" {
-    const zt_cmd_index = mem.indexOf(u8, bash_hook, "command -v zt").?;
-    const ghq = mem.indexOf(u8, bash_hook, "command -v ghq").?;
+    const zt_cmd_index = mem.indexOf(u8, bash_hook, "type -P zt").?;
+    const ghq = mem.indexOf(u8, bash_hook, "type -P ghq").?;
     try testing.expect(zt_cmd_index < ghq);
+}
+
+test "hook: bash uses PATH-only executable probes" {
+    try testing.expect(mem.indexOf(u8, bash_hook, "type -P zt") != null);
+    try testing.expect(mem.indexOf(u8, bash_hook, "type -P ghq") != null);
+    try testing.expect(mem.indexOf(u8, bash_hook, "command -v ghq") == null);
 }
 
 test "hook: bash forwards all args to zt" {
@@ -252,17 +264,17 @@ test "hook: nu defines wrapped ghq" {
 }
 
 test "hook: nu prefers zt" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "which zt") != null);
+    try testing.expect(mem.indexOf(u8, nu_hook, "which zt | where type == external") != null);
     try testing.expect(mem.indexOf(u8, nu_hook, "^zt ...$args") != null);
 }
 
 test "hook: nu falls back to ghq" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "which ghq") != null);
+    try testing.expect(mem.indexOf(u8, nu_hook, "which ghq | where type == external") != null);
     try testing.expect(mem.indexOf(u8, nu_hook, "^ghq ...$args") != null);
 }
 
-test "hook: nu raises an error when zt is missing" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "error make {msg: \"ghq(): zt not found on PATH\"}") != null);
+test "hook: nu raises an error when both tools are missing" {
+    try testing.expect(mem.indexOf(u8, nu_hook, "error make {msg: \"ghq(): neither zt nor ghq found on PATH\"}") != null);
     try testing.expect(mem.indexOf(u8, nu_hook, "exit 127") == null);
 }
 

@@ -449,6 +449,14 @@ test "e2e adopt rolls back partial gitstore copy when cp fails" {
     try Dir.cwd().writeFile(io, .{ .sub_path = unreadable, .data = "blocked\n" });
     try Dir.cwd().setFilePermissions(io, unreadable, .fromMode(0), .{});
     defer Dir.cwd().setFilePermissions(io, unreadable, .default_file, .{}) catch {};
+    if (Dir.cwd().openFile(io, unreadable, .{})) |opened| {
+        var file = opened;
+        file.close(io);
+        return error.SkipZigTest;
+    } else |err| switch (err) {
+        error.AccessDenied => {},
+        else => return err,
+    }
 
     try testing.expectError(error.ProcessFailed, gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false));
 
@@ -1069,7 +1077,7 @@ test "e2e detach round-trip jj+git" {
     try testing.expect(js.succeeded());
 }
 
-test "e2e detach propagates .jj backup rename failure" {
+test "e2e detach preserves pre-existing fixed .jj backup path" {
     const io = testing.io;
     const gpa = testing.allocator;
     var env = try TestEnv.setup(gpa, io);
@@ -1090,7 +1098,11 @@ test "e2e detach propagates .jj backup rename failure" {
         .data = "occupied\n",
     });
 
-    try testing.expectError(error.IsDir, gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false));
+    try gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false);
+    _ = try Dir.cwd().statFile(io, blocker, .{});
+    const restored_jj = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(restored_jj);
+    _ = try Dir.cwd().statFile(io, restored_jj, .{});
 }
 
 test "e2e detach aborts before store removal when .jj restore copy fails" {

@@ -21,6 +21,10 @@ pub const Error = error{
     Dir.DeleteTreeError || Dir.OpenError || Dir.CreateDirPathError ||
     File.OpenError || File.StatError || Dir.ReadFileAllocError;
 
+// Git pointer files are tiny; cap reads to avoid unbounded allocations on
+// malformed repos while still allowing far more than a real pointer needs.
+const max_git_pointer_file_bytes = 64 * 1024;
+
 fn info(io: Io, comptime fmt: []const u8, args: anytype) void {
     if (builtin.is_test) return;
     var buf: [8192]u8 = undefined;
@@ -34,6 +38,11 @@ fn warn(io: Io, comptime fmt: []const u8, args: anytype) void {
     var w = File.stderr().writerStreaming(io, &buf);
     w.interface.print(fmt, args) catch {};
     w.flush() catch {};
+}
+
+fn uniqueSidePath(gpa: Allocator, io: Io, base_path: []const u8, label: []const u8) ![]u8 {
+    const ns = Io.Clock.real.now(io).nanoseconds;
+    return std.fmt.allocPrint(gpa, "{s}.{s}-{d}", .{ base_path, label, ns });
 }
 
 /// Create the gitstore root directory if it does not exist.
@@ -83,8 +92,9 @@ pub fn isAdopted(io: Io, repo_path: []const u8, gitstore_root: []const u8, gpa: 
     const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path}) catch return false;
     defer gpa.free(git_path);
 
-    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch |err| switch (err) {
+    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .limited(max_git_pointer_file_bytes)) catch |err| switch (err) {
         error.IsDir => return false,
+        error.StreamTooLong => return false,
         else => return false,
     };
     defer gpa.free(content);
@@ -255,7 +265,7 @@ fn rewriteLinkedWorktreePointer(
     const wt_git_file = try std.fmt.allocPrint(gpa, "{s}/.git", .{linked_wt_path});
     defer gpa.free(wt_git_file);
 
-    const content = Dir.cwd().readFileAlloc(io, wt_git_file, gpa, .unlimited) catch |err| {
+    const content = Dir.cwd().readFileAlloc(io, wt_git_file, gpa, .limited(max_git_pointer_file_bytes)) catch |err| {
         warn(io, "warn: cannot read {s}: {s}\n", .{ wt_git_file, @errorName(err) });
         return err;
     };
@@ -515,8 +525,10 @@ pub fn adoptWithJjBinary(
     for (worktrees) |wt| {
         rewriteLinkedWorktreePointer(gpa, io, wt, git_dest) catch |err| {
             warn(io, "warn: could not rewrite worktree pointer at {s}: {s}\n", .{ wt, @errorName(err) });
-            try oplog.logOperation(io, log_path, .write_pointer, wt, git_dest, "error: worktree rewrite failed");
-            continue;
+            oplog.logOperation(io, log_path, .write_pointer, wt, git_dest, "error: worktree rewrite failed") catch |log_err| {
+                warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
+            };
+            return err;
         };
         try oplog.logOperation(io, log_path, .write_pointer, wt, git_dest, "ok: worktree");
         info(io, "worktree: {s}/.git -> {s}/worktrees/...\n", .{ wt, git_dest });
@@ -550,9 +562,8 @@ pub fn adoptWithJjBinary(
         // Move the original .jj aside instead of deleting it before the
         // symlink exists — restore it on failure so there is no window
         // where the worktree has no .jj at all.
-        const jj_aside = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-old", .{repo_path});
+        const jj_aside = try uniqueSidePath(gpa, io, jj_src, "gs-old");
         defer gpa.free(jj_aside);
-        Dir.cwd().deleteTree(io, jj_aside) catch {};
         try Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io);
         Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true }) catch |err| {
             warn(io, "error: .jj symlink failed ({s}); restoring original .jj\n", .{@errorName(err)});
@@ -592,17 +603,35 @@ pub fn adoptWithJjBinary(
             const jj_check = Dir.cwd().statFile(io, jj_src, .{}) catch null;
             if (jj_check != null) {
                 const jj_cp2 = try ex.exec(gpa, io, &.{ "cp", "-a", jj_src, jj_dest }, null);
-                gpa.free(jj_cp2.stdout);
-                gpa.free(jj_cp2.stderr);
-                if (jj_cp2.succeeded()) {
-                    rewriteJjGitTarget(gpa, io, jj_dest, git_dest) catch |err| {
-                        warn(io, "warn: could not rewrite optional jj git_target at {s}: {s}\n", .{ jj_dest, @errorName(err) });
-                    };
-                    try Dir.cwd().deleteTree(io, jj_src);
-                    try Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true });
-                    try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
-                    info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
+                defer {
+                    gpa.free(jj_cp2.stdout);
+                    gpa.free(jj_cp2.stderr);
                 }
+                if (!jj_cp2.succeeded()) {
+                    warn(io, "error: cp auto-created .jj failed: {s}\n", .{jj_cp2.stderr});
+                    Dir.cwd().deleteTree(io, jj_dest) catch {};
+                    try oplog.logOperation(io, log_path, .copy, jj_src, jj_dest, "error: cp .jj failed");
+                    return error.ProcessFailed;
+                }
+
+                rewriteJjGitTarget(gpa, io, jj_dest, git_dest) catch |err| {
+                    warn(io, "error: could not rewrite optional jj git_target at {s}: {s}\n", .{ jj_dest, @errorName(err) });
+                    Dir.cwd().deleteTree(io, jj_dest) catch {};
+                    return err;
+                };
+
+                const jj_aside = try uniqueSidePath(gpa, io, jj_src, "gs-old");
+                defer gpa.free(jj_aside);
+                try Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io);
+                Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true }) catch |err| {
+                    warn(io, "error: auto-created .jj symlink failed ({s}); restoring original .jj\n", .{@errorName(err)});
+                    Dir.rename(Dir.cwd(), jj_aside, Dir.cwd(), jj_src, io) catch {};
+                    Dir.cwd().deleteTree(io, jj_dest) catch {};
+                    return err;
+                };
+                try Dir.cwd().deleteTree(io, jj_aside);
+                try oplog.logOperation(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
+                info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
             }
         } else {
             try oplog.logOperation(io, log_path, .init_jj, repo_path, "", "error: jj init failed");
@@ -662,9 +691,13 @@ pub fn verify(
     const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
     defer gpa.free(git_path);
 
-    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch |err| switch (err) {
+    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .limited(max_git_pointer_file_bytes)) catch |err| switch (err) {
         error.IsDir => {
             warn(io, "FAIL: {s}/.git is a directory (not adopted)\n", .{repo_path});
+            return false;
+        },
+        error.StreamTooLong => {
+            warn(io, "FAIL: {s}/.git is too large to be a gitdir pointer\n", .{repo_path});
             return false;
         },
         else => {
@@ -719,8 +752,14 @@ pub fn verify(
         ok = false;
     };
 
-    {
-        const jj_result = try ex.exec(gpa, io, &.{ "jj", "status", "-R", repo_path }, null);
+    jj_check: {
+        const jj_result = ex.exec(gpa, io, &.{ "jj", "status", "-R", repo_path }, null) catch |err| switch (err) {
+            error.FileNotFound => {
+                warn(io, "SKIP: jj status skipped in {s} (jj not found on PATH)\n", .{repo_path});
+                break :jj_check;
+            },
+            else => return err,
+        };
         defer {
             gpa.free(jj_result.stdout);
             gpa.free(jj_result.stderr);
@@ -765,7 +804,7 @@ fn adoptedGitPointerBroken(gpa: Allocator, io: Io, repo_path: []const u8) bool {
     const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path}) catch return false;
     defer gpa.free(git_path);
 
-    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited) catch return false;
+    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .limited(max_git_pointer_file_bytes)) catch return false;
     defer gpa.free(content);
 
     const trimmed = ex.trimTrailingNewline(content);
@@ -980,7 +1019,13 @@ pub fn detach(
     // read, but if .git is swapped or truncated between the two reads we
     // would slice past the buffer. Refusing here turns malformed input into
     // error.GitDirMalformed instead of a panic.
-    const pointer_content = try Dir.cwd().readFileAlloc(io, git_pointer_path, gpa, .unlimited);
+    const pointer_content = Dir.cwd().readFileAlloc(io, git_pointer_path, gpa, .limited(max_git_pointer_file_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => {
+            warn(io, "error: gitdir pointer in {s}/.git is too large to be valid\n", .{repo_path});
+            return error.GitDirMalformed;
+        },
+        else => return err,
+    };
     defer gpa.free(pointer_content);
     const trimmed = ex.trimTrailingNewline(pointer_content);
     const prefix = "gitdir: ";
@@ -1153,10 +1198,18 @@ pub fn detach(
         return error.VerifyFailed;
     }
 
-    // --- Step 3: Swap — delete pointer file, rename staged dir ---
-    try Dir.cwd().deleteFile(io, git_pointer_path);
-    try oplog.logOperation(io, log_path, .remove, git_pointer_path, "", "ok: detach pointer");
-    try Dir.rename(Dir.cwd(), git_new, Dir.cwd(), git_pointer_path, io);
+    // --- Step 3: Swap — rename pointer aside, rename staged dir, then delete aside ---
+    const git_pointer_aside = try uniqueSidePath(gpa, io, git_pointer_path, "gs-old");
+    defer gpa.free(git_pointer_aside);
+    try Dir.rename(Dir.cwd(), git_pointer_path, Dir.cwd(), git_pointer_aside, io);
+    try oplog.logOperation(io, log_path, .remove, git_pointer_path, git_pointer_aside, "ok: detach pointer aside");
+    Dir.rename(Dir.cwd(), git_new, Dir.cwd(), git_pointer_path, io) catch |err| {
+        warn(io, "error: restoring .git pointer after staged rename failed ({s})\n", .{@errorName(err)});
+        Dir.rename(Dir.cwd(), git_pointer_aside, Dir.cwd(), git_pointer_path, io) catch {};
+        Dir.cwd().deleteTree(io, git_new) catch {};
+        return err;
+    };
+    try Dir.cwd().deleteFile(io, git_pointer_aside);
     try oplog.logOperation(io, log_path, .write_pointer, git_src, git_pointer_path, "ok: detach restore .git");
     info(io, "restored: {s}/.git\n", .{repo_path});
 
@@ -1174,7 +1227,7 @@ pub fn detach(
         }
         if (jcp.succeeded()) {
             // Rename the symlink aside first — do NOT delete it until the new .jj is in place.
-            const jj_backup = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-old", .{repo_path});
+            const jj_backup = try uniqueSidePath(gpa, io, jj_pointer_path, "gs-old");
             defer gpa.free(jj_backup);
             Dir.rename(Dir.cwd(), jj_pointer_path, Dir.cwd(), jj_backup, io) catch |err| {
                 warn(io, "warn: could not rename .jj symlink ({s}); leaving symlink in place\n", .{@errorName(err)});
@@ -1212,7 +1265,10 @@ pub fn detach(
     for (worktrees) |wt| {
         rewriteLinkedWorktreePointer(gpa, io, wt, restored_git) catch |err| {
             warn(io, "warn: could not rewrite worktree pointer {s}: {s}\n", .{ wt, @errorName(err) });
-            continue;
+            oplog.logOperation(io, log_path, .write_pointer, wt, restored_git, "error: detach worktree rewrite failed") catch |log_err| {
+                warn(io, "warn: could not write operations.log entry: {s}\n", .{@errorName(log_err)});
+            };
+            return err;
         };
         try oplog.logOperation(io, log_path, .write_pointer, wt, restored_git, "ok: detach worktree");
         info(io, "worktree: {s}/.git -> {s}/worktrees/...\n", .{ wt, restored_git });

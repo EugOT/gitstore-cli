@@ -372,6 +372,16 @@ fn writeLoreReport(gpa: Allocator, io: Io, path: []const u8) !bool {
     return ok;
 }
 
+fn hasLoreDirectory(gpa: Allocator, io: Io, path: []const u8) !bool {
+    const lore_dir = try std.fmt.allocPrint(gpa, "{s}/.lore", .{path});
+    defer gpa.free(lore_dir);
+    const stat = Dir.cwd().statFile(io, lore_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return stat.kind == .directory;
+}
+
 fn cmdLore(
     gpa: Allocator,
     io: Io,
@@ -405,10 +415,10 @@ fn cmdLore(
         return 2;
     };
 
-    if (!lore.detectLoreWorkspace(io, p)) {
+    if (!try hasLoreDirectory(gpa, io, p)) {
         var buf: [1024]u8 = undefined;
         var w = File.stderr().writerStreaming(io, &buf);
-        try w.interface.print("error: {s} is not a Lore workspace (no .lore/instance)\n", .{p});
+        try w.interface.print("error: {s} is not a Lore workspace (no .lore directory)\n", .{p});
         try w.flush();
         return 1;
     }
@@ -488,13 +498,27 @@ fn resolveGhqRootOrHome(gpa: Allocator, io: Io, environ_map: *const std.process.
 // testing allocator's leak detector pins any allocPrint that is not released.
 // =========================================================
 
+fn deleteTreeIfExists(io: Io, path: []const u8) !void {
+    _ = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    try Dir.cwd().deleteTree(io, path);
+}
+
+fn deleteTreeIfExistsOrPanic(io: Io, path: []const u8) void {
+    deleteTreeIfExists(io, path) catch |err| {
+        std.debug.panic("test cleanup failed for {s}: {s}", .{ path, @errorName(err) });
+    };
+}
+
 test "getStoreRoot defaults to <HOME>/.local/share/z3store when neither dir exists" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const home = "/tmp/z3s_test_home_none";
     // Ensure a pristine HOME so neither store dir exists.
-    Dir.cwd().deleteTree(io, home) catch {};
-    defer Dir.cwd().deleteTree(io, home) catch {};
+    try deleteTreeIfExists(io, home);
+    defer deleteTreeIfExistsOrPanic(io, home);
 
     var env_map: std.process.Environ.Map = .init(gpa);
     defer env_map.deinit();
@@ -509,8 +533,8 @@ test "getStoreRoot prefers z3store dir when it exists" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const home = "/tmp/z3s_test_home_z3";
-    Dir.cwd().deleteTree(io, home) catch {};
-    defer Dir.cwd().deleteTree(io, home) catch {};
+    try deleteTreeIfExists(io, home);
+    defer deleteTreeIfExistsOrPanic(io, home);
     // Both legacy and new dirs present -> new z3store must win.
     try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_z3/.local/share/z3store");
     try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_z3/.local/share/gitstore");
@@ -528,8 +552,8 @@ test "getStoreRoot uses legacy gitstore dir when only it exists" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const home = "/tmp/z3s_test_home_legacy";
-    Dir.cwd().deleteTree(io, home) catch {};
-    defer Dir.cwd().deleteTree(io, home) catch {};
+    try deleteTreeIfExists(io, home);
+    defer deleteTreeIfExistsOrPanic(io, home);
     // Only the legacy gitstore dir exists (adopted repos point into it).
     try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_legacy/.local/share/gitstore");
 
@@ -674,9 +698,6 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "init")) {
-        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
-        defer gpa.free(gitstore_root);
-
         // init with a path: create git+jj repo and adopt in one shot.
         // Scan ALL args (not just the first) so `init /path --help` and
         // `init --help /path` both surface help, and so unknown flags are
@@ -705,10 +726,14 @@ pub fn main(init: std.process.Init) !u8 {
             path = arg;
         }
         if (path) |p| {
+            const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
+            defer gpa.free(gitstore_root);
             const ghq_root = try getGhqRoot(gpa, io);
             defer gpa.free(ghq_root);
             try gitstore.initRepo(gpa, io, p, ghq_root, gitstore_root);
         } else {
+            const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
+            defer gpa.free(gitstore_root);
             // No path: just ensure gitstore root directory exists
             try gitstore.init(io, gitstore_root);
             var buf: [4096]u8 = undefined;
@@ -1195,11 +1220,17 @@ fn cmdGet(
 
     try printLegacyConfigHint(io, &cfg);
 
-    // Resolve gitstore root (for adoption side effect). With --no-adopt
-    // nothing will be written to the store, so don't create it either.
-    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
-    defer gpa.free(gitstore_root);
-    if (!opts.no_adopt) try gitstore.init(io, gitstore_root);
+    // Resolve gitstore root only for the adoption side effect. With
+    // --no-adopt nothing will be written to the store, so don't require the
+    // store root to be discoverable or creatable.
+    var gitstore_root_owned: ?[]u8 = null;
+    defer if (gitstore_root_owned) |root| gpa.free(root);
+    const gitstore_root: []const u8 = if (opts.no_adopt) "" else blk: {
+        const root = try getStoreRoot(gpa, io, environ_map);
+        gitstore_root_owned = root;
+        try gitstore.init(io, root);
+        break :blk root;
+    };
 
     // Parse URLs into specs.
     var specs: std.ArrayList(url_mod.RepoSpec) = .empty;

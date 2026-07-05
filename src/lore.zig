@@ -202,18 +202,15 @@ fn parseSharedStore(gpa: Allocator, content: []const u8, st: *LoreStatus) !void 
 
 const testing = std.testing;
 
-/// Create a unique throwaway workspace dir under /tmp. Caller frees the path
+/// Create a unique throwaway workspace dir. Caller frees the path
 /// and is responsible for deleting the tree.
 fn uniqueWs(gpa: Allocator, io: Io, tag: []const u8) ![]u8 {
-    var marker: u8 = undefined;
-    const ns = Io.Clock.real.now(io).nanoseconds;
-    const path = try std.fmt.allocPrint(
-        gpa,
-        "/tmp/z3s_lore_{s}_{x}_{x}",
-        .{ tag, @as(u64, @intCast(ns)), @intFromPtr(&marker) },
-    );
-    Dir.cwd().deleteTree(io, path) catch {};
-    try Dir.cwd().createDirPath(io, path);
+    _ = tag;
+    var tmp = testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    tmp.dir.close(io);
+    tmp.parent_dir.close(io);
     return path;
 }
 

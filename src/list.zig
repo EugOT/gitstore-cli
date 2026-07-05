@@ -689,6 +689,7 @@ test "list: renderJson emits a top-level array" {
     const obj = parsed.value.array.items[0].object;
     try testing.expectEqualStrings("github.com/owner/repo", obj.get("rel_path").?.string);
     try testing.expect(obj.get("has_jj").?.bool);
+    try testing.expect(!obj.get("is_lore").?.bool);
 }
 
 test "list: include_worktrees flattens linked worktree paths" {
