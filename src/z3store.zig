@@ -919,7 +919,10 @@ pub fn verifyAll(
     var ok_count: usize = 0;
     var fail_count: usize = 0;
 
-    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch return error.ProcessFailed;
+    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch |err| {
+        warn(io, "error: ghq enumeration failed: {s}\n", .{@errorName(err)});
+        return error.ProcessFailed;
+    };
     defer list_mod.freeEntries(gpa, entries);
 
     for (entries) |e| {
@@ -971,7 +974,10 @@ pub fn status(
     var adopted_count: usize = 0;
     var broken_count: usize = 0;
 
-    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch return error.ProcessFailed;
+    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch |err| {
+        warn(io, "error: ghq enumeration failed: {s}\n", .{@errorName(err)});
+        return error.ProcessFailed;
+    };
     defer list_mod.freeEntries(gpa, entries);
 
     for (entries) |e| {
@@ -1535,7 +1541,10 @@ pub fn detachAll(
     var skipped: usize = 0;
     var failed: usize = 0;
 
-    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch return error.ProcessFailed;
+    const entries = list_mod.walk(gpa, io, ghq_root, gitstore_root, .{}) catch |err| {
+        warn(io, "error: ghq enumeration failed: {s}\n", .{@errorName(err)});
+        return error.ProcessFailed;
+    };
     defer list_mod.freeEntries(gpa, entries);
 
     for (entries) |e| {

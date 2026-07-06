@@ -175,6 +175,11 @@ const TestEnv = struct {
         defer self.gpa.free(r1c.stderr);
         if (!r1c.succeeded()) return error.ProcessFailed;
 
+        const r1d = try ex.exec(self.gpa, self.io, &.{ "git", "config", "commit.gpgsign", "false" }, repo_path);
+        defer self.gpa.free(r1d.stdout);
+        defer self.gpa.free(r1d.stderr);
+        if (!r1d.succeeded()) return error.ProcessFailed;
+
         const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo_path);
         defer self.gpa.free(r2.stdout);
         defer self.gpa.free(r2.stderr);
