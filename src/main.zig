@@ -1021,11 +1021,11 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
-        // Resolve roots only after arg parse so `status --help` cannot fail
-        // when ghq is not installed.
+        // Resolve roots only after arg parse so `status --help` cannot fail,
+        // and keep status usable on hosts that have z3store but no ghq binary.
         const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
         defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
+        const ghq_root = try resolveGhqRootOrHome(gpa, io, init.environ_map);
         defer gpa.free(ghq_root);
 
         try gitstore.status(gpa, io, ghq_root, gitstore_root, json_mode);
