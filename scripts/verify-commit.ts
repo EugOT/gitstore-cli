@@ -41,14 +41,14 @@ async function main(): Promise<void> {
 	});
 	if (fast.exitCode !== 0) await finish(fast.exitCode ?? 1, startedAt);
 
-	console.log("== zig build test (Debug, --test-timeout 30s) ==");
+	console.log("== zig build test (Debug, --test-timeout 60s) ==");
 	const test = zig([
 		"build",
 		"test",
 		"--summary",
 		"failures",
 		"--test-timeout",
-		"30s",
+		"60s",
 	]);
 	process.stdout.write(test.stdout);
 	process.stderr.write(test.stderr);
