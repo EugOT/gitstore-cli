@@ -5,6 +5,7 @@ const Dir = std.Io.Dir;
 const File = std.Io.File;
 const Allocator = std.mem.Allocator;
 const ex = @import("exec.zig");
+const hooks = @import("hooks.zig");
 const oplog = @import("log.zig");
 const list_mod = @import("list.zig");
 
@@ -31,15 +32,15 @@ fn info(io: Io, comptime fmt: []const u8, args: anytype) void {
     if (builtin.is_test) return;
     var buf: [8192]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &buf);
-    w.interface.print(fmt, args) catch {};
-    w.flush() catch {};
+    w.interface.print(fmt, args) catch return;
+    w.flush() catch return;
 }
 
 fn warn(io: Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [8192]u8 = undefined;
     var w = File.stderr().writerStreaming(io, &buf);
-    w.interface.print(fmt, args) catch {};
-    w.flush() catch {};
+    w.interface.print(fmt, args) catch return;
+    w.flush() catch return;
 }
 
 /// Adopt/detach policy: real filesystem/process failures propagate. Once a
@@ -58,7 +59,9 @@ fn logOperationBestEffort(
     };
 }
 
-fn deleteEntryBestEffort(io: Io, path: []const u8) void {
+/// Remove a path whose type is genuinely variable. Prefer the type-specific
+/// helpers below whenever the operation created the path itself.
+fn deletePathByTypeBestEffort(io: Io, path: []const u8) void {
     var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (Dir.cwd().readLink(io, path, &link_buf)) |_| {
         Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
@@ -79,6 +82,25 @@ fn deleteEntryBestEffort(io: Io, path: []const u8) void {
             else => warn(io, "warn: could not delete file {s}: {s}\n", .{ path, @errorName(file_err) }),
         },
         else => warn(io, "warn: could not delete tree {s}: {s}\n", .{ path, @errorName(tree_err) }),
+    };
+}
+
+fn deleteFileBestEffort(io: Io, path: []const u8) void {
+    Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => warn(io, "warn: could not delete file {s}: {s}\n", .{ path, @errorName(err) }),
+    };
+}
+
+fn deleteTreeBestEffort(io: Io, path: []const u8) void {
+    Dir.cwd().deleteTree(io, path) catch |err| {
+        warn(io, "warn: could not delete tree {s}: {s}\n", .{ path, @errorName(err) });
+    };
+}
+
+fn renameBestEffort(io: Io, old_path: []const u8, new_path: []const u8) void {
+    Dir.rename(Dir.cwd(), old_path, Dir.cwd(), new_path, io) catch |err| {
+        warn(io, "warn: could not restore {s} -> {s}: {s}\n", .{ old_path, new_path, @errorName(err) });
     };
 }
 
@@ -133,11 +155,11 @@ fn rollbackAdoptAfterGitSwap(
             warn(io, "warn: could not restore worktree pointer at {s}: {s}\n", .{ wt, @errorName(err) });
         };
     }
-    if (remove_jj_src) deleteEntryBestEffort(io, jj_src);
-    deleteEntryBestEffort(io, jj_dest);
+    if (remove_jj_src) deletePathByTypeBestEffort(io, jj_src);
+    deleteTreeBestEffort(io, jj_dest);
     restoreGitDirFromStoreBestEffort(gpa, io, git_src, git_dest);
-    deleteEntryBestEffort(io, git_dest);
-    if (!repo_store_preexisting) deleteEntryBestEffort(io, repo_store_dir);
+    deleteTreeBestEffort(io, git_dest);
+    if (!repo_store_preexisting) deleteTreeBestEffort(io, repo_store_dir);
     logOperationBestEffort(io, log_path, .write_pointer, git_src, git_dest, "error: post-adopt failure, rolled back");
 }
 
@@ -189,11 +211,22 @@ pub fn repoStoragePath(repo_path: []const u8, ghq_root: []const u8) ?[]const u8 
 }
 
 /// Check if a repo is already adopted: .git is a pointer file with gitdir target inside gitstore_root.
+// ziglint-ignore: Z023 - public compatibility API predates allocator-first
+// ordering; changing it breaks downstream callers.
 pub fn isAdopted(io: Io, repo_path: []const u8, gitstore_root: []const u8, gpa: Allocator) bool {
+    return isAdoptedInternal(gpa, io, repo_path, gitstore_root);
+}
+
+fn isAdoptedInternal(gpa: Allocator, io: Io, repo_path: []const u8, gitstore_root: []const u8) bool {
     const git_path = std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path}) catch return false;
     defer gpa.free(git_path);
 
-    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .limited(max_git_pointer_file_bytes)) catch |err| switch (err) {
+    const content = Dir.cwd().readFileAlloc(
+        io,
+        git_path,
+        gpa,
+        .limited(max_git_pointer_file_bytes),
+    ) catch |err| switch (err) {
         error.IsDir => return false,
         error.StreamTooLong => return false,
         else => return false,
@@ -230,7 +263,7 @@ pub fn initRepo(
         return err;
     };
 
-    if (isAdopted(io, repo_path, gitstore_root, gpa)) {
+    if (isAdoptedInternal(gpa, io, repo_path, gitstore_root)) {
         info(io, "skip: {s} (already adopted)\n", .{repo_path});
         return;
     }
@@ -262,7 +295,12 @@ pub fn initRepo(
         info(io, "jj init: {s}\n", .{repo_path});
         // #22 parity with adopt(): a missing jj binary is best-effort here
         // too — the git repo is already initialized, so continue git-only.
-        const jj_init: ?ex.ExecResult = ex.exec(gpa, io, &.{ "jj", "git", "init", "--colocate" }, repo_path) catch |err| switch (err) {
+        const jj_init: ?ex.ExecResult = ex.exec(
+            gpa,
+            io,
+            &.{ "jj", "git", "init", "--colocate" },
+            repo_path,
+        ) catch |err| switch (err) {
             error.FileNotFound => blk: {
                 warn(io, "warn: jj init unavailable (non-fatal): jj not found\n", .{});
                 break :blk null;
@@ -347,7 +385,7 @@ pub fn enumerateLinkedWorktrees(gpa: Allocator, io: Io, repo_path: []const u8) !
         errdefer gpa.free(owned);
         try list.append(gpa, owned);
     }
-    return try list.toOwnedSlice(gpa);
+    return list.toOwnedSlice(gpa);
 }
 
 pub fn freeWorktreePaths(gpa: Allocator, paths: [][]u8) void {
@@ -440,7 +478,7 @@ pub fn adoptWithJjBinary(
         }
     }
 
-    if (isAdopted(io, repo_path, gitstore_root, gpa)) {
+    if (isAdoptedInternal(gpa, io, repo_path, gitstore_root)) {
         info(io, "skip: {s} (already adopted)\n", .{repo_path});
         return;
     }
@@ -451,7 +489,11 @@ pub fn adoptWithJjBinary(
         // Verify .git is a directory. openDir fails with NotDir if it's a file.
         var dir = Dir.openDirAbsolute(io, git_src, .{}) catch |err| switch (err) {
             error.NotDir => {
-                warn(io, "error: {s}/.git is a file (likely a linked worktree or submodule); adopt the main repo instead\n", .{repo_path});
+                warn(
+                    io,
+                    "error: {s}/.git is a file (likely a linked worktree or submodule); adopt the main repo instead\n",
+                    .{repo_path},
+                );
                 return error.NotAGitRepo;
             },
             else => {
@@ -533,7 +575,11 @@ pub fn adoptWithJjBinary(
                 canon_path.len <= canon_root.len or
                 canon_path[canon_root.len] != '/')
             {
-                warn(io, "error: canonicalized gitstore path {s} escapes canonicalized gitstore root {s}\n", .{ canon_path, canon_root });
+                warn(
+                    io,
+                    "error: canonicalized gitstore path {s} escapes canonicalized gitstore root {s}\n",
+                    .{ canon_path, canon_root },
+                );
                 gpa.free(next);
                 return error.GitDirMalformed;
             }
@@ -576,7 +622,7 @@ pub fn adoptWithJjBinary(
     }
     if (!cp_result.succeeded()) {
         warn(io, "error: cp failed: {s}\n", .{cp_result.stderr});
-        Dir.cwd().deleteTree(io, git_dest) catch {};
+        deleteTreeBestEffort(io, git_dest);
         try oplog.logOperation(io, log_path, .copy, git_src, git_dest, "error: cp failed");
         return error.ProcessFailed;
     }
@@ -596,7 +642,7 @@ pub fn adoptWithJjBinary(
         }
         if (!verify_result.succeeded()) {
             warn(io, "error: git verify failed after copy, rolling back\n", .{});
-            Dir.cwd().deleteTree(io, git_dest) catch {};
+            deleteTreeBestEffort(io, git_dest);
             try oplog.logOperation(io, log_path, .copy, git_src, git_dest, "error: verify failed, rolled back");
             return error.VerifyFailed;
         }
@@ -620,11 +666,15 @@ pub fn adoptWithJjBinary(
             gpa.free(restore.stderr);
         }
         if (!restore.succeeded()) {
-            warn(io, "CRITICAL: restore cp exited non-zero — .git at {s}, pointer missing: {s}\n", .{ git_dest, restore.stderr });
+            warn(
+                io,
+                "CRITICAL: restore cp exited non-zero — .git at {s}, pointer missing: {s}\n",
+                .{ git_dest, restore.stderr },
+            );
             return err;
         }
         // Remove the gitstore copy since we restored the original
-        Dir.cwd().deleteTree(io, git_dest) catch {};
+        deleteTreeBestEffort(io, git_dest);
         return err;
     };
     logOperationBestEffort(io, log_path, .write_pointer, git_src, git_dest, "ok");
@@ -638,7 +688,19 @@ pub fn adoptWithJjBinary(
         rewriteLinkedWorktreePointer(gpa, io, wt, git_dest) catch |err| {
             warn(io, "warn: could not rewrite worktree pointer at {s}: {s}\n", .{ wt, @errorName(err) });
             logOperationBestEffort(io, log_path, .write_pointer, wt, git_dest, "error: worktree rewrite failed");
-            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            rollbackAdoptAfterGitSwap(
+                gpa,
+                io,
+                git_src,
+                git_dest,
+                jj_src,
+                jj_dest,
+                repo_store_dir,
+                repo_store_preexisting,
+                worktrees,
+                false,
+                log_path,
+            );
             return err;
         };
         logOperationBestEffort(io, log_path, .write_pointer, wt, git_dest, "ok: worktree");
@@ -661,13 +723,37 @@ pub fn adoptWithJjBinary(
         if (!jj_cp.succeeded()) {
             warn(io, "error: cp .jj failed: {s}\n", .{jj_cp.stderr});
             logOperationBestEffort(io, log_path, .copy, jj_src, jj_dest, "error: cp failed");
-            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            rollbackAdoptAfterGitSwap(
+                gpa,
+                io,
+                git_src,
+                git_dest,
+                jj_src,
+                jj_dest,
+                repo_store_dir,
+                repo_store_preexisting,
+                worktrees,
+                false,
+                log_path,
+            );
             return error.ProcessFailed;
         }
         logOperationBestEffort(io, log_path, .copy, jj_src, jj_dest, "ok");
 
         rewriteJjGitTarget(gpa, io, jj_dest, git_dest) catch |err| {
-            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            rollbackAdoptAfterGitSwap(
+                gpa,
+                io,
+                git_src,
+                git_dest,
+                jj_src,
+                jj_dest,
+                repo_store_dir,
+                repo_store_preexisting,
+                worktrees,
+                false,
+                log_path,
+            );
             return err;
         };
 
@@ -677,20 +763,60 @@ pub fn adoptWithJjBinary(
         const jj_aside = try uniqueSidePath(gpa, io, jj_src, "gs-old");
         defer gpa.free(jj_aside);
         Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io) catch |err| {
-            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            rollbackAdoptAfterGitSwap(
+                gpa,
+                io,
+                git_src,
+                git_dest,
+                jj_src,
+                jj_dest,
+                repo_store_dir,
+                repo_store_preexisting,
+                worktrees,
+                false,
+                log_path,
+            );
             return err;
         };
         Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true }) catch |err| {
             warn(io, "error: .jj symlink failed ({s}); restoring original .jj\n", .{@errorName(err)});
-            Dir.rename(Dir.cwd(), jj_aside, Dir.cwd(), jj_src, io) catch {};
-            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            renameBestEffort(io, jj_aside, jj_src);
+            rollbackAdoptAfterGitSwap(
+                gpa,
+                io,
+                git_src,
+                git_dest,
+                jj_src,
+                jj_dest,
+                repo_store_dir,
+                repo_store_preexisting,
+                worktrees,
+                false,
+                log_path,
+            );
             return err;
         };
         Dir.cwd().deleteTree(io, jj_aside) catch |err| {
-            warn(io, "error: could not remove staged original .jj ({s}); restoring original layout\n", .{@errorName(err)});
-            Dir.cwd().deleteFile(io, jj_src) catch {};
-            Dir.rename(Dir.cwd(), jj_aside, Dir.cwd(), jj_src, io) catch {};
-            rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+            warn(
+                io,
+                "error: could not remove staged original .jj ({s}); restoring original layout\n",
+                .{@errorName(err)},
+            );
+            deleteFileBestEffort(io, jj_src);
+            renameBestEffort(io, jj_aside, jj_src);
+            rollbackAdoptAfterGitSwap(
+                gpa,
+                io,
+                git_src,
+                git_dest,
+                jj_src,
+                jj_dest,
+                repo_store_dir,
+                repo_store_preexisting,
+                worktrees,
+                false,
+                log_path,
+            );
             return err;
         };
         logOperationBestEffort(io, log_path, .remove, jj_src, "", "ok");
@@ -698,7 +824,12 @@ pub fn adoptWithJjBinary(
         info(io, "symlink: {s} -> {s}\n", .{ jj_src, jj_dest });
     } else {
         info(io, "init: jj colocated in {s}\n", .{repo_path});
-        const jj_init = ex.exec(gpa, io, &.{ jj_binary, "git", "init", "--colocate" }, repo_path) catch |err| switch (err) {
+        const jj_init = ex.exec(
+            gpa,
+            io,
+            &.{ jj_binary, "git", "init", "--colocate" },
+            repo_path,
+        ) catch |err| switch (err) {
             // Missing jj binary (absent from PATH) is the only spawn failure
             // treated as best-effort: git-level adoption is already complete,
             // so record it and finish instead of failing the whole adoption
@@ -729,38 +860,110 @@ pub fn adoptWithJjBinary(
                 }
                 if (!jj_cp2.succeeded()) {
                     warn(io, "error: cp auto-created .jj failed: {s}\n", .{jj_cp2.stderr});
-                    Dir.cwd().deleteTree(io, jj_dest) catch {};
+                    deleteTreeBestEffort(io, jj_dest);
                     logOperationBestEffort(io, log_path, .copy, jj_src, jj_dest, "error: cp .jj failed");
-                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, true, log_path);
+                    rollbackAdoptAfterGitSwap(
+                        gpa,
+                        io,
+                        git_src,
+                        git_dest,
+                        jj_src,
+                        jj_dest,
+                        repo_store_dir,
+                        repo_store_preexisting,
+                        worktrees,
+                        true,
+                        log_path,
+                    );
                     return error.ProcessFailed;
                 }
 
                 rewriteJjGitTarget(gpa, io, jj_dest, git_dest) catch |err| {
-                    warn(io, "error: could not rewrite optional jj git_target at {s}: {s}\n", .{ jj_dest, @errorName(err) });
-                    Dir.cwd().deleteTree(io, jj_dest) catch {};
-                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, true, log_path);
+                    warn(
+                        io,
+                        "error: could not rewrite optional jj git_target at {s}: {s}\n",
+                        .{ jj_dest, @errorName(err) },
+                    );
+                    deleteTreeBestEffort(io, jj_dest);
+                    rollbackAdoptAfterGitSwap(
+                        gpa,
+                        io,
+                        git_src,
+                        git_dest,
+                        jj_src,
+                        jj_dest,
+                        repo_store_dir,
+                        repo_store_preexisting,
+                        worktrees,
+                        true,
+                        log_path,
+                    );
                     return err;
                 };
 
                 const jj_aside = try uniqueSidePath(gpa, io, jj_src, "gs-old");
                 defer gpa.free(jj_aside);
                 Dir.rename(Dir.cwd(), jj_src, Dir.cwd(), jj_aside, io) catch |err| {
-                    Dir.cwd().deleteTree(io, jj_dest) catch {};
-                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, true, log_path);
+                    deleteTreeBestEffort(io, jj_dest);
+                    rollbackAdoptAfterGitSwap(
+                        gpa,
+                        io,
+                        git_src,
+                        git_dest,
+                        jj_src,
+                        jj_dest,
+                        repo_store_dir,
+                        repo_store_preexisting,
+                        worktrees,
+                        true,
+                        log_path,
+                    );
                     return err;
                 };
                 Dir.symLinkAbsolute(io, jj_dest, jj_src, .{ .is_directory = true }) catch |err| {
-                    warn(io, "error: auto-created .jj symlink failed ({s}); restoring original layout\n", .{@errorName(err)});
-                    deleteEntryBestEffort(io, jj_aside);
-                    Dir.cwd().deleteTree(io, jj_dest) catch {};
-                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, true, log_path);
+                    warn(
+                        io,
+                        "error: auto-created .jj symlink failed ({s}); restoring original layout\n",
+                        .{@errorName(err)},
+                    );
+                    deleteTreeBestEffort(io, jj_aside);
+                    deleteTreeBestEffort(io, jj_dest);
+                    rollbackAdoptAfterGitSwap(
+                        gpa,
+                        io,
+                        git_src,
+                        git_dest,
+                        jj_src,
+                        jj_dest,
+                        repo_store_dir,
+                        repo_store_preexisting,
+                        worktrees,
+                        true,
+                        log_path,
+                    );
                     return err;
                 };
                 Dir.cwd().deleteTree(io, jj_aside) catch |err| {
-                    warn(io, "error: could not remove auto-created .jj aside ({s}); restoring original layout\n", .{@errorName(err)});
-                    deleteEntryBestEffort(io, jj_src);
-                    deleteEntryBestEffort(io, jj_aside);
-                    rollbackAdoptAfterGitSwap(gpa, io, git_src, git_dest, jj_src, jj_dest, repo_store_dir, repo_store_preexisting, worktrees, false, log_path);
+                    warn(
+                        io,
+                        "error: could not remove auto-created .jj aside ({s}); restoring original layout\n",
+                        .{@errorName(err)},
+                    );
+                    deleteFileBestEffort(io, jj_src);
+                    deleteTreeBestEffort(io, jj_aside);
+                    rollbackAdoptAfterGitSwap(
+                        gpa,
+                        io,
+                        git_src,
+                        git_dest,
+                        jj_src,
+                        jj_dest,
+                        repo_store_dir,
+                        repo_store_preexisting,
+                        worktrees,
+                        false,
+                        log_path,
+                    );
                     return err;
                 };
                 logOperationBestEffort(io, log_path, .create_symlink, jj_src, jj_dest, "ok");
@@ -807,7 +1010,11 @@ pub fn adoptAll(
     }
 
     if (dry_run) {
-        info(io, "\ndry-run summary: {d} would adopt, {d} already adopted, {d} failed\n", .{ adopted, skipped, failed });
+        info(
+            io,
+            "\ndry-run summary: {d} would adopt, {d} already adopted, {d} failed\n",
+            .{ adopted, skipped, failed },
+        );
     } else {
         info(io, "\nsummary: {d} adopted, {d} skipped, {d} failed\n", .{ adopted, skipped, failed });
     }
@@ -825,7 +1032,12 @@ pub fn verify(
     const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
     defer gpa.free(git_path);
 
-    const content = Dir.cwd().readFileAlloc(io, git_path, gpa, .limited(max_git_pointer_file_bytes)) catch |err| switch (err) {
+    const content = Dir.cwd().readFileAlloc(
+        io,
+        git_path,
+        gpa,
+        .limited(max_git_pointer_file_bytes),
+    ) catch |err| switch (err) {
         error.IsDir => {
             warn(io, "FAIL: {s}/.git is a directory (not adopted)\n", .{repo_path});
             return false;
@@ -1047,7 +1259,7 @@ fn createExclusiveFilterTmp(gpa: Allocator, io: Io, contents: []const u8) ![]u8 
         // ownership cleanly without unlinking.
         defer file.close(io);
         errdefer {
-            Dir.cwd().deleteFile(io, path) catch {};
+            deleteFileBestEffort(io, path);
             gpa.free(path);
         }
 
@@ -1090,7 +1302,7 @@ fn infoRedactingRemote(io: Io, text: []const u8, remote: []const u8, safe_remote
         return;
     }
     var start: usize = 0;
-    while (std.mem.indexOf(u8, text[start..], remote)) |rel| {
+    while (std.mem.find(u8, text[start..], remote)) |rel| {
         const hit = start + rel;
         info(io, "{s}", .{text[start..hit]});
         info(io, "{s}", .{safe_remote});
@@ -1106,7 +1318,7 @@ fn warnRedactingRemote(io: Io, text: []const u8, remote: []const u8, safe_remote
         return;
     }
     var start: usize = 0;
-    while (std.mem.indexOf(u8, text[start..], remote)) |rel| {
+    while (std.mem.find(u8, text[start..], remote)) |rel| {
         const hit = start + rel;
         warn(io, "{s}", .{text[start..hit]});
         warn(io, "{s}", .{safe_remote});
@@ -1135,8 +1347,6 @@ pub fn sync(
     remote: []const u8,
     dry_run: bool,
 ) !void {
-    const hooks = @import("hooks.zig");
-
     // Ensure gitstore root exists
     try init(io, gitstore_root);
 
@@ -1155,7 +1365,7 @@ pub fn sync(
     defer gpa.free(filter_path);
     info(io, "filter: {s}\n", .{filter_path});
     defer if (dry_run) {
-        Dir.cwd().deleteFile(io, filter_path) catch {};
+        deleteFileBestEffort(io, filter_path);
     };
     const safe_remote = try redactRemoteUserinfo(gpa, remote);
     defer gpa.free(safe_remote);
@@ -1218,7 +1428,7 @@ pub fn detach(
 ) !void {
     _ = ghq_root;
 
-    if (!isAdopted(io, repo_path, gitstore_root, gpa)) {
+    if (!isAdoptedInternal(gpa, io, repo_path, gitstore_root)) {
         warn(io, "error: {s} is not adopted into {s}\n", .{ repo_path, gitstore_root });
         return error.NotAdopted;
     }
@@ -1232,7 +1442,12 @@ pub fn detach(
     // read, but if .git is swapped or truncated between the two reads we
     // would slice past the buffer. Refusing here turns malformed input into
     // error.GitDirMalformed instead of a panic.
-    const pointer_content = Dir.cwd().readFileAlloc(io, git_pointer_path, gpa, .limited(max_git_pointer_file_bytes)) catch |err| switch (err) {
+    const pointer_content = Dir.cwd().readFileAlloc(
+        io,
+        git_pointer_path,
+        gpa,
+        .limited(max_git_pointer_file_bytes),
+    ) catch |err| switch (err) {
         error.StreamTooLong => {
             warn(io, "error: gitdir pointer in {s}/.git is too large to be valid\n", .{repo_path});
             return error.GitDirMalformed;
@@ -1243,7 +1458,11 @@ pub fn detach(
     const trimmed = ex.trimTrailingNewline(pointer_content);
     const prefix = "gitdir: ";
     if (!std.mem.startsWith(u8, trimmed, prefix)) {
-        warn(io, "error: gitdir pointer in {s}/.git lost its 'gitdir: ' prefix between reads: {s}\n", .{ repo_path, trimmed });
+        warn(
+            io,
+            "error: gitdir pointer in {s}/.git lost its 'gitdir: ' prefix between reads: {s}\n",
+            .{ repo_path, trimmed },
+        );
         return error.GitDirMalformed;
     }
     const git_src = trimmed[prefix.len..]; // e.g. /gitstore/.../git
@@ -1260,7 +1479,11 @@ pub fn detach(
     // archive-rename would mangle).
     const git_suffix = "/git";
     if (git_src.len < git_suffix.len + 2 or !std.mem.endsWith(u8, git_src, git_suffix)) {
-        warn(io, "error: gitdir pointer in {s}/.git is not a gitstore git_src (missing /git suffix): {s}\n", .{ repo_path, git_src });
+        warn(
+            io,
+            "error: gitdir pointer in {s}/.git is not a gitstore git_src (missing /git suffix): {s}\n",
+            .{ repo_path, git_src },
+        );
         return error.GitDirMalformed;
     }
     // Slash immediately before the "git" segment.
@@ -1311,7 +1534,11 @@ pub fn detach(
         var comps = std.mem.splitScalar(u8, rel, '/');
         while (comps.next()) |seg| {
             if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) {
-                warn(io, "error: gitdir pointer in {s}/.git has invalid path components: {s}\n", .{ repo_path, git_src });
+                warn(
+                    io,
+                    "error: gitdir pointer in {s}/.git has invalid path components: {s}\n",
+                    .{ repo_path, git_src },
+                );
                 return error.GitDirMalformed;
             }
         }
@@ -1329,12 +1556,20 @@ pub fn detach(
         var canon_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         var canon_repo_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const canon_root_len = Dir.cwd().realPathFile(io, root_norm, &canon_root_buf) catch |err| {
-            warn(io, "error: could not canonicalize gitstore root {s}: {s}\n", .{ root_norm, @errorName(err) });
+            warn(
+                io,
+                "error: could not canonicalize gitstore root {s}: {s}\n",
+                .{ root_norm, @errorName(err) },
+            );
             return error.GitDirMalformed;
         };
         const canon_root = canon_root_buf[0..canon_root_len];
         const canon_repo_len = Dir.cwd().realPathFile(io, repo_store_dir, &canon_repo_buf) catch |err| {
-            warn(io, "error: could not canonicalize gitstore repo dir {s}: {s}\n", .{ repo_store_dir, @errorName(err) });
+            warn(
+                io,
+                "error: could not canonicalize gitstore repo dir {s}: {s}\n",
+                .{ repo_store_dir, @errorName(err) },
+            );
             return error.GitDirMalformed;
         };
         const canon_repo = canon_repo_buf[0..canon_repo_len];
@@ -1342,7 +1577,11 @@ pub fn detach(
             canon_repo.len <= canon_root.len or
             canon_repo[canon_root.len] != '/')
         {
-            warn(io, "error: canonicalized gitdir target {s} escapes canonicalized gitstore root {s}\n", .{ canon_repo, canon_root });
+            warn(
+                io,
+                "error: canonicalized gitdir target {s} escapes canonicalized gitstore root {s}\n",
+                .{ canon_repo, canon_root },
+            );
             return error.GitDirMalformed;
         }
     }
@@ -1371,7 +1610,13 @@ pub fn detach(
         info(io, "dry-run: would detach {s}\n", .{repo_path});
         info(io, "  restore {s} -> {s}/.git\n", .{ git_src, repo_path });
         if (has_jj_link) info(io, "  restore {s} -> {s}/.jj\n", .{ jj_src, repo_path });
-        for (worktrees) |wt| info(io, "  rewrite worktree pointer {s}/.git -> {s}/.git/worktrees/...\n", .{ wt, repo_path });
+        for (worktrees) |wt| {
+            info(
+                io,
+                "  rewrite worktree pointer {s}/.git -> {s}/.git/worktrees/...\n",
+                .{ wt, repo_path },
+            );
+        }
         if (keep_backup) {
             info(io, "  rename z3store entry {s} -> {s}.detached-<ts>\n", .{ repo_store_dir, repo_store_dir });
         } else {
@@ -1383,7 +1628,7 @@ pub fn detach(
     // --- Step 1: Stage-copy .git back ---
     const git_new = try std.fmt.allocPrint(gpa, "{s}/.git.gs-new", .{repo_path});
     defer gpa.free(git_new);
-    Dir.cwd().deleteTree(io, git_new) catch {};
+    deleteTreeBestEffort(io, git_new);
     info(io, "copy: {s} -> {s}\n", .{ git_src, git_new });
     const cp = try ex.exec(gpa, io, &.{ "cp", "-a", git_src, git_new }, null);
     defer {
@@ -1393,7 +1638,7 @@ pub fn detach(
     if (!cp.succeeded()) {
         warn(io, "error: cp failed: {s}\n", .{cp.stderr});
         try oplog.logOperation(io, log_path, .copy, git_src, git_new, "error: cp failed (detach)");
-        Dir.cwd().deleteTree(io, git_new) catch {};
+        deleteTreeBestEffort(io, git_new);
         return error.ProcessFailed;
     }
     try oplog.logOperation(io, log_path, .copy, git_src, git_new, "ok: detach stage");
@@ -1406,7 +1651,7 @@ pub fn detach(
     }
     if (!vr.succeeded()) {
         warn(io, "error: staged .git verify failed\n", .{});
-        Dir.cwd().deleteTree(io, git_new) catch {};
+        deleteTreeBestEffort(io, git_new);
         try oplog.logOperation(io, log_path, .copy, git_src, git_new, "error: verify failed");
         return error.VerifyFailed;
     }
@@ -1418,8 +1663,8 @@ pub fn detach(
     logOperationBestEffort(io, log_path, .remove, git_pointer_path, git_pointer_aside, "ok: detach pointer aside");
     Dir.rename(Dir.cwd(), git_new, Dir.cwd(), git_pointer_path, io) catch |err| {
         warn(io, "error: restoring .git pointer after staged rename failed ({s})\n", .{@errorName(err)});
-        Dir.rename(Dir.cwd(), git_pointer_aside, Dir.cwd(), git_pointer_path, io) catch {};
-        Dir.cwd().deleteTree(io, git_new) catch {};
+        renameBestEffort(io, git_pointer_aside, git_pointer_path);
+        deleteTreeBestEffort(io, git_new);
         return err;
     };
     try Dir.cwd().deleteFile(io, git_pointer_aside);
@@ -1432,7 +1677,7 @@ pub fn detach(
     if (has_jj_link) jj_restore: {
         const jj_new = try std.fmt.allocPrint(gpa, "{s}/.jj.gs-new", .{repo_path});
         defer gpa.free(jj_new);
-        Dir.cwd().deleteTree(io, jj_new) catch {};
+        deleteTreeBestEffort(io, jj_new);
         info(io, "copy: {s} -> {s}\n", .{ jj_src, jj_new });
         const jcp = try ex.exec(gpa, io, &.{ "cp", "-aL", jj_src, jj_new }, null);
         // Freed via defer — the failure branch below still reads jcp.stderr.
@@ -1446,32 +1691,36 @@ pub fn detach(
             defer gpa.free(jj_backup);
             Dir.rename(Dir.cwd(), jj_pointer_path, Dir.cwd(), jj_backup, io) catch |err| {
                 warn(io, "warn: could not rename .jj symlink ({s}); leaving symlink in place\n", .{@errorName(err)});
-                Dir.cwd().deleteTree(io, jj_new) catch {};
+                deleteTreeBestEffort(io, jj_new);
                 post_restore_err = err;
                 break :jj_restore;
             };
             // Now rename staged copy into place. On failure restore the symlink.
             Dir.rename(Dir.cwd(), jj_new, Dir.cwd(), jj_pointer_path, io) catch |err| {
                 warn(io, "error: rename staged .jj failed ({s}); restoring symlink\n", .{@errorName(err)});
-                Dir.rename(Dir.cwd(), jj_backup, Dir.cwd(), jj_pointer_path, io) catch {};
-                Dir.cwd().deleteTree(io, jj_new) catch {};
+                renameBestEffort(io, jj_backup, jj_pointer_path);
+                deleteTreeBestEffort(io, jj_new);
                 post_restore_err = err;
                 break :jj_restore;
             };
             rewriteJjGitTargetRelative(gpa, io, jj_pointer_path) catch |err| {
-                warn(io, "error: rewrite restored .jj git_target failed ({s}); restoring symlink\n", .{@errorName(err)});
-                Dir.cwd().deleteTree(io, jj_pointer_path) catch {};
-                Dir.rename(Dir.cwd(), jj_backup, Dir.cwd(), jj_pointer_path, io) catch {};
+                warn(
+                    io,
+                    "error: rewrite restored .jj git_target failed ({s}); restoring symlink\n",
+                    .{@errorName(err)},
+                );
+                deleteTreeBestEffort(io, jj_pointer_path);
+                renameBestEffort(io, jj_backup, jj_pointer_path);
                 post_restore_err = err;
                 break :jj_restore;
             };
             // Success — delete the old symlink backup.
-            Dir.cwd().deleteFile(io, jj_backup) catch {};
+            deleteFileBestEffort(io, jj_backup);
             logOperationBestEffort(io, log_path, .create_symlink, jj_src, jj_pointer_path, "ok: detach restore .jj");
             info(io, "restored: {s}/.jj\n", .{repo_path});
         } else {
             warn(io, "error: cp .jj failed: {s}\n", .{jcp.stderr});
-            Dir.cwd().deleteTree(io, jj_new) catch {};
+            deleteTreeBestEffort(io, jj_new);
             logOperationBestEffort(io, log_path, .copy, jj_src, jj_new, "error: cp .jj failed (detach)");
             post_restore_err = error.ProcessFailed;
             break :jj_restore;
@@ -1484,7 +1733,14 @@ pub fn detach(
     for (worktrees) |wt| {
         rewriteLinkedWorktreePointer(gpa, io, wt, restored_git) catch |err| {
             warn(io, "warn: could not rewrite worktree pointer {s}: {s}\n", .{ wt, @errorName(err) });
-            logOperationBestEffort(io, log_path, .write_pointer, wt, restored_git, "error: detach worktree rewrite failed");
+            logOperationBestEffort(
+                io,
+                log_path,
+                .write_pointer,
+                wt,
+                restored_git,
+                "error: detach worktree rewrite failed",
+            );
             if (post_restore_err == null) post_restore_err = err;
             continue;
         };
@@ -1512,7 +1768,14 @@ pub fn detach(
         defer gpa.free(archived);
         Dir.rename(Dir.cwd(), repo_store_dir, Dir.cwd(), archived, io) catch |err| {
             warn(io, "error: could not archive z3store entry ({s}); left in place\n", .{@errorName(err)});
-            logOperationBestEffort(io, log_path, .remove, repo_store_dir, archived, "error: archive failed (left in place)");
+            logOperationBestEffort(
+                io,
+                log_path,
+                .remove,
+                repo_store_dir,
+                archived,
+                "error: archive failed (left in place)",
+            );
             return err;
         };
         logOperationBestEffort(io, log_path, .remove, repo_store_dir, archived, "ok: detach archived");
@@ -1562,7 +1825,11 @@ pub fn detachAll(
     }
 
     if (dry_run) {
-        info(io, "\ndry-run detach summary: {d} would detach, {d} not adopted, {d} failed\n", .{ detached, skipped, failed });
+        info(
+            io,
+            "\ndry-run detach summary: {d} would detach, {d} not adopted, {d} failed\n",
+            .{ detached, skipped, failed },
+        );
     } else {
         info(io, "\ndetach summary: {d} detached, {d} not adopted, {d} failed\n", .{ detached, skipped, failed });
     }
