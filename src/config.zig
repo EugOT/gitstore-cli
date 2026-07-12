@@ -137,7 +137,7 @@ fn ghUser(gpa: Allocator, io: Io) LoadError!?[]u8 {
 }
 
 /// Duplicate `s` into `gpa`, register it in `list`, and return it.
-fn ownStatic(list: *std.ArrayList([]const u8), gpa: Allocator, s: []const u8) LoadError![]const u8 {
+fn ownStatic(gpa: Allocator, list: *std.ArrayList([]const u8), s: []const u8) LoadError![]const u8 {
     const dup = try gpa.dupe(u8, s);
     try list.append(gpa, dup);
     return dup;
@@ -145,7 +145,13 @@ fn ownStatic(list: *std.ArrayList([]const u8), gpa: Allocator, s: []const u8) Lo
 
 /// Load configuration by reading `git config` values, environment variables,
 /// and baked-in defaults in precedence order.
-pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Config {
+// ziglint-ignore: Z015 - LoadError is a public composed error set; ziglint
+// 0.5.2 false-positives on same-file public error-set references.
+pub fn load(
+    gpa: Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+) LoadError!Config {
     var owned_strings: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (owned_strings.items) |s| gpa.free(s);
@@ -187,7 +193,7 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
     const root: []const u8 = if (root_res.is_default)
         default_root
     else
-        try ownStatic(&owned_strings, gpa, root_res.value);
+        try ownStatic(gpa, &owned_strings, root_res.value);
     if (root_res.legacy) used_legacy = true;
 
     // --- user ---
@@ -198,20 +204,20 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
 
     var user: ?[]const u8 = null;
     if (nonEmpty(z3_user_raw)) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
+        user = try ownStatic(gpa, &owned_strings, v);
     } else if (nonEmpty(gitstore_user_raw)) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
+        user = try ownStatic(gpa, &owned_strings, v);
         used_legacy = true;
     } else if (nonEmpty(ghq_user_raw)) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
+        user = try ownStatic(gpa, &owned_strings, v);
         used_legacy = true;
     } else if (nonEmpty(env_user)) |v| {
-        user = try ownStatic(&owned_strings, gpa, v);
+        user = try ownStatic(gpa, &owned_strings, v);
     } else {
         const gh_user_raw = try ghUser(gpa, io);
         defer if (gh_user_raw) |v| gpa.free(v);
         if (nonEmpty(gh_user_raw)) |v| {
-            user = try ownStatic(&owned_strings, gpa, v);
+            user = try ownStatic(gpa, &owned_strings, v);
         }
     }
 
@@ -293,16 +299,16 @@ fn resolveCfgTriple(
     const gitstore_raw = snapshotValue(config_snapshot, gitstore_key);
     const ghq_raw = snapshotValue(config_snapshot, ghq_key);
 
-    if (nonEmpty(z3_raw)) |v| return ownStatic(owned_strings, gpa, v);
+    if (nonEmpty(z3_raw)) |v| return ownStatic(gpa, owned_strings, v);
     if (nonEmpty(gitstore_raw)) |v| {
         used_legacy.* = true;
-        return ownStatic(owned_strings, gpa, v);
+        return ownStatic(gpa, owned_strings, v);
     }
     if (nonEmpty(ghq_raw)) |v| {
         used_legacy.* = true;
-        return ownStatic(owned_strings, gpa, v);
+        return ownStatic(gpa, owned_strings, v);
     }
-    return ownStatic(owned_strings, gpa, default_val);
+    return ownStatic(gpa, owned_strings, default_val);
 }
 
 /// Like `resolveCfgTriple` but with no `ghq.*` fallback tier.
@@ -318,12 +324,12 @@ fn resolveCfgPair(
     const z3_raw = snapshotValue(config_snapshot, z3_key);
     const gitstore_raw = snapshotValue(config_snapshot, gitstore_key);
 
-    if (nonEmpty(z3_raw)) |v| return ownStatic(owned_strings, gpa, v);
+    if (nonEmpty(z3_raw)) |v| return ownStatic(gpa, owned_strings, v);
     if (nonEmpty(gitstore_raw)) |v| {
         used_legacy.* = true;
-        return ownStatic(owned_strings, gpa, v);
+        return ownStatic(gpa, owned_strings, v);
     }
-    return ownStatic(owned_strings, gpa, default_val);
+    return ownStatic(gpa, owned_strings, default_val);
 }
 
 /// Treat null and empty-string as "unset"; return the value otherwise.
@@ -383,6 +389,8 @@ pub fn resolveRootChain(
 /// `git config --get-urlmatch`. Tries `gitstore.root <url>` first, then
 /// `ghq.root <url>`, then falls back to `base.root`. The returned slice is
 /// always a fresh heap allocation owned by the caller.
+// ziglint-ignore: Z015 - LoadError is a public composed error set; ziglint
+// 0.5.2 false-positives on same-file public error-set references.
 pub fn resolveRootForUrl(
     gpa: Allocator,
     io: Io,
@@ -394,6 +402,8 @@ pub fn resolveRootForUrl(
 
 /// Testable variant of `resolveRootForUrl` that reads a specific git config
 /// file instead of the ambient global config.
+// ziglint-ignore: Z015 - LoadError is a public composed error set; ziglint
+// 0.5.2 false-positives on same-file public error-set references.
 pub fn resolveRootForUrlWithConfigFile(
     gpa: Allocator,
     io: Io,
@@ -403,7 +413,10 @@ pub fn resolveRootForUrlWithConfigFile(
 ) LoadError![]u8 {
     // git config --get-urlmatch <key> <url> — z3store.root (primary) first.
     {
-        const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "z3store.root", url } else undefined;
+        const file_argv = if (config_file) |path|
+            [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "z3store.root", url }
+        else
+            undefined;
         const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "z3store.root", url };
         const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
         var result = try exec.exec(
@@ -428,7 +441,10 @@ pub fn resolveRootForUrlWithConfigFile(
 
     // Legacy gitstore.root urlmatch.
     {
-        const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "gitstore.root", url } else undefined;
+        const file_argv = if (config_file) |path|
+            [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "gitstore.root", url }
+        else
+            undefined;
         const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "gitstore.root", url };
         const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
         var result = try exec.exec(
@@ -452,7 +468,10 @@ pub fn resolveRootForUrlWithConfigFile(
     }
 
     {
-        const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "ghq.root", url } else undefined;
+        const file_argv = if (config_file) |path|
+            [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "ghq.root", url }
+        else
+            undefined;
         const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "ghq.root", url };
         const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
         var result = try exec.exec(

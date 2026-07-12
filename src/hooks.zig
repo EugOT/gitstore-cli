@@ -278,7 +278,11 @@ test "hook: nu falls back to ghq" {
 }
 
 test "hook: nu raises an error when both tools are missing" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "error make {msg: \"ghq(): neither zt nor ghq found on PATH\"}") != null);
+    try testing.expect(mem.indexOf(
+        u8,
+        nu_hook,
+        "error make {msg: \"ghq(): neither zt nor ghq found on PATH\"}",
+    ) != null);
     try testing.expect(mem.indexOf(u8, nu_hook, "exit 127") == null);
 }
 
