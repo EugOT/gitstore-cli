@@ -8,8 +8,6 @@ const Allocator = std.mem.Allocator;
 
 const gitstore = @import("z3store.zig");
 const ex = @import("exec.zig");
-const oplog = @import("log.zig");
-const hooks = @import("hooks.zig");
 
 // Pull in tests from all modules
 comptime {
@@ -100,6 +98,19 @@ fn dirHasAnyEntry(io: Io, path: []const u8) !bool {
     return (try iter.next(io)) != null;
 }
 
+fn bestEffortDeleteTree(io: Io, path: []const u8) void {
+    Dir.cwd().deleteTree(io, path) catch |err| {
+        std.debug.print("test cleanup failed for {s}: {s}\n", .{ path, @errorName(err) });
+    };
+}
+
+fn bestEffortDeleteFile(io: Io, path: []const u8) void {
+    Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => std.debug.print("test cleanup failed for {s}: {s}\n", .{ path, @errorName(err) }),
+    };
+}
+
 const TestEnv = struct {
     base: []const u8,
     ghq_root: []const u8,
@@ -128,7 +139,7 @@ const TestEnv = struct {
     }
 
     fn teardown(self: *const TestEnv) void {
-        Dir.cwd().deleteTree(self.io, self.base) catch {};
+        bestEffortDeleteTree(self.io, self.base);
         self.gpa.free(self.base);
         self.gpa.free(self.ghq_root);
         self.gpa.free(self.gitstore_root);
@@ -180,7 +191,12 @@ const TestEnv = struct {
         defer self.gpa.free(r1d.stderr);
         if (!r1d.succeeded()) return error.ProcessFailed;
 
-        const r2 = try ex.exec(self.gpa, self.io, &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" }, repo_path);
+        const r2 = try ex.exec(
+            self.gpa,
+            self.io,
+            &.{ "git", "commit", "--no-verify", "--allow-empty", "-m", "init" },
+            repo_path,
+        );
         defer self.gpa.free(r2.stdout);
         defer self.gpa.free(r2.stderr);
         if (!r2.succeeded()) return error.ProcessFailed;
@@ -281,8 +297,8 @@ test "isAdopted returns true when pointer targets gitstore_root" {
     const io = testing.io;
     const gpa = testing.allocator;
     const dir = "/tmp/gitstore_test_adopted";
-    Dir.cwd().createDirPath(io, dir) catch {};
-    defer Dir.cwd().deleteTree(io, dir) catch {};
+    try Dir.cwd().createDirPath(io, dir);
+    defer bestEffortDeleteTree(io, dir);
 
     try Dir.cwd().writeFile(io, .{
         .sub_path = "/tmp/gitstore_test_adopted/.git",
@@ -296,8 +312,8 @@ test "isAdopted returns false when pointer targets non-gitstore path (linked wor
     const io = testing.io;
     const gpa = testing.allocator;
     const dir = "/tmp/gitstore_test_linked_wt";
-    Dir.cwd().createDirPath(io, dir) catch {};
-    defer Dir.cwd().deleteTree(io, dir) catch {};
+    try Dir.cwd().createDirPath(io, dir);
+    defer bestEffortDeleteTree(io, dir);
 
     // A normal linked worktree points into the main repo's .git/worktrees/
     try Dir.cwd().writeFile(io, .{
@@ -312,10 +328,10 @@ test "isAdopted returns false for .git directory" {
     const io = testing.io;
     const gpa = testing.allocator;
     const dir = "/tmp/gitstore_test_not_adopted";
-    Dir.cwd().deleteTree(io, dir) catch {};
+    bestEffortDeleteTree(io, dir);
     try Dir.cwd().createDirPath(io, dir);
     try Dir.cwd().createDirPath(io, "/tmp/gitstore_test_not_adopted/.git");
-    defer Dir.cwd().deleteTree(io, dir) catch {};
+    defer bestEffortDeleteTree(io, dir);
 
     try testing.expect(!gitstore.isAdopted(io, dir, "/tmp/mygitstore", gpa));
 }
@@ -324,8 +340,8 @@ test "isAdopted returns false for non-gitdir file content" {
     const io = testing.io;
     const gpa = testing.allocator;
     const dir = "/tmp/gitstore_test_bad_pointer";
-    Dir.cwd().createDirPath(io, dir) catch {};
-    defer Dir.cwd().deleteTree(io, dir) catch {};
+    try Dir.cwd().createDirPath(io, dir);
+    defer bestEffortDeleteTree(io, dir);
 
     try Dir.cwd().writeFile(io, .{
         .sub_path = "/tmp/gitstore_test_bad_pointer/.git",
@@ -358,7 +374,7 @@ test "rewriteJjGitTarget writes absolute path" {
     const gpa = testing.allocator;
     const jj_dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_jj_target");
     defer {
-        Dir.cwd().deleteTree(io, jj_dir) catch {};
+        bestEffortDeleteTree(io, jj_dir);
         gpa.free(jj_dir);
     }
     const store_dir = try std.fmt.allocPrint(gpa, "{s}/repo/store", .{jj_dir});
@@ -390,7 +406,7 @@ test "rewriteJjGitTarget propagates write failure when file missing" {
     const gpa = testing.allocator;
     const jj_dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_jj_missing_target");
     defer {
-        Dir.cwd().deleteTree(io, jj_dir) catch {};
+        bestEffortDeleteTree(io, jj_dir);
         gpa.free(jj_dir);
     }
     try testing.expectError(error.FileNotFound, gitstore.rewriteJjGitTarget(gpa, io, jj_dir, "/some/git"));
@@ -403,8 +419,8 @@ test "rewriteJjGitTarget propagates write failure when file missing" {
 test "init creates gitstore directory" {
     const io = testing.io;
     const dir = "/tmp/gitstore_test_init_dir";
-    Dir.cwd().deleteTree(io, dir) catch {};
-    defer Dir.cwd().deleteTree(io, dir) catch {};
+    bestEffortDeleteTree(io, dir);
+    defer bestEffortDeleteTree(io, dir);
 
     try gitstore.init(io, dir);
 
@@ -416,8 +432,8 @@ test "init creates gitstore directory" {
 test "init is idempotent" {
     const io = testing.io;
     const dir = "/tmp/gitstore_test_init_idem";
-    Dir.cwd().deleteTree(io, dir) catch {};
-    defer Dir.cwd().deleteTree(io, dir) catch {};
+    bestEffortDeleteTree(io, dir);
+    defer bestEffortDeleteTree(io, dir);
 
     try gitstore.init(io, dir);
     try gitstore.init(io, dir); // second call should not error
@@ -491,7 +507,7 @@ test "e2e adopt rolls back partial gitstore copy when cp fails" {
     defer gpa.free(git_src);
     const probe_dest = try std.fmt.allocPrint(gpa, "{s}/partial-copy-probe", .{env.base});
     defer gpa.free(probe_dest);
-    defer Dir.cwd().deleteTree(io, probe_dest) catch {};
+    defer bestEffortDeleteTree(io, probe_dest);
     const cp_probe = try ex.exec(gpa, io, &.{ "cp", "-a", git_src, probe_dest }, null);
     defer {
         gpa.free(cp_probe.stdout);
@@ -561,7 +577,15 @@ test "e2e adopt git-only repo completes when jj binary is missing" {
     // Regression EugOT/gitstore-cli#22: a missing jj binary (spawn
     // error.FileNotFound) must be as non-fatal as jj exiting non-zero —
     // git-level adoption is already complete when the jj step runs.
-    try gitstore.adoptWithJjBinary(gpa, io, repo, env.ghq_root, env.gitstore_root, false, "/nonexistent/gitstore-test-missing-jj");
+    try gitstore.adoptWithJjBinary(
+        gpa,
+        io,
+        repo,
+        env.ghq_root,
+        env.gitstore_root,
+        false,
+        "/nonexistent/gitstore-test-missing-jj",
+    );
 
     // Git-level adoption completed: .git is a pointer file.
     const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
@@ -1027,8 +1051,8 @@ test "e2e adopt repo with linked worktree rewrites pointer" {
     // Create a linked worktree on a new branch
     const wt_dir = try std.fmt.allocPrint(gpa, "{s}/wt-feature", .{env.base});
     defer gpa.free(wt_dir);
-    Dir.cwd().deleteTree(io, wt_dir) catch {};
-    defer Dir.cwd().deleteTree(io, wt_dir) catch {};
+    bestEffortDeleteTree(io, wt_dir);
+    defer bestEffortDeleteTree(io, wt_dir);
     const wt_add = try ex.exec(gpa, io, &.{ "git", "worktree", "add", "-b", "feature", wt_dir }, repo);
     gpa.free(wt_add.stdout);
     gpa.free(wt_add.stderr);
@@ -1194,7 +1218,10 @@ test "e2e detach aborts before store removal when .jj restore copy fails" {
 
     try Dir.cwd().deleteTree(io, jj_dest);
 
-    try testing.expectError(error.ProcessFailed, gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false));
+    try testing.expectError(
+        error.ProcessFailed,
+        gitstore.detach(gpa, io, repo, env.ghq_root, env.gitstore_root, false, false),
+    );
     _ = try Dir.cwd().statFile(io, repo_store_dir, .{});
 
     const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
@@ -1262,8 +1289,8 @@ test "e2e detach round-trip preserves linked worktree" {
 
     const wt_dir = try std.fmt.allocPrint(gpa, "{s}/wt-detach", .{env.base});
     defer gpa.free(wt_dir);
-    Dir.cwd().deleteTree(io, wt_dir) catch {};
-    defer Dir.cwd().deleteTree(io, wt_dir) catch {};
+    bestEffortDeleteTree(io, wt_dir);
+    defer bestEffortDeleteTree(io, wt_dir);
     const wt_add = try ex.exec(gpa, io, &.{ "git", "worktree", "add", "-b", "feature", wt_dir }, repo);
     gpa.free(wt_add.stdout);
     gpa.free(wt_add.stderr);
@@ -1559,7 +1586,10 @@ test "G6-9 detachAll returns BatchFailures when any repo fails" {
     defer gpa.free(store_git);
     try Dir.cwd().deleteTree(io, store_git);
 
-    try testing.expectError(error.BatchFailures, gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false));
+    try testing.expectError(
+        error.BatchFailures,
+        gitstore.detachAll(gpa, io, env.ghq_root, env.gitstore_root, false, false),
+    );
     try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
 }
 
@@ -1737,7 +1767,7 @@ test "config: load reads gitstore.root from real global git config" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    defer bestEffortDeleteFile(io, config_path);
 
     try gitSetFile(gpa, io, config_path, "gitstore.root", "/gitstore_unit_test_sentinel_root");
 
@@ -1761,7 +1791,7 @@ test "config: load falls back to ghq.root and flags legacy" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    defer bestEffortDeleteFile(io, config_path);
 
     try gitSetFile(gpa, io, config_path, "ghq.root", "/ghq_legacy_test_sentinel_root");
 
@@ -1783,7 +1813,7 @@ test "config: load uses env GITSTORE_ROOT when no git config set" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    defer bestEffortDeleteFile(io, config_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
 
     var env_map: std.process.Environ.Map = .init(gpa);
@@ -1806,7 +1836,7 @@ test "config: load uses env Z3STORE_ROOT and does not flag legacy" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    defer bestEffortDeleteFile(io, config_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
 
     var env_map: std.process.Environ.Map = .init(gpa);
@@ -1830,7 +1860,7 @@ test "config: load uses env USER before gh api fallback" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    defer bestEffortDeleteFile(io, config_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
 
     var env_map: std.process.Environ.Map = .init(gpa);
@@ -1852,7 +1882,7 @@ test "config: load prefers z3store.root over gitstore.root git config" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    defer bestEffortDeleteFile(io, config_path);
 
     try gitSetFile(gpa, io, config_path, "z3store.root", "/z3store_primary_root");
     try gitSetFile(gpa, io, config_path, "gitstore.root", "/gitstore_legacy_root");
@@ -1880,7 +1910,7 @@ test "config: resolveRootForUrl falls back to base.root when no pattern matches"
     const sentinel_url = "https://gitstore-test.invalid/unused/sentinel";
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    defer bestEffortDeleteFile(io, config_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
 
     var owned: std.ArrayList([]const u8) = .empty;
@@ -1910,7 +1940,7 @@ test "config: resolveRootForUrl prefers matching gitstore.<url>.root urlmatch" {
 
     const config_path = try tempGitConfigPath(gpa, io);
     defer gpa.free(config_path);
-    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    defer bestEffortDeleteFile(io, config_path);
 
     try gitSetFile(gpa, io, config_path, pattern_key, "/per-org/acme");
 
@@ -2310,6 +2340,7 @@ const ZtOut = struct {
     fn deinit(self: *ZtOut, gpa: Allocator) void {
         gpa.free(self.stdout);
         gpa.free(self.stderr);
+        self.* = undefined;
     }
 };
 
@@ -2352,12 +2383,12 @@ fn runZtControlled(
     // parallel test execution cannot collide.
     const home = try uniqueTempDir(gpa, io, harness.home_prefix);
     defer {
-        Dir.cwd().deleteTree(io, home) catch {};
+        bestEffortDeleteTree(io, home);
         gpa.free(home);
     }
     const git_config = try uniqueTempFile(gpa, io, harness.git_config_prefix, ".gitconfig");
     defer {
-        Dir.cwd().deleteFile(io, git_config) catch {};
+        bestEffortDeleteFile(io, git_config);
         gpa.free(git_config);
     }
 
@@ -2622,8 +2653,6 @@ test "e2e migrate real-mode is unimplemented, non-zero exit with stderr" {
 // EpicGames Lore workspace recognition (e2e)
 // =========================================================
 
-const lore = @import("lore.zig");
-
 /// Spawn the built `zt` with an absolute-path argument and a throwaway HOME.
 /// Unlike `runE2eCase`, this returns the captured output so a test can assert
 /// on both streams AND inspect on-disk state afterwards (the no-mutation
@@ -2639,6 +2668,7 @@ const LoreFileSnapshot = struct {
     fn deinit(self: *LoreFileSnapshot, gpa: Allocator) void {
         gpa.free(self.name);
         gpa.free(self.bytes);
+        self.* = undefined;
     }
 };
 
@@ -2648,6 +2678,7 @@ const LoreSnapshot = struct {
     fn deinit(self: *LoreSnapshot, gpa: Allocator) void {
         for (self.files) |*file| file.deinit(gpa);
         gpa.free(self.files);
+        self.* = undefined;
     }
 };
 
@@ -2697,7 +2728,7 @@ fn expectLoreSnapshotEqual(expected: LoreSnapshot, actual: LoreSnapshot) !void {
 fn makeLoreFixture(gpa: Allocator, io: Io, config_body: ?[]const u8) ![]u8 {
     const ws = try uniqueTempDir(gpa, io, "/tmp/gitstore_lore_ws");
     errdefer {
-        Dir.cwd().deleteTree(io, ws) catch {};
+        bestEffortDeleteTree(io, ws);
         gpa.free(ws);
     }
     const lore_dir = try std.fmt.allocPrint(gpa, "{s}/.lore", .{ws});
@@ -2719,7 +2750,7 @@ test "e2e adopt refuses a lore-only workspace and mutates nothing" {
     const io = testing.io;
     const ws = try makeLoreFixture(gpa, io, null);
     defer {
-        Dir.cwd().deleteTree(io, ws) catch {};
+        bestEffortDeleteTree(io, ws);
         gpa.free(ws);
     }
 
@@ -2752,7 +2783,7 @@ test "e2e lore subcommand reports missing shared-store config as unhealthy" {
         \\
     );
     defer {
-        Dir.cwd().deleteTree(io, ws) catch {};
+        bestEffortDeleteTree(io, ws);
         gpa.free(ws);
     }
 
@@ -2770,7 +2801,7 @@ test "e2e lore subcommand rejects a non-lore path" {
     const io = testing.io;
     const dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_lore_notlore");
     defer {
-        Dir.cwd().deleteTree(io, dir) catch {};
+        bestEffortDeleteTree(io, dir);
         gpa.free(dir);
     }
 
@@ -2790,7 +2821,7 @@ test "e2e verify on a lore-only workspace reports metadata, exit 0" {
         \\
     );
     defer {
-        Dir.cwd().deleteTree(io, ws) catch {};
+        bestEffortDeleteTree(io, ws);
         gpa.free(ws);
     }
 
@@ -2811,7 +2842,7 @@ test "e2e verify fails when lore shared store is enabled without a path" {
         \\
     );
     defer {
-        Dir.cwd().deleteTree(io, ws) catch {};
+        bestEffortDeleteTree(io, ws);
         gpa.free(ws);
     }
 
