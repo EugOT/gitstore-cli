@@ -1207,6 +1207,11 @@ pub fn status(
         try s.beginObject();
         try s.objectField("disk_usage");
         try s.write(disk_usage);
+        try s.objectField("working_tree_root");
+        try s.write(ghq_root);
+        try s.objectField("backing_store_root");
+        try s.write(gitstore_root);
+        // Compatibility alias retained for existing status consumers.
         try s.objectField("z3store_root");
         try s.write(gitstore_root);
         try s.objectField("total_repos");
@@ -1219,7 +1224,8 @@ pub fn status(
         try aw.writer.writeByte('\n');
         info(io, "{s}", .{aw.written()});
     } else {
-        info(io, "z3store: {s}\n", .{gitstore_root});
+        info(io, "working trees: {s}\n", .{ghq_root});
+        info(io, "backing store: {s}\n", .{gitstore_root});
         info(io, "disk usage: {s}\n", .{disk_usage});
         info(io, "total repos: {d}\n", .{total_repos});
         info(io, "adopted: {d}\n", .{adopted_count});

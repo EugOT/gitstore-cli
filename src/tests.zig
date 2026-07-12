@@ -20,9 +20,8 @@ comptime {
     _ = @import("cache.zig");
     _ = @import("clone.zig");
     _ = @import("lore.zig");
-    // main.zig hosts inline unit tests for its private dispatcher helpers
-    // (getGitstoreRoot / getGhqRoot / resolveGhqRootOrHome) and e2e tests
-    // that spawn the built gitstore binary. Force-importing it here makes the
+    // main.zig hosts inline dispatcher and e2e tests that spawn the built
+    // z3store binary. Force-importing it here makes the
     // integration test runner collect those `test` blocks. main.zig is
     // path-relative and transitively imports the co-located src/ modules, so
     // no extra build.zig wiring is needed beyond the `build_options` seam.
@@ -1854,6 +1853,121 @@ test "config: load uses env Z3STORE_ROOT and does not flag legacy" {
     try testing.expect(!cfg.used_legacy);
 }
 
+test "config: load keeps working and backing roots independent" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
+    try env_map.put("Z3STORE_ROOT", "/configured/worktrees");
+    try env_map.put("Z3STORE_BACKING_STORE_ROOT", "/configured/backing");
+    try env_map.put("USER", "test-user");
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings("/configured/worktrees", cfg.root);
+    try testing.expectEqualStrings("/configured/backing", cfg.backing_store_root);
+    try testing.expect(!cfg.used_legacy);
+}
+
+test "config: backing-store fallback requires HOME" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
+    try env_map.put("Z3STORE_ROOT", "/configured/worktrees");
+    try env_map.put("USER", "test-user");
+
+    try testing.expectError(error.InvalidUserId, config.load(gpa, io, &env_map));
+}
+
+test "config: explicit backing-store root must be absolute" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer bestEffortDeleteFile(io, config_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
+    try env_map.put("Z3STORE_ROOT", "/configured/worktrees");
+    try env_map.put("Z3STORE_BACKING_STORE_ROOT", "relative/backing");
+    try env_map.put("USER", "test-user");
+
+    try testing.expectError(error.BackingStoreRootNotAbsolute, config.load(gpa, io, &env_map));
+}
+
+test "config: legacy backing-store discovery is not legacy configuration" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const home = try uniqueTempDir(gpa, io, "/tmp/z3store_legacy_home");
+    defer {
+        bestEffortDeleteTree(io, home);
+        gpa.free(home);
+    }
+    const legacy_store = try std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
+    defer gpa.free(legacy_store);
+    try Dir.cwd().createDirPath(io, legacy_store);
+
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer bestEffortDeleteFile(io, config_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
+    try env_map.put("USER", "test-user");
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings(legacy_store, cfg.backing_store_root);
+    try testing.expect(!cfg.used_legacy);
+    try testing.expect(cfg.legacy_backing_store_discovered);
+}
+
+test "config: load accepts legacy backing-store environment" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const config_path = try tempGitConfigPath(gpa, io);
+    defer gpa.free(config_path);
+    defer Dir.cwd().deleteFile(io, config_path) catch {};
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "" });
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/nonexistent_test_home");
+    try env_map.put("GIT_CONFIG_GLOBAL", config_path);
+    try env_map.put("GITSTORE_BACKING_STORE_ROOT", "/legacy/backing");
+
+    var cfg = try config.load(gpa, io, &env_map);
+    defer cfg.deinit(gpa);
+
+    try testing.expectEqualStrings("/legacy/backing", cfg.backing_store_root);
+    try testing.expect(cfg.used_legacy);
+}
+
 test "config: load uses env USER before gh api fallback" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1917,12 +2031,14 @@ test "config: resolveRootForUrl falls back to base.root when no pattern matches"
     defer owned.deinit(gpa);
     const base: config.Config = .{
         .root = "/fallback/root",
+        .backing_store_root = "/fallback/store",
         .user = null,
         .default_host = "github.com",
         .complete_user = true,
         .adopt_on_clone = true,
         .jj_colocate = true,
         .used_legacy = false,
+        .legacy_backing_store_discovered = false,
         .owned_strings = owned,
     };
 
@@ -1948,12 +2064,14 @@ test "config: resolveRootForUrl prefers matching gitstore.<url>.root urlmatch" {
     defer owned.deinit(gpa);
     const base: config.Config = .{
         .root = "/fallback/root",
+        .backing_store_root = "/fallback/store",
         .user = null,
         .default_host = "github.com",
         .complete_user = true,
         .adopt_on_clone = true,
         .jj_colocate = true,
         .used_legacy = false,
+        .legacy_backing_store_discovered = false,
         .owned_strings = owned,
     };
 
@@ -2423,6 +2541,144 @@ fn spawnZtControlled(
         .home_prefix = home_prefix,
         .git_config_prefix = git_config_prefix,
     });
+}
+
+/// Spawn zt with an explicitly controlled two-root contract and a PATH that
+/// excludes user-installed ghq. Null roots leave the corresponding variables
+/// unset, which is used to prove that single-path verify is root-independent.
+fn spawnZtWithRoots(
+    gpa: Allocator,
+    io: Io,
+    argv_tail: []const []const u8,
+    working_tree_root: ?[]const u8,
+    backing_store_root: ?[]const u8,
+    with_home: bool,
+) !ZtOut {
+    const home = try uniqueTempDir(gpa, io, "/tmp/z3store_two_root_home");
+    defer {
+        Dir.cwd().deleteTree(io, home) catch {};
+        gpa.free(home);
+    }
+    const git_config = try uniqueTempFile(gpa, io, "/tmp/z3store_two_root", ".gitconfig");
+    defer {
+        Dir.cwd().deleteFile(io, git_config) catch {};
+        gpa.free(git_config);
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, build_options.zt_bin);
+    for (argv_tail) |arg| try argv.append(gpa, arg);
+
+    var env_map = try controlledEnv(gpa, home, git_config);
+    defer env_map.deinit();
+    try env_map.put("PATH", "/usr/bin:/bin");
+    if (!with_home) _ = env_map.swapRemove("HOME");
+    if (working_tree_root) |root| try env_map.put("Z3STORE_ROOT", root);
+    if (backing_store_root) |root| try env_map.put("Z3STORE_BACKING_STORE_ROOT", root);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    errdefer gpa.free(result.stdout);
+    errdefer gpa.free(result.stderr);
+    try testing.expect(result.term == .exited);
+    return .{ .exit = result.term.exited, .stdout = result.stdout, .stderr = result.stderr };
+}
+
+test "e2e verify path does not load roots or execute ghq" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("owner", "verify-direct");
+    defer gpa.free(repo);
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+
+    var out = try spawnZtWithRoots(gpa, io, &.{ "verify", repo }, null, null, false);
+    defer out.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), out.exit);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "OK:") != null);
+}
+
+test "e2e root list and status share the configured root pair" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createHostRepo("github.com", "owner", "two-root");
+    defer gpa.free(repo);
+    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+
+    var root_out = try spawnZtWithRoots(gpa, io, &.{"root"}, env.ghq_root, env.gitstore_root, true);
+    defer root_out.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), root_out.exit);
+    try testing.expectEqualStrings(env.ghq_root, std.mem.trim(u8, root_out.stdout, "\r\n"));
+
+    var list_out = try spawnZtWithRoots(
+        gpa,
+        io,
+        &.{ "list", "--json", "two-root" },
+        env.ghq_root,
+        env.gitstore_root,
+        true,
+    );
+    defer list_out.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), list_out.exit);
+    try testing.expect(std.mem.indexOf(u8, list_out.stdout, "\"is_adopted\": true") != null);
+
+    var status_out = try spawnZtWithRoots(gpa, io, &.{ "status", "--json" }, env.ghq_root, env.gitstore_root, true);
+    defer status_out.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), status_out.exit);
+
+    const Status = struct {
+        disk_usage: []const u8,
+        working_tree_root: []const u8,
+        backing_store_root: []const u8,
+        z3store_root: []const u8,
+        total_repos: usize,
+        adopted: usize,
+        broken: usize,
+    };
+    const parsed = try std.json.parseFromSlice(Status, gpa, status_out.stdout, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(env.gitstore_root, parsed.value.z3store_root);
+    try testing.expectEqualStrings(env.ghq_root, parsed.value.working_tree_root);
+    try testing.expectEqualStrings(env.gitstore_root, parsed.value.backing_store_root);
+    try testing.expect(parsed.value.disk_usage.len != 0);
+    try testing.expect(parsed.value.total_repos >= 1);
+    try testing.expect(parsed.value.adopted >= 1);
+    try testing.expectEqual(@as(usize, 0), parsed.value.broken);
+}
+
+test "e2e root does not require HOME or a backing-store root" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    var out = try spawnZtWithRoots(gpa, io, &.{"root"}, env.ghq_root, null, false);
+    defer out.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), out.exit);
+    try testing.expectEqualStrings(env.ghq_root, std.mem.trim(u8, out.stdout, "\r\n"));
+}
+
+test "e2e get no-adopt does not require HOME or a backing-store root" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const missing_url = "file:///tmp/z3store-cel-616-intentionally-missing.git";
+    var out = try spawnZtWithRoots(gpa, io, &.{ "get", "--no-adopt", missing_url }, env.ghq_root, null, false);
+    defer out.deinit(gpa);
+    try testing.expect(out.exit != 0);
+    try testing.expect(std.mem.indexOf(u8, out.stderr, "failed to load config") == null);
 }
 
 /// Spawn the built zt binary with `argv_tail` and a controlled env,

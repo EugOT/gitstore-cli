@@ -7,6 +7,11 @@
 //! Precedence:
 //!   root: z3store.root -> gitstore.root -> ghq.root
 //!         -> $Z3STORE_ROOT -> $GITSTORE_ROOT -> $GHQ_ROOT -> ~/ghq
+//!   backingStoreRoot: z3store.backingStoreRoot -> gitstore.backingStoreRoot
+//!         -> $Z3STORE_BACKING_STORE_ROOT -> $GITSTORE_BACKING_STORE_ROOT
+//!         -> existing ~/.local/share/z3store
+//!         -> existing ~/.local/share/gitstore
+//!         -> ~/.local/share/z3store
 //!   user: z3store.user -> gitstore.user -> ghq.user -> $USER -> gh-user
 //!   defaultHost:  z3store.defaultHost  -> gitstore.defaultHost  -> ghq.defaultHost  -> "github.com"
 //!   completeUser: z3store.completeUser -> gitstore.completeUser -> ghq.completeUser -> "true"
@@ -16,22 +21,29 @@
 //! `used_legacy` is set to true whenever a value was sourced from a legacy
 //! `gitstore.*` / `ghq.*` key or the `$GITSTORE_ROOT` / `$GHQ_ROOT` env vars —
 //! a signal for callers to emit a one-line deprecation hint on stderr.
+//! `legacy_backing_store_discovered` is separate: it records preservation of
+//! an existing local store, not use of a deprecated configuration source.
 
 const std = @import("std");
 const Io = std.Io;
+const Dir = Io.Dir;
 const Allocator = std.mem.Allocator;
 const exec = @import("exec.zig");
 
 pub const Source = enum { gitstore, ghq, env, default };
 
 pub const Config = struct {
+    /// Checkout namespace containing host/owner/repository working trees.
     root: []const u8,
+    /// Detached Git/JJ databases and z3store operational metadata.
+    backing_store_root: []const u8,
     user: ?[]const u8,
     default_host: []const u8,
     complete_user: bool,
     adopt_on_clone: bool,
     jj_colocate: bool,
     used_legacy: bool,
+    legacy_backing_store_discovered: bool,
     /// All heap allocations produced while resolving configuration. `deinit`
     /// frees each slice here.
     owned_strings: std.ArrayList([]const u8),
@@ -46,6 +58,9 @@ pub const Config = struct {
 pub const LoadError = error{
     OutOfMemory,
     ProcessFailed,
+    InvalidUserId,
+    ConfigPathUnavailable,
+    BackingStoreRootNotAbsolute,
 } || exec.ExecError;
 
 pub const Resolution = struct {
@@ -139,9 +154,20 @@ fn ghUser(gpa: Allocator, io: Io) LoadError!?[]u8 {
 /// Duplicate `s` into `gpa`, register it in `list`, and return it.
 fn ownStatic(gpa: Allocator, list: *std.ArrayList([]const u8), s: []const u8) LoadError![]const u8 {
     const dup = try gpa.dupe(u8, s);
-    try list.append(gpa, dup);
-    return dup;
+    return registerOwned(gpa, list, dup);
 }
+
+/// Register an existing allocation for Config.deinit without leaking if the
+/// list itself must grow and allocation fails.
+fn registerOwned(gpa: Allocator, list: *std.ArrayList([]const u8), value: []u8) LoadError![]const u8 {
+    errdefer gpa.free(value);
+    try list.append(gpa, value);
+    return value;
+}
+
+pub const LoadOptions = struct {
+    require_backing_store: bool = true,
+};
 
 /// Load configuration by reading `git config` values, environment variables,
 /// and baked-in defaults in precedence order.
@@ -152,6 +178,23 @@ pub fn load(
     io: Io,
     env: *std.process.Environ.Map,
 ) LoadError!Config {
+    return loadWithOptions(gpa, io, env, .{});
+}
+
+/// Load command configuration without discovering a backing store. This is
+/// limited to commands such as `root` and `get --no-adopt` that never read or
+/// write detached metadata.
+// ziglint-ignore: Z015 - LoadError is a public composed error set; ziglint
+// 0.5.2 false-positives on same-file public error-set references.
+pub fn loadWorkingTreeOnly(
+    gpa: Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+) LoadError!Config {
+    return loadWithOptions(gpa, io, env, .{ .require_backing_store = false });
+}
+
+fn loadWithOptions(gpa: Allocator, io: Io, env: *std.process.Environ.Map, options: LoadOptions) LoadError!Config {
     var owned_strings: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (owned_strings.items) |s| gpa.free(s);
@@ -175,11 +218,11 @@ pub fn load(
     const env_ghq_root = env.get("GHQ_ROOT");
     const home_opt = env.get("HOME");
 
-    const default_root = if (home_opt) |h|
+    const default_root_alloc = if (home_opt) |h|
         try std.fmt.allocPrint(gpa, "{s}/ghq", .{h})
     else
         try gpa.dupe(u8, "ghq");
-    try owned_strings.append(gpa, default_root);
+    const default_root = try registerOwned(gpa, &owned_strings, default_root_alloc);
 
     const root_res = resolveStoreRootChain(
         z3_root_raw,
@@ -195,6 +238,62 @@ pub fn load(
     else
         try ownStatic(gpa, &owned_strings, root_res.value);
     if (root_res.legacy) used_legacy = true;
+
+    // --- backingStoreRoot ---
+    // This is deliberately independent from `root`: existing .git pointer
+    // files contain absolute paths into the backing store, while root names
+    // the working-tree namespace. ghq has no detached-store equivalent.
+    const z3_backing_raw = snapshotValue(config_snapshot, "z3store.backingStoreRoot");
+    const gitstore_backing_raw = snapshotValue(config_snapshot, "gitstore.backingStoreRoot");
+    const env_z3_backing = env.get("Z3STORE_BACKING_STORE_ROOT");
+    const env_gitstore_backing = env.get("GITSTORE_BACKING_STORE_ROOT");
+
+    const explicit_backing = resolveBackingStoreChain(
+        z3_backing_raw,
+        gitstore_backing_raw,
+        env_z3_backing,
+        env_gitstore_backing,
+        false,
+        false,
+        "",
+        "",
+    );
+    const backing_res: BackingStoreResolution = if (explicit_backing.explicit)
+        explicit_backing
+    else if (!options.require_backing_store)
+        .{ .value = "", .legacy = false, .explicit = false }
+    else blk: {
+        const home = home_opt orelse return error.InvalidUserId;
+
+        const default_backing_alloc = try std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
+        const default_backing = try registerOwned(gpa, &owned_strings, default_backing_alloc);
+
+        const legacy_backing_alloc = try std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
+        const legacy_backing = try registerOwned(gpa, &owned_strings, legacy_backing_alloc);
+
+        const z3_exists = try directoryExists(io, default_backing);
+        const legacy_exists = if (z3_exists) false else try directoryExists(io, legacy_backing);
+
+        break :blk resolveBackingStoreChain(
+            null,
+            null,
+            null,
+            null,
+            z3_exists,
+            legacy_exists,
+            default_backing,
+            legacy_backing,
+        );
+    };
+    const backing_store_root = if (backing_res.explicit)
+        try ownStatic(gpa, &owned_strings, backing_res.value)
+    else
+        backing_res.value;
+    if (options.require_backing_store and !std.fs.path.isAbsolute(backing_store_root)) {
+        return error.BackingStoreRootNotAbsolute;
+    }
+    const legacy_backing_store_discovered = backing_res.legacy and !backing_res.explicit;
+    if (backing_res.legacy and backing_res.explicit) used_legacy = true;
 
     // --- user ---
     const z3_user_raw = snapshotValue(config_snapshot, "z3store.user");
@@ -272,12 +371,14 @@ pub fn load(
 
     return .{
         .root = root,
+        .backing_store_root = backing_store_root,
         .user = user,
         .default_host = default_host,
         .complete_user = complete_user,
         .adopt_on_clone = adopt_on_clone,
         .jj_colocate = jj_colocate,
         .used_legacy = used_legacy,
+        .legacy_backing_store_discovered = legacy_backing_store_discovered,
         .owned_strings = owned_strings,
     };
 }
@@ -346,6 +447,45 @@ pub const RootResolution = struct {
     /// No source matched; `value` is the baked-in default.
     is_default: bool,
 };
+
+pub const BackingStoreResolution = struct {
+    value: []const u8,
+    /// A legacy config/env source or an existing legacy local store won.
+    legacy: bool,
+    /// Config or environment selected the value, so `load` must own a copy.
+    explicit: bool,
+};
+
+/// Resolve the detached backing-store root independently from the working
+/// tree root. ghq is intentionally absent because it has no detached-store
+/// contract. Empty strings are treated as unset.
+pub fn resolveBackingStoreChain(
+    z3_cfg: ?[]const u8,
+    gitstore_cfg: ?[]const u8,
+    env_z3: ?[]const u8,
+    env_gitstore: ?[]const u8,
+    z3_exists: bool,
+    legacy_exists: bool,
+    z3_default: []const u8,
+    legacy_default: []const u8,
+) BackingStoreResolution {
+    if (nonEmpty(z3_cfg)) |v| return .{ .value = v, .legacy = false, .explicit = true };
+    if (nonEmpty(gitstore_cfg)) |v| return .{ .value = v, .legacy = true, .explicit = true };
+    if (nonEmpty(env_z3)) |v| return .{ .value = v, .legacy = false, .explicit = true };
+    if (nonEmpty(env_gitstore)) |v| return .{ .value = v, .legacy = true, .explicit = true };
+    if (z3_exists) return .{ .value = z3_default, .legacy = false, .explicit = false };
+    if (legacy_exists) return .{ .value = legacy_default, .legacy = true, .explicit = false };
+    return .{ .value = z3_default, .legacy = false, .explicit = false };
+}
+
+fn directoryExists(io: Io, path: []const u8) LoadError!bool {
+    var dir = Dir.openDirAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return error.ConfigPathUnavailable,
+    };
+    dir.close(io);
+    return true;
+}
 
 /// Pure six-source store-root resolver:
 ///   z3store.root -> gitstore.root -> ghq.root
@@ -601,6 +741,64 @@ test "config: resolveStoreRootChain empty strings are unset, default when all em
     try testing.expectEqualStrings("/def", r.value);
     try testing.expect(!r.legacy);
     try testing.expect(r.is_default);
+}
+
+test "config: working and backing roots resolve independently" {
+    const working = resolveStoreRootChain("/worktrees", null, null, null, null, null, "/work-default");
+    const backing = resolveBackingStoreChain(
+        "/store",
+        null,
+        null,
+        null,
+        false,
+        false,
+        "/store-default",
+        "/legacy-store",
+    );
+    try testing.expectEqualStrings("/worktrees", working.value);
+    try testing.expectEqualStrings("/store", backing.value);
+    try testing.expect(backing.explicit);
+    try testing.expect(!backing.legacy);
+}
+
+test "config: explicit backing roots beat local discovery" {
+    const primary = resolveBackingStoreChain(
+        "/configured",
+        "/legacy-configured",
+        "/env",
+        "/legacy-env",
+        true,
+        true,
+        "/local-z3",
+        "/local-gitstore",
+    );
+    try testing.expectEqualStrings("/configured", primary.value);
+    try testing.expect(!primary.legacy);
+
+    const legacy = resolveBackingStoreChain(
+        null,
+        "/legacy-configured",
+        "/env",
+        "/legacy-env",
+        true,
+        true,
+        "/local-z3",
+        "/local-gitstore",
+    );
+    try testing.expectEqualStrings("/legacy-configured", legacy.value);
+    try testing.expect(legacy.legacy);
+}
+
+test "config: existing backing store fallback preserves absolute pointers" {
+    const z3 = resolveBackingStoreChain(null, null, null, null, true, true, "/local-z3", "/local-gitstore");
+    try testing.expectEqualStrings("/local-z3", z3.value);
+    try testing.expect(!z3.legacy);
+    try testing.expect(!z3.explicit);
+
+    const legacy = resolveBackingStoreChain(null, null, null, null, false, true, "/local-z3", "/local-gitstore");
+    try testing.expectEqualStrings("/local-gitstore", legacy.value);
+    try testing.expect(legacy.legacy);
+    try testing.expect(!legacy.explicit);
 }
 
 test "config: parseBool accepts true/1/yes/on case-insensitively" {

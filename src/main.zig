@@ -11,7 +11,6 @@ const config_mod = @import("config.zig");
 const clone_mod = @import("clone.zig");
 const list_mod = @import("list.zig");
 const lore = @import("lore.zig");
-const exec = @import("exec.zig");
 
 const usage_text =
     \\Usage: zt <command> [options]
@@ -292,18 +291,6 @@ const sub_help_migrate =
     \\
 ;
 
-/// True if an absolute directory path currently exists. Only genuine
-/// absence maps to false — other probe failures propagate so store-root
-/// selection can never silently fall back to the wrong store.
-fn dirExists(io: Io, path: []const u8) !bool {
-    var d = Dir.openDirAbsolute(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return false,
-        else => return err,
-    };
-    d.close(io);
-    return true;
-}
-
 fn statPathExists(io: Io, path: []const u8) !bool {
     _ = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return false,
@@ -418,61 +405,6 @@ fn cmdLore(
     return if (ok) 0 else 1;
 }
 
-/// Resolve the store root under $HOME.
-///
-/// Prefers `$HOME/.local/share/z3store` when it already exists; otherwise
-/// falls back to the LEGACY `$HOME/.local/share/gitstore` when only that
-/// exists (adopted repos hold absolute `gitdir:` pointer paths into it, so it
-/// must NEVER be moved or migrated); otherwise defaults to the new
-/// `$HOME/.local/share/z3store` for fresh stores. Caller owns the returned
-/// slice.
-fn getStoreRoot(gpa: Allocator, io: Io, environ_map: *const std.process.Environ.Map) ![]u8 {
-    const home = environ_map.get("HOME") orelse return error.InvalidUserId;
-    // Each candidate's errdefer is scoped to its own block so it can never
-    // stay armed past the explicit free (double-free hazard otherwise).
-    {
-        const z3 = try std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
-        errdefer gpa.free(z3);
-        if (try dirExists(io, z3)) return z3;
-        gpa.free(z3);
-    }
-    {
-        const legacy = try std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
-        errdefer gpa.free(legacy);
-        if (try dirExists(io, legacy)) return legacy;
-        gpa.free(legacy);
-    }
-    return std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home});
-}
-
-fn getGhqRoot(gpa: Allocator, io: Io) ![]u8 {
-    const result = try exec.exec(gpa, io, &.{ "ghq", "root" }, null);
-    defer gpa.free(result.stderr);
-    if (!result.succeeded()) {
-        gpa.free(result.stdout);
-        return error.ProcessFailed;
-    }
-    // Trim trailing newline from the stdout
-    const trimmed = exec.trimTrailingNewline(result.stdout);
-    // We need to return owned memory of just the trimmed part
-    if (trimmed.len < result.stdout.len) {
-        const owned = try gpa.dupe(u8, trimmed);
-        gpa.free(result.stdout);
-        return owned;
-    }
-    return result.stdout;
-}
-
-/// Best-effort ghq-root resolution used by the newer subcommands. Falls back
-/// to `<HOME>/ghq` when the `ghq` binary is unavailable, so `gitstore root`
-/// and `gitstore list` can still function without ghq installed.
-fn resolveGhqRootOrHome(gpa: Allocator, io: Io, environ_map: *const std.process.Environ.Map) ![]u8 {
-    return getGhqRoot(gpa, io) catch {
-        const home = environ_map.get("HOME") orelse return error.InvalidUserId;
-        return std.fmt.allocPrint(gpa, "{s}/ghq", .{home});
-    };
-}
-
 // =========================================================
 // Unit tests for the private dispatcher helpers (G2).
 //
@@ -488,185 +420,8 @@ fn resolveGhqRootOrHome(gpa: Allocator, io: Io, environ_map: *const std.process.
 // testing allocator's leak detector pins any allocPrint that is not released.
 // =========================================================
 
-fn deleteTreeIfExists(io: Io, path: []const u8) !void {
-    _ = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    try Dir.cwd().deleteTree(io, path);
-}
-
-fn deleteTreeIfExistsOrPanic(io: Io, path: []const u8) void {
-    deleteTreeIfExists(io, path) catch |err| {
-        std.debug.panic("test cleanup failed for {s}: {s}", .{ path, @errorName(err) });
-    };
-}
-
-test "getStoreRoot defaults to <HOME>/.local/share/z3store when neither dir exists" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const home = "/tmp/z3s_test_home_none";
-    // Ensure a pristine HOME so neither store dir exists.
-    try deleteTreeIfExists(io, home);
-    defer deleteTreeIfExistsOrPanic(io, home);
-
-    var env_map: std.process.Environ.Map = .init(gpa);
-    defer env_map.deinit();
-    try env_map.put("HOME", home);
-
-    const root = try getStoreRoot(gpa, io, &env_map);
-    defer gpa.free(root);
-    try std.testing.expectEqualStrings("/tmp/z3s_test_home_none/.local/share/z3store", root);
-}
-
-test "getStoreRoot prefers z3store dir when it exists" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const home = "/tmp/z3s_test_home_z3";
-    try deleteTreeIfExists(io, home);
-    defer deleteTreeIfExistsOrPanic(io, home);
-    // Both legacy and new dirs present -> new z3store must win.
-    try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_z3/.local/share/z3store");
-    try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_z3/.local/share/gitstore");
-
-    var env_map: std.process.Environ.Map = .init(gpa);
-    defer env_map.deinit();
-    try env_map.put("HOME", home);
-
-    const root = try getStoreRoot(gpa, io, &env_map);
-    defer gpa.free(root);
-    try std.testing.expectEqualStrings("/tmp/z3s_test_home_z3/.local/share/z3store", root);
-}
-
-test "getStoreRoot uses legacy gitstore dir when only it exists" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const home = "/tmp/z3s_test_home_legacy";
-    try deleteTreeIfExists(io, home);
-    defer deleteTreeIfExistsOrPanic(io, home);
-    // Only the legacy gitstore dir exists (adopted repos point into it).
-    try Dir.cwd().createDirPath(io, "/tmp/z3s_test_home_legacy/.local/share/gitstore");
-
-    var env_map: std.process.Environ.Map = .init(gpa);
-    defer env_map.deinit();
-    try env_map.put("HOME", home);
-
-    const root = try getStoreRoot(gpa, io, &env_map);
-    defer gpa.free(root);
-    try std.testing.expectEqualStrings("/tmp/z3s_test_home_legacy/.local/share/gitstore", root);
-}
-
-test "getStoreRoot errors when HOME is absent" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var env_map: std.process.Environ.Map = .init(gpa);
-    defer env_map.deinit();
-    // Intentionally leave HOME unset.
-
-    try std.testing.expectError(error.InvalidUserId, getStoreRoot(gpa, io, &env_map));
-}
-
 test "usage_text starts with 'Usage: zt'" {
     try std.testing.expect(std.mem.startsWith(u8, usage_text, "Usage: zt"));
-}
-
-// DISCREPANCY vs the task's HELPERS testSpec: `std.testing.io` is a real
-// `Io.Threaded` instance (see std/testing.zig: `io_instance: Io.Threaded`).
-// It SPAWNS real processes under `zig build test` — exec.zig's own tests run
-// real `git`/`echo`/`pwd` through it. The spec assumed ghq exec would always
-// fail under testing.io and the HOME fallback would fire deterministically;
-// that is not the real behavior when ghq is installed. These tests therefore
-// branch on actual ghq availability (probed once via getGhqRoot) so they pin
-// the true contract whether or not ghq is on PATH, instead of asserting a
-// fallback that never executes on a host that has ghq. main.zig logic is
-// unchanged.
-
-/// Probe whether `ghq root` is runnable under the test io. Returns the owned
-/// real ghq-root slice on success (caller frees), or null when ghq is absent
-/// / fails to produce a clean zero-exit result.
-fn probeGhqRoot(gpa: Allocator, io: Io) ?[]u8 {
-    return getGhqRoot(gpa, io) catch return null;
-}
-
-test "resolveGhqRootOrHome: real ghq root when present, else <HOME>/ghq fallback" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var env_map: std.process.Environ.Map = .init(gpa);
-    defer env_map.deinit();
-    try env_map.put("HOME", "/tmp/testhome");
-
-    const root = try resolveGhqRootOrHome(gpa, io, &env_map);
-    defer gpa.free(root);
-
-    if (probeGhqRoot(gpa, io)) |real| {
-        defer gpa.free(real);
-        // ghq present: resolveGhqRootOrHome must return the real ghq root and
-        // must NOT consult HOME, so it never equals the "/tmp/testhome/ghq"
-        // fallback.
-        try std.testing.expectEqualStrings(real, root);
-        try std.testing.expect(!std.mem.eql(u8, "/tmp/testhome/ghq", root));
-    } else {
-        // ghq absent: the HOME fallback branch fires deterministically.
-        try std.testing.expectEqualStrings("/tmp/testhome/ghq", root);
-    }
-}
-
-test "resolveGhqRootOrHome errors with InvalidUserId only when ghq fails AND HOME absent" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var env_map: std.process.Environ.Map = .init(gpa);
-    defer env_map.deinit();
-    // No HOME set.
-
-    if (probeGhqRoot(gpa, io)) |real| {
-        // ghq present: success short-circuits before the HOME lookup, so the
-        // missing HOME is irrelevant and a real root is returned.
-        defer gpa.free(real);
-        const root = try resolveGhqRootOrHome(gpa, io, &env_map);
-        defer gpa.free(root);
-        try std.testing.expectEqualStrings(real, root);
-    } else {
-        // ghq absent + HOME absent → the only path that yields InvalidUserId.
-        try std.testing.expectError(error.InvalidUserId, resolveGhqRootOrHome(gpa, io, &env_map));
-    }
-}
-
-test "getGhqRoot returns an absolute newline-trimmed path when ghq is installed" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    // Success path: absolute, non-empty, trailing newline stripped (the trim
-    // contract). Failure path (ghq absent): a value is never returned.
-    const result = getGhqRoot(gpa, io) catch |err| {
-        try std.testing.expect(err == error.FileNotFound or
-            err == error.ProcessFailed or
-            err == error.Unexpected);
-        return;
-    };
-    defer gpa.free(result);
-    try std.testing.expect(result.len > 0);
-    try std.testing.expect(result[0] == '/');
-    try std.testing.expect(result[result.len - 1] != '\n');
-}
-
-test "getGhqRoot trims the trailing newline from `ghq root` stdout" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    // The raw `ghq root` stdout ends in a newline; getGhqRoot must dupe-and-free
-    // to return the trimmed slice. Pin that the returned slice carries no
-    // trailing newline/CR and that the failure path frees the owned stdout (a
-    // leak there would trip the testing allocator). Skip cleanly if ghq is not
-    // runnable in this environment so the suite stays green on minimal hosts.
-    const result = getGhqRoot(gpa, io) catch |err| switch (err) {
-        error.FileNotFound, error.ProcessFailed => return error.SkipZigTest,
-        else => return err,
-    };
-    defer gpa.free(result);
-    try std.testing.expect(result.len > 0);
-    try std.testing.expect(result[result.len - 1] != '\n' and result[result.len - 1] != '\r');
-    // Re-running yields an identical, independently-owned slice (no aliasing).
-    const again = try getGhqRoot(gpa, io);
-    defer gpa.free(again);
-    try std.testing.expectEqualStrings(result, again);
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -715,20 +470,18 @@ pub fn main(init: std.process.Init) !u8 {
             }
             path = arg;
         }
+        var cfg = try config_mod.load(gpa, io, init.environ_map);
+        defer cfg.deinit(gpa);
+        try printLegacyConfigHint(io, &cfg);
+
         if (path) |p| {
-            const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
-            defer gpa.free(gitstore_root);
-            const ghq_root = try getGhqRoot(gpa, io);
-            defer gpa.free(ghq_root);
-            try gitstore.initRepo(gpa, io, p, ghq_root, gitstore_root);
+            try gitstore.initRepo(gpa, io, p, cfg.root, cfg.backing_store_root);
         } else {
-            const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
-            defer gpa.free(gitstore_root);
             // No path: just ensure gitstore root directory exists
-            try gitstore.init(io, gitstore_root);
+            try gitstore.init(io, cfg.backing_store_root);
             var buf: [4096]u8 = undefined;
             var w = File.stdout().writerStreaming(io, &buf);
-            try w.interface.print("z3store initialized at {s}\n", .{gitstore_root});
+            try w.interface.print("z3store initialized at {s}\n", .{cfg.backing_store_root});
             try w.flush();
         }
         return 0;
@@ -851,18 +604,15 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
-        // Resolve roots only after arg parse so `adopt --help` cannot fail
-        // with error.ProcessFailed when ghq is not installed.
-        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-        try gitstore.init(io, gitstore_root);
+        var cfg = try config_mod.load(gpa, io, init.environ_map);
+        defer cfg.deinit(gpa);
+        try printLegacyConfigHint(io, &cfg);
+        try gitstore.init(io, cfg.backing_store_root);
 
         if (all) {
-            try gitstore.adoptAll(gpa, io, ghq_root, gitstore_root, dry_run);
+            try gitstore.adoptAll(gpa, io, cfg.root, cfg.backing_store_root, dry_run);
         } else if (path) |p| {
-            try gitstore.adopt(gpa, io, p, ghq_root, gitstore_root, dry_run);
+            try gitstore.adopt(gpa, io, p, cfg.root, cfg.backing_store_root, dry_run);
             // git+lore repo: git was adopted normally; note that the Lore
             // metadata stays put (z3store never touches `.lore/`).
             if (!dry_run and lore.detectLoreWorkspace(io, p)) {
@@ -911,15 +661,11 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
 
-        // Resolve roots only after arg parse so `verify --help` cannot fail
-        // when ghq is not installed.
-        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-
         if (all) {
-            try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
+            var cfg = try config_mod.load(gpa, io, init.environ_map);
+            defer cfg.deinit(gpa);
+            try printLegacyConfigHint(io, &cfg);
+            try gitstore.verifyAll(gpa, io, cfg.root, cfg.backing_store_root);
         } else if (path) |p| {
             const has_git = try hasEntry(io, p, ".git");
             const has_jj = try hasEntry(io, p, ".jj");
@@ -984,20 +730,25 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
 
-        // Resolve roots only after arg parse so `detach --help` cannot fail
-        // when ghq is not installed.
-        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
+        var cfg = try config_mod.load(gpa, io, init.environ_map);
+        defer cfg.deinit(gpa);
+        try printLegacyConfigHint(io, &cfg);
 
         if (all) {
             // detachAll swallows per-repo GitDirMalformed and reports it as
             // a `failed` count in the summary, so we don't need a special
             // catch here — only path errors and IO failures propagate.
-            try gitstore.detachAll(gpa, io, ghq_root, gitstore_root, dry_run, keep_backup);
+            try gitstore.detachAll(gpa, io, cfg.root, cfg.backing_store_root, dry_run, keep_backup);
         } else if (path) |p| {
-            gitstore.detach(gpa, io, p, ghq_root, gitstore_root, dry_run, keep_backup) catch |err| switch (err) {
+            gitstore.detach(
+                gpa,
+                io,
+                p,
+                cfg.root,
+                cfg.backing_store_root,
+                dry_run,
+                keep_backup,
+            ) catch |err| switch (err) {
                 error.GitDirMalformed => {
                     var buf: [512]u8 = undefined;
                     var w = File.stderr().writerStreaming(io, &buf);
@@ -1028,14 +779,10 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
-        // Resolve roots only after arg parse so `status --help` cannot fail
-        // when ghq is not installed.
-        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-
-        try gitstore.status(gpa, io, ghq_root, gitstore_root, json_mode);
+        var cfg = try config_mod.load(gpa, io, init.environ_map);
+        defer cfg.deinit(gpa);
+        try printLegacyConfigHint(io, &cfg);
+        try gitstore.status(gpa, io, cfg.root, cfg.backing_store_root, json_mode);
         return 0;
     }
 
@@ -1073,12 +820,10 @@ pub fn main(init: std.process.Init) !u8 {
 
         // Resolve roots only after arg parse so `sync --help` cannot fail
         // when ghq is not installed.
-        const gitstore_root = try getStoreRoot(gpa, io, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
-
-        try gitstore.sync(gpa, io, ghq_root, gitstore_root, remote.?, dry_run);
+        var cfg = try config_mod.load(gpa, io, init.environ_map);
+        defer cfg.deinit(gpa);
+        try printLegacyConfigHint(io, &cfg);
+        try gitstore.sync(gpa, io, cfg.root, cfg.backing_store_root, remote.?, dry_run);
         return 0;
     }
 
@@ -1153,11 +898,22 @@ pub fn main(init: std.process.Init) !u8 {
 // =========================================================
 
 fn printLegacyConfigHint(io: Io, cfg: *const config_mod.Config) !void {
-    if (!cfg.used_legacy) return;
-    try printErr(
-        io,
-        "warning: using legacy gitstore.*/ghq.* config or GITSTORE_ROOT/GHQ_ROOT; prefer z3store.* / Z3STORE_ROOT\n",
-    );
+    if (cfg.used_legacy) {
+        try printErr(
+            io,
+            "warning: using legacy gitstore.*/ghq.* config or GITSTORE_* / GHQ_ROOT; " ++
+                "prefer z3store.* / Z3STORE_*\n",
+        );
+    }
+    if (cfg.legacy_backing_store_discovered) {
+        try printErr(io, "warning: preserving existing legacy backing store at ");
+        try printErr(io, cfg.backing_store_root);
+        try printErr(
+            io,
+            "; configure z3store.backingStoreRoot or Z3STORE_BACKING_STORE_ROOT explicitly; " ++
+                "do not move the store while absolute gitdir pointers reference it\n",
+        );
+    }
 }
 
 fn cmdGet(
@@ -1209,8 +965,12 @@ fn cmdGet(
         return 2;
     }
 
-    // Load config for parser defaults.
-    var cfg = config_mod.load(gpa, io, environ_map) catch |err| {
+    // --no-adopt never reads or writes detached metadata, so it must not
+    // require backing-store discovery.
+    var cfg = (if (opts.no_adopt)
+        config_mod.loadWorkingTreeOnly(gpa, io, environ_map)
+    else
+        config_mod.load(gpa, io, environ_map)) catch |err| {
         try printErr(io, "error: failed to load config\n");
         return err;
     };
@@ -1218,16 +978,10 @@ fn cmdGet(
 
     try printLegacyConfigHint(io, &cfg);
 
-    // Resolve gitstore root only for the adoption side effect. With
-    // --no-adopt nothing will be written to the store, so don't require the
-    // store root to be discoverable or creatable.
-    var gitstore_root_owned: ?[]u8 = null;
-    defer if (gitstore_root_owned) |root| gpa.free(root);
-    const gitstore_root: []const u8 = if (opts.no_adopt) "" else blk: {
-        const root = try getStoreRoot(gpa, io, environ_map);
-        gitstore_root_owned = root;
-        try gitstore.init(io, root);
-        break :blk root;
+    // With --no-adopt nothing is written to the backing store.
+    const backing_store_root: []const u8 = if (opts.no_adopt) "" else blk: {
+        try gitstore.init(io, cfg.backing_store_root);
+        break :blk cfg.backing_store_root;
     };
 
     // Parse URLs into specs.
@@ -1258,7 +1012,7 @@ fn cmdGet(
         io,
         specs.items,
         cfg.root,
-        gitstore_root,
+        backing_store_root,
         opts,
     ) catch |err| {
         var buf: [512]u8 = undefined;
@@ -1327,12 +1081,14 @@ fn cmdList(
         }
     }
 
-    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
-    defer gpa.free(gitstore_root);
-    const ghq_root = try resolveGhqRootOrHome(gpa, io, environ_map);
-    defer gpa.free(ghq_root);
+    var cfg = config_mod.load(gpa, io, environ_map) catch |err| {
+        try printErr(io, "error: failed to load config\n");
+        return err;
+    };
+    defer cfg.deinit(gpa);
+    try printLegacyConfigHint(io, &cfg);
 
-    const all_entries = try list_mod.walk(gpa, io, ghq_root, gitstore_root, .{
+    const all_entries = try list_mod.walk(gpa, io, cfg.root, cfg.backing_store_root, .{
         .pattern = pattern,
         .include_worktrees = true,
         .include_head = with_head,
@@ -1395,7 +1151,7 @@ fn cmdRoot(
         }
     }
 
-    var cfg = config_mod.load(gpa, io, environ_map) catch |err| {
+    var cfg = config_mod.loadWorkingTreeOnly(gpa, io, environ_map) catch |err| {
         try printErr(io, "error: failed to load config\n");
         return err;
     };
@@ -1437,12 +1193,14 @@ fn cmdRm(
         return 2;
     };
 
-    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
-    defer gpa.free(gitstore_root);
-    const ghq_root = try resolveGhqRootOrHome(gpa, io, environ_map);
-    defer gpa.free(ghq_root);
+    var cfg = config_mod.load(gpa, io, environ_map) catch |err| {
+        try printErr(io, "error: failed to load config\n");
+        return err;
+    };
+    defer cfg.deinit(gpa);
+    try printLegacyConfigHint(io, &cfg);
 
-    const entries = try list_mod.walk(gpa, io, ghq_root, gitstore_root, .{
+    const entries = try list_mod.walk(gpa, io, cfg.root, cfg.backing_store_root, .{
         .include_worktrees = false,
         .include_head = false,
     });
@@ -1496,7 +1254,15 @@ fn cmdRm(
     }
 
     if (target.is_adopted) {
-        gitstore.detach(gpa, io, target.abs_path, ghq_root, gitstore_root, false, false) catch |err| switch (err) {
+        gitstore.detach(
+            gpa,
+            io,
+            target.abs_path,
+            cfg.root,
+            cfg.backing_store_root,
+            false,
+            false,
+        ) catch |err| switch (err) {
             error.GitDirMalformed => {
                 var ebuf: [512]u8 = undefined;
                 var ew = File.stderr().writerStreaming(io, &ebuf);
@@ -1577,11 +1343,8 @@ fn cmdCreate(
     const repo_path = try spec.toStoragePath(gpa, cfg.root);
     defer gpa.free(repo_path);
 
-    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
-    defer gpa.free(gitstore_root);
-
     // initRepo already handles: git init, optional jj colocate, adopt.
-    try gitstore.initRepo(gpa, io, repo_path, cfg.root, gitstore_root);
+    try gitstore.initRepo(gpa, io, repo_path, cfg.root, cfg.backing_store_root);
 
     var buf: [4096]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &buf);
@@ -1617,12 +1380,14 @@ fn cmdMigrate(
         return 2;
     };
 
-    const gitstore_root = try getStoreRoot(gpa, io, environ_map);
-    defer gpa.free(gitstore_root);
-    const ghq_root = try resolveGhqRootOrHome(gpa, io, environ_map);
-    defer gpa.free(ghq_root);
+    var cfg = config_mod.load(gpa, io, environ_map) catch |err| {
+        try printErr(io, "error: failed to load config\n");
+        return err;
+    };
+    defer cfg.deinit(gpa);
+    try printLegacyConfigHint(io, &cfg);
 
-    const entries = try list_mod.walk(gpa, io, ghq_root, gitstore_root, .{
+    const entries = try list_mod.walk(gpa, io, cfg.root, cfg.backing_store_root, .{
         .include_worktrees = true,
         .include_head = false,
     });
@@ -1630,7 +1395,7 @@ fn cmdMigrate(
 
     var buf: [8192]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &buf);
-    try w.interface.print("migrate plan: {s} -> {s}\n", .{ ghq_root, target_root });
+    try w.interface.print("migrate plan: {s} -> {s}\n", .{ cfg.root, target_root });
 
     var adopted_count: usize = 0;
     var worktree_count: usize = 0;

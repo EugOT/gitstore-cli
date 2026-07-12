@@ -34,6 +34,28 @@ bun scripts/verify-commit.ts      # tier 2 (~30s) — fast + tests + API drift
 bun scripts/verify-pr.ts          # tier 3 (~10min) — commit + cross-target + safety + fuzz
 ```
 
+## Storage roots
+
+z3store keeps two independent roots:
+
+| Root | Purpose | Primary setting |
+|---|---|---|
+| Working-tree root | `host/owner/repository` checkout namespace used by `root`, `list`, and `get` | `z3store.root` or `Z3STORE_ROOT` |
+| Backing-store root | Detached Git/JJ databases, cache, and `operations.log` | `z3store.backingStoreRoot` or `Z3STORE_BACKING_STORE_ROOT` |
+
+```bash
+git config --global z3store.root /Volumes/Crucial/ghq
+git config --global z3store.backingStoreRoot /Volumes/Crucial/gitstore
+
+zt root
+zt status --json
+```
+
+Existing absolute `.git` pointer files are not rewritten merely because a
+different backing root is selected. Legacy `gitstore.backingStoreRoot` and
+`GITSTORE_BACKING_STORE_ROOT` remain supported during migration. See
+[`docs/MIGRATION-ghq-to-gitstore.md`](docs/MIGRATION-ghq-to-gitstore.md).
+
 ## Quality gates
 
 | Tier | Trigger | Entrypoint | Budget |
