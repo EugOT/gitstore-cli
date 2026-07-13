@@ -68,7 +68,7 @@ pub fn timestamp(io: Io, buf: *[30]u8) []const u8 {
     const ts = Io.Clock.real.now(io);
     const ns = ts.nanoseconds;
     const secs: u64 = @intCast(@divTrunc(ns, std.time.ns_per_s));
-    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const es: std.time.epoch.EpochSeconds = .{ .secs = secs };
     const day_seconds = es.getDaySeconds();
     const year_day = es.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -87,6 +87,13 @@ pub fn timestamp(io: Io, buf: *[30]u8) []const u8 {
 // ===== Tests =====
 const testing = std.testing;
 
+fn removeFileBestEffort(io: Io, path: []const u8) void {
+    Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => std.log.warn("failed to remove test log {s}: {s}", .{ path, @errorName(err) }),
+    };
+}
+
 // ===== Action.toString() tests =====
 
 test "Action.toString covers all variants" {
@@ -104,7 +111,7 @@ test "logOperation creates file and writes valid JSONL" {
     const path = "/tmp/gitstore_test_log_create.jsonl";
 
     // Clean up from prior runs
-    Dir.cwd().deleteFile(io, path) catch {};
+    removeFileBestEffort(io, path);
 
     try logOperation(io, path, .copy, "/src/a", "/dst/b", "ok");
 
@@ -124,13 +131,13 @@ test "logOperation creates file and writes valid JSONL" {
     try testing.expect(std.mem.indexOf(u8, content, "\"timestamp\":\"") != null);
 
     // Clean up
-    Dir.cwd().deleteFile(io, path) catch {};
+    removeFileBestEffort(io, path);
 }
 
 test "logOperation appends multiple lines" {
     const io = testing.io;
     const path = "/tmp/gitstore_test_log_append.jsonl";
-    Dir.cwd().deleteFile(io, path) catch {};
+    removeFileBestEffort(io, path);
 
     try logOperation(io, path, .copy, "/a", "/b", "ok");
     try logOperation(io, path, .remove, "/c", "", "ok");
@@ -158,13 +165,13 @@ test "logOperation appends multiple lines" {
     }
     try testing.expectEqual(@as(usize, 3), idx);
 
-    Dir.cwd().deleteFile(io, path) catch {};
+    removeFileBestEffort(io, path);
 }
 
 test "logOperation with empty source and destination" {
     const io = testing.io;
     const path = "/tmp/gitstore_test_log_empty.jsonl";
-    Dir.cwd().deleteFile(io, path) catch {};
+    removeFileBestEffort(io, path);
 
     try logOperation(io, path, .init_jj, "", "", "ok");
 
@@ -175,13 +182,13 @@ test "logOperation with empty source and destination" {
     try testing.expect(std.mem.indexOf(u8, content, "\"source\":\"\"") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"destination\":\"\"") != null);
 
-    Dir.cwd().deleteFile(io, path) catch {};
+    removeFileBestEffort(io, path);
 }
 
 test "logOperation with special characters in paths" {
     const io = testing.io;
     const path = "/tmp/gitstore_test_log_special.jsonl";
-    Dir.cwd().deleteFile(io, path) catch {};
+    removeFileBestEffort(io, path);
 
     try logOperation(io, path, .copy, "/path/with spaces/repo", "/dst/path", "ok");
 
@@ -191,7 +198,7 @@ test "logOperation with special characters in paths" {
 
     try testing.expect(std.mem.indexOf(u8, content, "with spaces") != null);
 
-    Dir.cwd().deleteFile(io, path) catch {};
+    removeFileBestEffort(io, path);
 }
 
 // ===== timestamp() tests =====

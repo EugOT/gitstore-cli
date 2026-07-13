@@ -9,6 +9,34 @@ local). z3store absorbs ghq's role — no more shell-side diff dance.
 > source. Legacy `gitstore.*` / `ghq.*` keys and `$GITSTORE_ROOT` / `$GHQ_ROOT`
 > still work as fallbacks; using them prints a one-line deprecation hint.
 
+## Two independent roots
+
+| Contract | Contains | Primary config | Primary env |
+|---|---|---|---|
+| Working-tree root | `host/owner/repository` checkouts | `z3store.root` | `Z3STORE_ROOT` |
+| Backing-store root | Detached Git/JJ databases, cache, and `operations.log` | `z3store.backingStoreRoot` | `Z3STORE_BACKING_STORE_ROOT` |
+
+Working-tree precedence:
+
+```text
+z3store.root > gitstore.root > ghq.root
+> Z3STORE_ROOT > GITSTORE_ROOT > GHQ_ROOT > $HOME/ghq
+```
+
+Backing-store precedence:
+
+```text
+z3store.backingStoreRoot > gitstore.backingStoreRoot
+> Z3STORE_BACKING_STORE_ROOT > GITSTORE_BACKING_STORE_ROOT
+> existing $HOME/.local/share/z3store
+> existing $HOME/.local/share/gitstore
+> $HOME/.local/share/z3store
+```
+
+There is no `ghq.backingStoreRoot`: ghq has no detached-metadata contract.
+Selecting a backing store does not move repositories or rewrite existing
+absolute `.git` pointer files.
+
 ## Why migrate
 
 - **One tool, one config.** `z3store.*` keys in `git config` parallel
@@ -98,6 +126,13 @@ ADOPT_ON_CLONE=$(git config --global --get z3store.adoptOnClone \
   || git config --global --get gitstore.adoptOnClone || echo "true")
 JJ_COLOCATE=$(git config --global --get z3store.jjColocate \
   || git config --global --get gitstore.jjColocate || echo "true")
+BACKING_STORE_ROOT=$(git config --global --get z3store.backingStoreRoot \
+  || git config --global --get gitstore.backingStoreRoot \
+  || { [ -n "${Z3STORE_BACKING_STORE_ROOT:-}" ] && echo "$Z3STORE_BACKING_STORE_ROOT"; } \
+  || { [ -n "${GITSTORE_BACKING_STORE_ROOT:-}" ] && echo "$GITSTORE_BACKING_STORE_ROOT"; } \
+  || { [ -d "$HOME/.local/share/z3store" ] && echo "$HOME/.local/share/z3store"; } \
+  || { [ -d "$HOME/.local/share/gitstore" ] && echo "$HOME/.local/share/gitstore"; } \
+  || echo "$HOME/.local/share/z3store")
 
 # Set z3store.* equivalents
 git config --global z3store.root "$ROOT"
@@ -106,6 +141,7 @@ git config --global z3store.defaultHost "$DEFAULT_HOST"
 git config --global z3store.completeUser "$COMPLETE_USER"
 git config --global z3store.adoptOnClone "$ADOPT_ON_CLONE"
 git config --global z3store.jjColocate "$JJ_COLOCATE"
+git config --global z3store.backingStoreRoot "$BACKING_STORE_ROOT"
 
 # Optional — remove the old keys once parity is confirmed
 # git config --global --unset ghq.root
@@ -118,6 +154,7 @@ git config --global z3store.jjColocate "$JJ_COLOCATE"
 # git config --global --unset gitstore.completeUser
 # git config --global --unset gitstore.adoptOnClone
 # git config --global --unset gitstore.jjColocate
+# git config --global --unset gitstore.backingStoreRoot
 ```
 
 ### Config key cross-reference
@@ -131,9 +168,12 @@ git config --global z3store.jjColocate "$JJ_COLOCATE"
 | `ghq.<url-pattern>.root` / `gitstore.<url-pattern>.root` | `z3store.<url-pattern>.root` | — |
 | `gitstore.adoptOnClone` | `z3store.adoptOnClone` | `true` (no ghq analogue) |
 | `gitstore.jjColocate` | `z3store.jjColocate` | `true` (no ghq analogue) |
+| `gitstore.backingStoreRoot` | `z3store.backingStoreRoot` | Existing `~/.local/share/z3store`, then existing `~/.local/share/gitstore`, then `~/.local/share/z3store` |
 
 Env vars: `$Z3STORE_ROOT` takes precedence over `$GITSTORE_ROOT`, which takes
-precedence over `$GHQ_ROOT`.
+precedence over `$GHQ_ROOT` for the working-tree root.
+`$Z3STORE_BACKING_STORE_ROOT` takes precedence over
+`$GITSTORE_BACKING_STORE_ROOT` for the detached backing store.
 
 ## Known gaps in v1
 
@@ -146,7 +186,9 @@ precedence over `$GHQ_ROOT`.
 
 - **`ghq` still runs the Go binary after `chezmoi apply`** — reload the shell function/command cache for your shell. zsh: restart the shell or `source ~/.config/zsh/functions.zsh`. bash: `source ~/.bashrc` and `hash -r`. Nushell: `exec nu` or re-source the config that defines the alias/function. Shell functions don't re-load automatically.
 - **`zt list` shows nothing** — check `zt root` matches where your repos live; if empty, `git config --global z3store.root <path>`.
-- **Deprecation warning on every run** — indicates a `z3store.*` key is absent and the matching legacy `gitstore.*` / `ghq.*` key is being used for that setting; see Phase 3 above.
+- **`zt list` reports adopted repositories as false** — check `z3store.backingStoreRoot` points to the store referenced by those checkouts' `.git` pointer files.
+- **Legacy config warning on every run** — indicates a `z3store.*` key is absent and the matching legacy `gitstore.*` / `ghq.*` key or environment variable is being used; see Phase 3 above.
+- **Existing legacy backing-store warning** — no backing-store key is configured and z3store preserved an existing `~/.local/share/gitstore` because checkout pointers may contain absolute paths into it. Configure `z3store.backingStoreRoot` explicitly; do not move the store until those pointers are migrated.
 - **Want to fall back to real ghq for a single invocation** — use `command ghq <args>` (the `command` builtin bypasses the shell function).
 
 ## Related

@@ -84,6 +84,150 @@ pub const nu_hook =
     \\}
 ;
 
+pub const gh_zsh_hook =
+    \\# z3store-gh-hook.zsh — opt-in GitHub CLI compatibility for synced trees
+    \\# Source this only when you want `gh` to derive GH_REPO from z3store/ghq paths
+    \\# that no longer contain a .git file after rclone/Google Drive sync.
+    \\#
+    \\# Uses `command gh` so 1Password's `op plugin run -- gh` alias still works.
+    \\
+    \\gh() {
+    \\  if [ -n "${GH_REPO:-}" ]; then
+    \\    GH_REPO="$GH_REPO" command gh "$@"
+    \\    return $?
+    \\  fi
+    \\  if whence -p zt >/dev/null 2>&1; then
+    \\    local _zt_gh_repo
+    \\    local _zt_gh_error
+    \\    local _zt_gh_status=0
+    \\    local _zt_gh_stdout_file
+    \\    _zt_gh_stdout_file="$(mktemp "${TMPDIR:-/tmp}/zt-gh-repo.XXXXXX")" || {
+    \\      printf '%s\n' "zt gh-repo temp file creation failed" >&2
+    \\      return 1
+    \\    }
+    \\    _zt_gh_error="$(command zt gh-repo 2>&1 1>"$_zt_gh_stdout_file")" || _zt_gh_status=$?
+    \\    local _zt_read_status=0
+    \\    _zt_gh_repo="$(cat "$_zt_gh_stdout_file")" || _zt_read_status=$?
+    \\    if [ "$_zt_read_status" -ne 0 ]; then
+    \\      rm -f "$_zt_gh_stdout_file" || printf '%s\n' "zt gh-repo temp file cleanup failed" >&2
+    \\      printf '%s\n' "zt gh-repo stdout read failed" >&2
+    \\      return 1
+    \\    fi
+    \\    rm -f "$_zt_gh_stdout_file" || printf '%s\n' "zt gh-repo temp file cleanup failed" >&2
+    \\    if [ "$_zt_gh_status" -eq 0 ] && [ -n "$_zt_gh_repo" ]; then
+    \\      GH_REPO="$_zt_gh_repo" command gh "$@"
+    \\      return $?
+    \\    fi
+    \\    if [ "$_zt_gh_status" -eq 0 ]; then
+    \\      printf '%s\n' "zt gh-repo returned empty GH_REPO" >&2
+    \\      return 1
+    \\    fi
+    \\    if [ "$_zt_gh_status" -eq 1 ]; then
+    \\      case "$_zt_gh_error" in
+    \\        *"cannot derive GH_REPO"*)
+    \\          command gh "$@"
+    \\          return $?
+    \\          ;;
+    \\      esac
+    \\    fi
+    \\    printf '%s\n' "$_zt_gh_error" >&2
+    \\    return "$_zt_gh_status"
+    \\  fi
+    \\  command gh "$@"
+    \\}
+;
+
+pub const gh_bash_hook =
+    \\# z3store-gh-hook.bash — opt-in GitHub CLI compatibility for synced trees
+    \\# Source this only when you want `gh` to derive GH_REPO from z3store/ghq paths
+    \\# that no longer contain a .git file after rclone/Google Drive sync.
+    \\#
+    \\# Uses `command gh` so 1Password's `op plugin run -- gh` alias still works.
+    \\
+    \\gh() {
+    \\  if [ -n "${GH_REPO:-}" ]; then
+    \\    GH_REPO="$GH_REPO" command gh "$@"
+    \\    return $?
+    \\  fi
+    \\  if type -P zt >/dev/null 2>&1; then
+    \\    local _zt_gh_repo
+    \\    local _zt_gh_error
+    \\    local _zt_gh_status=0
+    \\    local _zt_gh_stdout_file
+    \\    _zt_gh_stdout_file="$(mktemp "${TMPDIR:-/tmp}/zt-gh-repo.XXXXXX")" || {
+    \\      printf '%s\n' "zt gh-repo temp file creation failed" >&2
+    \\      return 1
+    \\    }
+    \\    _zt_gh_error="$(command zt gh-repo 2>&1 1>"$_zt_gh_stdout_file")" || _zt_gh_status=$?
+    \\    local _zt_read_status=0
+    \\    _zt_gh_repo="$(cat "$_zt_gh_stdout_file")" || _zt_read_status=$?
+    \\    if [ "$_zt_read_status" -ne 0 ]; then
+    \\      rm -f "$_zt_gh_stdout_file" || printf '%s\n' "zt gh-repo temp file cleanup failed" >&2
+    \\      printf '%s\n' "zt gh-repo stdout read failed" >&2
+    \\      return 1
+    \\    fi
+    \\    rm -f "$_zt_gh_stdout_file" || printf '%s\n' "zt gh-repo temp file cleanup failed" >&2
+    \\    if [ "$_zt_gh_status" -eq 0 ] && [ -n "$_zt_gh_repo" ]; then
+    \\      GH_REPO="$_zt_gh_repo" command gh "$@"
+    \\      return $?
+    \\    fi
+    \\    if [ "$_zt_gh_status" -eq 0 ]; then
+    \\      printf '%s\n' "zt gh-repo returned empty GH_REPO" >&2
+    \\      return 1
+    \\    fi
+    \\    if [ "$_zt_gh_status" -eq 1 ]; then
+    \\      case "$_zt_gh_error" in
+    \\        *"cannot derive GH_REPO"*)
+    \\          command gh "$@"
+    \\          return $?
+    \\          ;;
+    \\      esac
+    \\    fi
+    \\    printf '%s\n' "$_zt_gh_error" >&2
+    \\    return "$_zt_gh_status"
+    \\  fi
+    \\  command gh "$@"
+    \\}
+;
+
+pub const gh_nu_hook =
+    \\# z3store-gh.nu — opt-in GitHub CLI compatibility for synced trees
+    \\# Usage: use this module after confirming you want `gh` wrapped.
+    \\#
+    \\# Uses `^gh` (external) so 1Password's `op plugin run -- gh` alias still works.
+    \\
+    \\def --wrapped _zt_run_gh [...args: string] {
+    \\  ^gh ...$args
+    \\}
+    \\
+    \\export def --wrapped gh [...args: string] {
+    \\  let explicit_gh_repo = ($env.GH_REPO? | default "")
+    \\  if ($explicit_gh_repo | is-not-empty) {
+    \\    _zt_run_gh ...$args
+    \\    return
+    \\  }
+    \\  if (which zt | is-not-empty) {
+    \\    let resolved = (do { ^zt gh-repo } | complete)
+    \\    let resolved_gh_repo = ($resolved.stdout | str trim)
+    \\    if $resolved.exit_code == 0 and ($resolved_gh_repo | is-not-empty) {
+    \\      with-env { GH_REPO: $resolved_gh_repo } { _zt_run_gh ...$args }
+    \\      return
+    \\    }
+    \\    if $resolved.exit_code == 0 {
+    \\      error make { msg: "zt gh-repo returned empty GH_REPO" }
+    \\    }
+    \\    if $resolved.exit_code == 1 and ($resolved.stderr | str contains "cannot derive GH_REPO") {
+    \\      _zt_run_gh ...$args
+    \\      return
+    \\    }
+    \\    if $resolved.exit_code != 0 {
+    \\      error make { msg: $resolved.stderr }
+    \\    }
+    \\  }
+    \\  _zt_run_gh ...$args
+    \\}
+;
+
 /// rclone filter rules for syncing zt/z3store working trees to Google Drive.
 /// Excludes VCS internals, build artifacts, caches, env files, OS junk.
 /// Used by "zt sync" and "zt filter".
@@ -278,7 +422,11 @@ test "hook: nu falls back to ghq" {
 }
 
 test "hook: nu raises an error when both tools are missing" {
-    try testing.expect(mem.indexOf(u8, nu_hook, "error make {msg: \"ghq(): neither zt nor ghq found on PATH\"}") != null);
+    try testing.expect(mem.indexOf(
+        u8,
+        nu_hook,
+        "error make {msg: \"ghq(): neither zt nor ghq found on PATH\"}",
+    ) != null);
     try testing.expect(mem.indexOf(u8, nu_hook, "exit 127") == null);
 }
 
