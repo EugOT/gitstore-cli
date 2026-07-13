@@ -77,6 +77,7 @@ pub const CloneError = error{
 ///   the computed storage path. Free via `freeReports` for batched
 ///   reports; for a single report, free `r.url`, `r.storage_path` and
 ///   `r.err` manually.
+// ziglint-ignore: Z015 - CloneError is a documented public error set.
 pub fn cloneOne(
     gpa: Allocator,
     io: Io,
@@ -232,6 +233,7 @@ pub fn cloneOne(
 /// frees via `freeReports`. `error.Canceled` is the only error that
 /// propagates — every other per-URL failure is captured on that URL's
 /// report with `.failed`.
+// ziglint-ignore: Z015 - CloneError is a documented public error set.
 pub fn cloneMany(
     gpa: Allocator,
     io: Io,
@@ -404,6 +406,12 @@ fn dirExists(io: Io, path: []const u8) bool {
 
 const testing = std.testing;
 
+fn removeTreeBestEffort(io: Io, path: []const u8) void {
+    Dir.cwd().deleteTree(io, path) catch |err| {
+        std.log.warn("failed to remove test path {s}: {s}", .{ path, @errorName(err) });
+    };
+}
+
 test "clone: cloneTarget preserves explicit https identity URL" {
     const gpa = testing.allocator;
     var spec = try url.parse(gpa, "https://git.example.com/team/repo", .{});
@@ -468,8 +476,8 @@ fn makeLocalBareFixture(
     bare_path: []const u8,
 ) !void {
     // Fresh workspace.
-    Dir.cwd().deleteTree(io, work_dir) catch {};
-    Dir.cwd().deleteTree(io, bare_path) catch {};
+    removeTreeBestEffort(io, work_dir);
+    removeTreeBestEffort(io, bare_path);
     try Dir.cwd().createDirPath(io, work_dir);
 
     // `git init` in working dir.
@@ -518,8 +526,8 @@ test "clone: cloneOne clones from a file:// bare fixture" {
     const ghq_root = "/tmp/gitstore_clone_test_basic/ghq";
     const store = "/tmp/gitstore_clone_test_basic/store";
 
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    removeTreeBestEffort(io, base);
+    defer removeTreeBestEffort(io, base);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
@@ -559,8 +567,8 @@ test "clone: cloneOne with update_if_exists refreshes an existing clone" {
     const ghq_root = "/tmp/gitstore_clone_test_update/ghq";
     const store = "/tmp/gitstore_clone_test_update/store";
 
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    removeTreeBestEffort(io, base);
+    defer removeTreeBestEffort(io, base);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
@@ -613,8 +621,8 @@ test "clone: cloneOne without update on existing path returns skipped" {
     const ghq_root = "/tmp/gitstore_clone_test_skip/ghq";
     const store = "/tmp/gitstore_clone_test_skip/store";
 
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    removeTreeBestEffort(io, base);
+    defer removeTreeBestEffort(io, base);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
@@ -657,8 +665,8 @@ test "clone: cloneOne against a non-existent remote reports failure" {
     const ghq_root = "/tmp/gitstore_clone_test_fail/ghq";
     const store = "/tmp/gitstore_clone_test_fail/store";
 
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    removeTreeBestEffort(io, base);
+    defer removeTreeBestEffort(io, base);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 
@@ -692,8 +700,8 @@ test "clone: cloneMany runs three file:// clones with parallelism=2" {
     const ghq_root = "/tmp/gitstore_clone_test_many/ghq";
     const store = "/tmp/gitstore_clone_test_many/store";
 
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    removeTreeBestEffort(io, base);
+    defer removeTreeBestEffort(io, base);
     try Dir.cwd().createDirPath(io, ghq_root);
     try Dir.cwd().createDirPath(io, store);
 

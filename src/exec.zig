@@ -11,6 +11,7 @@ pub const ExecResult = struct {
     pub fn deinit(self: *ExecResult, gpa: Allocator) void {
         gpa.free(self.stdout);
         gpa.free(self.stderr);
+        self.* = undefined;
     }
 
     pub fn succeeded(self: ExecResult) bool {
@@ -359,7 +360,7 @@ test "exec exit code preserved" {
 // ===== ExecResult.succeeded() tests =====
 
 test "succeeded returns true for exit 0" {
-    const result = ExecResult{
+    const result: ExecResult = .{
         .stdout = &.{},
         .stderr = &.{},
         .term = .{ .exited = 0 },
@@ -368,7 +369,7 @@ test "succeeded returns true for exit 0" {
 }
 
 test "succeeded returns false for exit 1" {
-    const result = ExecResult{
+    const result: ExecResult = .{
         .stdout = &.{},
         .stderr = &.{},
         .term = .{ .exited = 1 },
@@ -377,7 +378,7 @@ test "succeeded returns false for exit 1" {
 }
 
 test "succeeded returns false for signal" {
-    const result = ExecResult{
+    const result: ExecResult = .{
         .stdout = &.{},
         .stderr = &.{},
         .term = .{ .signal = .SEGV },

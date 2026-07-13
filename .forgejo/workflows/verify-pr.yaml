@@ -92,6 +92,13 @@ jobs:
       - name: Install kcov
         run: sudo apt-get update && sudo apt-get install -y kcov
 
+      - name: Coverage preflight
+        run: |
+          uname -a
+          command -v kcov
+          kcov --version
+          mise x zig@0.16.0 -- zig version
+
       - name: Bun install
         run: bun ci
 
@@ -99,7 +106,7 @@ jobs:
         run: bun scripts/kcov-coverage.ts --print
 
       - name: Enforce coverage threshold
-        run: bun scripts/check-coverage.ts
+        run: bun scripts/check-coverage.ts --require-measured
 
       - name: Upload coverage report
         if: always()

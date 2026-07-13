@@ -74,6 +74,8 @@ pub const WalkError = error{
 
 /// Walk `ghq_root` and return repo entries. The caller owns the slice and
 /// must free it with `freeEntries`.
+// ziglint-ignore: Z015 — `WalkError` is a public composed error set; ziglint
+// 0.5.2 false-positives on same-file public error-set references.
 pub fn walk(
     gpa: Allocator,
     io: Io,
@@ -93,7 +95,7 @@ pub fn walk(
 
     // Top-level: iterate host directories.
     var root_dir = Dir.openDirAbsolute(io, ghq_root, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return try out.toOwnedSlice(gpa),
+        error.FileNotFound, error.NotDir => return out.toOwnedSlice(gpa),
         else => return err,
     };
     defer root_dir.close(io);
@@ -105,7 +107,7 @@ pub fn walk(
         try walkHost(gpa, io, &out, ghq_root, gitstore_root, host_entry.name, opts, &cache_map);
     }
 
-    return try out.toOwnedSlice(gpa);
+    return out.toOwnedSlice(gpa);
 }
 
 fn walkHost(
@@ -151,7 +153,18 @@ fn walkOwner(
     var name_iter = owner_dir.iterate();
     while (try name_iter.next(io)) |name_entry| {
         if (name_entry.kind != .directory) continue;
-        try tryAppendRepo(gpa, io, out, ghq_root, gitstore_root, host_name, owner_name, name_entry.name, opts, cache_map);
+        try tryAppendRepo(
+            gpa,
+            io,
+            out,
+            ghq_root,
+            gitstore_root,
+            host_name,
+            owner_name,
+            name_entry.name,
+            opts,
+            cache_map,
+        );
     }
 }
 
@@ -180,7 +193,7 @@ fn tryAppendRepo(
     );
     errdefer gpa.free(rel_path);
 
-    const repo_status = try detectRepoDirStatus(io, abs_path, gpa);
+    const repo_status = try detectRepoDirStatus(gpa, io, abs_path);
     if (!repo_status.is_repo) {
         gpa.free(abs_path);
         gpa.free(rel_path);
@@ -276,7 +289,7 @@ const RepoDirStatus = struct {
 /// A directory is considered a repo if it contains `.git` (dir or pointer
 /// file) or `.jj`. Non-git VCS (hg, svn, bzr) are intentionally skipped per
 /// libz3store v2 scope.
-fn detectRepoDirStatus(io: Io, abs_path: []const u8, gpa: Allocator) !RepoDirStatus {
+fn detectRepoDirStatus(gpa: Allocator, io: Io, abs_path: []const u8) !RepoDirStatus {
     var is_repo = false;
 
     const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{abs_path});
@@ -318,6 +331,8 @@ fn resolveHead(gpa: Allocator, io: Io, abs_path: []const u8) !?[]const u8 {
     if (!result.succeeded()) return null;
     const trimmed = ex.trimTrailingNewline(result.stdout);
     if (trimmed.len == 0) return null;
+    // ziglint-ignore: Z017 — `try` is required before coercing `[]u8` into
+    // the declared optional `?[]const u8` payload.
     return try gpa.dupe(u8, trimmed);
 }
 
@@ -410,6 +425,14 @@ pub fn renderJson(gpa: Allocator, entries: []const RepoEntry) ![]u8 {
 
 const testing = std.testing;
 
+fn reportTestFsFailure(operation: []const u8, path: []const u8, err: anyerror) void {
+    std.debug.print("list test {s} failed for {s}: {s}\n", .{ operation, path, @errorName(err) });
+}
+
+fn deleteTestTree(io: Io, path: []const u8) void {
+    Dir.cwd().deleteTree(io, path) catch |err| reportTestFsFailure("cleanup", path, err);
+}
+
 const WalkTestEnv = struct {
     base: []const u8,
     ghq_root: []const u8,
@@ -421,7 +444,7 @@ const WalkTestEnv = struct {
         const base = try std.fmt.allocPrint(gpa, "/tmp/gitstore_list_{s}", .{tag});
         const ghq = try std.fmt.allocPrint(gpa, "{s}/ghq", .{base});
         const store = try std.fmt.allocPrint(gpa, "{s}/gitstore", .{base});
-        Dir.cwd().deleteTree(io, base) catch {};
+        deleteTestTree(io, base);
         try Dir.cwd().createDirPath(io, ghq);
         try Dir.cwd().createDirPath(io, store);
         return .{
@@ -434,7 +457,7 @@ const WalkTestEnv = struct {
     }
 
     fn teardown(self: *const WalkTestEnv) void {
-        Dir.cwd().deleteTree(self.io, self.base) catch {};
+        deleteTestTree(self.io, self.base);
         self.gpa.free(self.base);
         self.gpa.free(self.ghq_root);
         self.gpa.free(self.gitstore_root);
@@ -442,7 +465,12 @@ const WalkTestEnv = struct {
 
     /// Create a dir at `<ghq>/host/owner/name` and put a `.git` directory
     /// inside so it's recognized as a repo.
-    fn createGitRepo(self: *const WalkTestEnv, host: []const u8, owner: []const u8, name: []const u8) !void {
+    fn createGitRepo(
+        self: *const WalkTestEnv,
+        host: []const u8,
+        owner: []const u8,
+        name: []const u8,
+    ) !void {
         const repo = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}/{s}", .{ self.ghq_root, host, owner, name });
         defer self.gpa.free(repo);
         const git_dir = try std.fmt.allocPrint(self.gpa, "{s}/.git", .{repo});
@@ -452,7 +480,11 @@ const WalkTestEnv = struct {
 
     fn createJjRepo(self: *const WalkTestEnv, host: []const u8, owner: []const u8, name: []const u8) !void {
         try self.createGitRepo(host, owner, name);
-        const repo = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}/{s}/.jj", .{ self.ghq_root, host, owner, name });
+        const repo = try std.fmt.allocPrint(
+            self.gpa,
+            "{s}/{s}/{s}/{s}/.jj",
+            .{ self.ghq_root, host, owner, name },
+        );
         defer self.gpa.free(repo);
         try Dir.cwd().createDirPath(self.io, repo);
     }
@@ -465,7 +497,11 @@ const WalkTestEnv = struct {
 
     /// Create a Lore-only workspace (`.lore/instance`) at `<ghq>/host/owner/name`.
     fn createLoreWorkspace(self: *const WalkTestEnv, host: []const u8, owner: []const u8, name: []const u8) !void {
-        const lore_dir = try std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}/{s}/.lore", .{ self.ghq_root, host, owner, name });
+        const lore_dir = try std.fmt.allocPrint(
+            self.gpa,
+            "{s}/{s}/{s}/{s}/.lore",
+            .{ self.ghq_root, host, owner, name },
+        );
         defer self.gpa.free(lore_dir);
         try Dir.cwd().createDirPath(self.io, lore_dir);
         const instance = try std.fmt.allocPrint(self.gpa, "{s}/instance", .{lore_dir});
@@ -482,7 +518,7 @@ const WalkTestEnv = struct {
         );
         defer self.gpa.free(git_path);
         // Remove the .git dir placeholder if present, replace with a pointer file.
-        Dir.cwd().deleteTree(self.io, git_path) catch {};
+        deleteTestTree(self.io, git_path);
         const pointer = try std.fmt.allocPrint(
             self.gpa,
             "gitdir: {s}/{s}/{s}/{s}/git\n",
@@ -507,7 +543,13 @@ test "list: empty ghq root yields no entries" {
 test "list: nonexistent ghq root returns empty slice" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const entries = try walk(gpa, io, "/tmp/gitstore_list_absolutely_no_such_root_42", "/tmp/gitstore_list_no_such_store_42", .{});
+    const entries = try walk(
+        gpa,
+        io,
+        "/tmp/gitstore_list_absolutely_no_such_root_42",
+        "/tmp/gitstore_list_no_such_store_42",
+        .{},
+    );
     defer freeEntries(gpa, entries);
     try testing.expectEqual(@as(usize, 0), entries.len);
 }
@@ -746,8 +788,8 @@ fn fuzzWalkerSynthetic(_: void, smith: *std.testing.Smith) anyerror!void {
     const io = testing.io;
 
     const base = "/tmp/gitstore_list_fuzz_root";
-    Dir.cwd().deleteTree(io, base) catch {};
-    defer Dir.cwd().deleteTree(io, base) catch {};
+    deleteTestTree(io, base);
+    defer deleteTestTree(io, base);
     try Dir.cwd().createDirPath(io, base);
 
     const host_count = smith.valueRangeAtMost(u8, 0, 3);
@@ -772,7 +814,11 @@ fn fuzzWalkerSynthetic(_: void, smith: *std.testing.Smith) anyerror!void {
                     else => "gamma",
                 };
                 const owner: []const u8 = if (o == 0) "o1" else "o2";
-                const repo_path = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}/{s}", .{ base, host_name, owner, name });
+                const repo_path = try std.fmt.allocPrint(
+                    gpa,
+                    "{s}/{s}/{s}/{s}",
+                    .{ base, host_name, owner, name },
+                );
                 defer gpa.free(repo_path);
 
                 // Randomly add .git, .jj, both, or neither.
@@ -782,12 +828,12 @@ fn fuzzWalkerSynthetic(_: void, smith: *std.testing.Smith) anyerror!void {
                 if (has_git) {
                     const gitp = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo_path});
                     defer gpa.free(gitp);
-                    Dir.cwd().createDirPath(io, gitp) catch {};
+                    Dir.cwd().createDirPath(io, gitp) catch |err| reportTestFsFailure("create", gitp, err);
                 }
                 if (has_jj_flag) {
                     const jjp = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo_path});
                     defer gpa.free(jjp);
-                    Dir.cwd().createDirPath(io, jjp) catch {};
+                    Dir.cwd().createDirPath(io, jjp) catch |err| reportTestFsFailure("create", jjp, err);
                 }
             }
         }

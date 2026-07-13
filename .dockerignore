@@ -1,0 +1,9 @@
+.git/
+.agents/
+.codex/
+.claude/worktrees/
+.jj/
+.zig-cache/
+coverage/
+node_modules/
+zig-out/
