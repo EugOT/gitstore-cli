@@ -1,16 +1,21 @@
-//! gitstore configuration resolution.
+//! z3store configuration resolution.
 //!
-//! Precedence (per libgitstore v2 plan):
-//!   gitstore.root          -> ghq.root          -> $GITSTORE_ROOT -> $GHQ_ROOT -> ~/ghq
-//!   gitstore.user          -> ghq.user          -> gh-user        -> $USER
-//!   gitstore.defaultHost   -> ghq.defaultHost   -> "github.com"
-//!   gitstore.completeUser  -> ghq.completeUser  -> "true"
-//!   gitstore.adoptOnClone  -> (default "true"; no ghq fallback)
-//!   gitstore.jjColocate    -> (default "true"; no ghq fallback)
+//! `z3store.*` git-config keys (and `$Z3STORE_ROOT`) are the primary source.
+//! `gitstore.*` / `ghq.*` keys and `$GITSTORE_ROOT` / `$GHQ_ROOT` remain as
+//! legacy fallbacks so existing setups keep working.
 //!
-//! `used_legacy_ghq_keys` is set to true when any `gitstore.*` lookup was
-//! unset AND the `ghq.*` fallback produced a real value — a signal for
-//! callers to emit a deprecation hint on stderr.
+//! Precedence:
+//!   root: z3store.root -> gitstore.root -> ghq.root
+//!         -> $Z3STORE_ROOT -> $GITSTORE_ROOT -> $GHQ_ROOT -> ~/ghq
+//!   user: z3store.user -> gitstore.user -> ghq.user -> $USER -> gh-user
+//!   defaultHost:  z3store.defaultHost  -> gitstore.defaultHost  -> ghq.defaultHost  -> "github.com"
+//!   completeUser: z3store.completeUser -> gitstore.completeUser -> ghq.completeUser -> "true"
+//!   adoptOnClone: z3store.adoptOnClone -> gitstore.adoptOnClone -> "true" (no ghq fallback)
+//!   jjColocate:   z3store.jjColocate   -> gitstore.jjColocate   -> "true" (no ghq fallback)
+//!
+//! `used_legacy` is set to true whenever a value was sourced from a legacy
+//! `gitstore.*` / `ghq.*` key or the `$GITSTORE_ROOT` / `$GHQ_ROOT` env vars —
+//! a signal for callers to emit a one-line deprecation hint on stderr.
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,7 +31,7 @@ pub const Config = struct {
     complete_user: bool,
     adopt_on_clone: bool,
     jj_colocate: bool,
-    used_legacy_ghq_keys: bool,
+    used_legacy: bool,
     /// All heap allocations produced while resolving configuration. `deinit`
     /// frees each slice here.
     owned_strings: std.ArrayList([]const u8),
@@ -75,19 +80,16 @@ fn parseBool(s: []const u8) bool {
     return false;
 }
 
-/// Returns a trimmed, heap-allocated copy of the stdout of
-/// `git config --get <key>` if the key is set. Returns `null` if the key is
-/// absent (non-zero exit) or if its value is empty after trimming.
-///
-/// Caller owns returned memory.
-fn gitConfigGet(
+/// Capture git config once and resolve individual keys from the snapshot.
+/// Missing/unreadable config behaves like repeated `git config --get` misses:
+/// it is not fatal, and every key falls through to later precedence tiers.
+fn gitConfigSnapshot(
     gpa: Allocator,
     io: Io,
-    key: []const u8,
     config_file: ?[]const u8,
 ) LoadError!?[]u8 {
-    const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get", key } else undefined;
-    const global_argv = [_][]const u8{ "git", "config", "--global", "--get", key };
+    const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--list" } else undefined;
+    const global_argv = [_][]const u8{ "git", "config", "--global", "--list" };
     const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
     var result = try exec.exec(gpa, io, argv, null);
     defer gpa.free(result.stderr);
@@ -95,15 +97,19 @@ fn gitConfigGet(
         gpa.free(result.stdout);
         return null;
     }
-    const trimmed = exec.trimTrailingNewline(result.stdout);
-    if (trimmed.len == 0) {
-        gpa.free(result.stdout);
-        return null;
+    return result.stdout;
+}
+
+fn snapshotValue(snapshot: ?[]const u8, key: []const u8) ?[]const u8 {
+    const content = snapshot orelse return null;
+    var found: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r");
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..eq], key)) found = line[eq + 1 ..];
     }
-    if (trimmed.len == result.stdout.len) return result.stdout;
-    const owned = try gpa.dupe(u8, trimmed);
-    gpa.free(result.stdout);
-    return owned;
+    return found;
 }
 
 /// Run `gh api user -q .login` to derive the GitHub username. Returns null on
@@ -124,6 +130,7 @@ fn ghUser(gpa: Allocator, io: Io) LoadError!?[]u8 {
         return null;
     }
     if (trimmed.len == result.stdout.len) return result.stdout;
+    errdefer gpa.free(result.stdout);
     const owned = try gpa.dupe(u8, trimmed);
     gpa.free(result.stdout);
     return owned;
@@ -147,12 +154,17 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
 
     var used_legacy = false;
 
-    // --- root ---
     const config_file = env.get("GIT_CONFIG_GLOBAL");
-    const gitstore_root_raw = try gitConfigGet(gpa, io, "gitstore.root", config_file);
-    defer if (gitstore_root_raw) |v| gpa.free(v);
-    const ghq_root_raw = try gitConfigGet(gpa, io, "ghq.root", config_file);
-    defer if (ghq_root_raw) |v| gpa.free(v);
+    const config_snapshot = try gitConfigSnapshot(gpa, io, config_file);
+    defer if (config_snapshot) |s| gpa.free(s);
+
+    // --- root ---
+    // Primary z3store.* / $Z3STORE_ROOT, then legacy gitstore.* / ghq.* and
+    // $GITSTORE_ROOT / $GHQ_ROOT.
+    const z3_root_raw = snapshotValue(config_snapshot, "z3store.root");
+    const gitstore_root_raw = snapshotValue(config_snapshot, "gitstore.root");
+    const ghq_root_raw = snapshotValue(config_snapshot, "ghq.root");
+    const env_z3_root = env.get("Z3STORE_ROOT");
     const env_gitstore_root = env.get("GITSTORE_ROOT");
     const env_ghq_root = env.get("GHQ_ROOT");
     const home_opt = env.get("HOME");
@@ -163,77 +175,94 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
         try gpa.dupe(u8, "ghq");
     try owned_strings.append(gpa, default_root);
 
-    const root_res = resolveRootChain(
+    const root_res = resolveStoreRootChain(
+        z3_root_raw,
         gitstore_root_raw,
         ghq_root_raw,
+        env_z3_root,
         env_gitstore_root,
         env_ghq_root,
         default_root,
     );
-    const root: []const u8 = switch (root_res.source) {
-        .gitstore, .ghq, .env => try ownStatic(&owned_strings, gpa, root_res.value),
-        .default => default_root,
-    };
-    if (root_res.source == .ghq) used_legacy = true;
+    const root: []const u8 = if (root_res.is_default)
+        default_root
+    else
+        try ownStatic(&owned_strings, gpa, root_res.value);
+    if (root_res.legacy) used_legacy = true;
 
     // --- user ---
-    const gitstore_user_raw = try gitConfigGet(gpa, io, "gitstore.user", config_file);
-    defer if (gitstore_user_raw) |v| gpa.free(v);
-    const ghq_user_raw = try gitConfigGet(gpa, io, "ghq.user", config_file);
-    defer if (ghq_user_raw) |v| gpa.free(v);
-    const gh_user_raw = try ghUser(gpa, io);
-    defer if (gh_user_raw) |v| gpa.free(v);
+    const z3_user_raw = snapshotValue(config_snapshot, "z3store.user");
+    const gitstore_user_raw = snapshotValue(config_snapshot, "gitstore.user");
+    const ghq_user_raw = snapshotValue(config_snapshot, "ghq.user");
     const env_user = env.get("USER");
 
     var user: ?[]const u8 = null;
-    if (gitstore_user_raw) |v| {
+    if (nonEmpty(z3_user_raw)) |v| {
         user = try ownStatic(&owned_strings, gpa, v);
-    } else if (ghq_user_raw) |v| {
+    } else if (nonEmpty(gitstore_user_raw)) |v| {
         user = try ownStatic(&owned_strings, gpa, v);
         used_legacy = true;
-    } else if (gh_user_raw) |v| {
+    } else if (nonEmpty(ghq_user_raw)) |v| {
         user = try ownStatic(&owned_strings, gpa, v);
-    } else if (env_user) |v| {
-        if (v.len != 0) user = try ownStatic(&owned_strings, gpa, v);
+        used_legacy = true;
+    } else if (nonEmpty(env_user)) |v| {
+        user = try ownStatic(&owned_strings, gpa, v);
+    } else {
+        const gh_user_raw = try ghUser(gpa, io);
+        defer if (gh_user_raw) |v| gpa.free(v);
+        if (nonEmpty(gh_user_raw)) |v| {
+            user = try ownStatic(&owned_strings, gpa, v);
+        }
     }
 
     // --- defaultHost ---
-    const gitstore_host_raw = try gitConfigGet(gpa, io, "gitstore.defaultHost", config_file);
-    defer if (gitstore_host_raw) |v| gpa.free(v);
-    const ghq_host_raw = try gitConfigGet(gpa, io, "ghq.defaultHost", config_file);
-    defer if (ghq_host_raw) |v| gpa.free(v);
-    const host_res = resolvePrecedence(
-        gitstore_host_raw,
-        ghq_host_raw,
-        null,
+    const default_host = try resolveCfgTriple(
+        gpa,
+        &owned_strings,
+        config_snapshot,
+        "z3store.defaultHost",
+        "gitstore.defaultHost",
+        "ghq.defaultHost",
         "github.com",
+        &used_legacy,
     );
-    const default_host: []const u8 = switch (host_res.source) {
-        .gitstore, .ghq, .env => try ownStatic(&owned_strings, gpa, host_res.value),
-        .default => try ownStatic(&owned_strings, gpa, host_res.value),
-    };
-    if (host_res.source == .ghq) used_legacy = true;
 
     // --- completeUser ---
-    const gitstore_cu_raw = try gitConfigGet(gpa, io, "gitstore.completeUser", config_file);
-    defer if (gitstore_cu_raw) |v| gpa.free(v);
-    const ghq_cu_raw = try gitConfigGet(gpa, io, "ghq.completeUser", config_file);
-    defer if (ghq_cu_raw) |v| gpa.free(v);
-    const cu_res = resolvePrecedence(gitstore_cu_raw, ghq_cu_raw, null, "true");
-    const complete_user = parseBool(cu_res.value);
-    if (cu_res.source == .ghq) used_legacy = true;
+    const cu_val = try resolveCfgTriple(
+        gpa,
+        &owned_strings,
+        config_snapshot,
+        "z3store.completeUser",
+        "gitstore.completeUser",
+        "ghq.completeUser",
+        "true",
+        &used_legacy,
+    );
+    const complete_user = parseBool(cu_val);
 
     // --- adoptOnClone (no ghq fallback) ---
-    const gitstore_aoc_raw = try gitConfigGet(gpa, io, "gitstore.adoptOnClone", config_file);
-    defer if (gitstore_aoc_raw) |v| gpa.free(v);
-    const aoc_res = resolvePrecedence(gitstore_aoc_raw, null, null, "true");
-    const adopt_on_clone = parseBool(aoc_res.value);
+    const aoc_val = try resolveCfgPair(
+        gpa,
+        &owned_strings,
+        config_snapshot,
+        "z3store.adoptOnClone",
+        "gitstore.adoptOnClone",
+        "true",
+        &used_legacy,
+    );
+    const adopt_on_clone = parseBool(aoc_val);
 
     // --- jjColocate (no ghq fallback) ---
-    const gitstore_jj_raw = try gitConfigGet(gpa, io, "gitstore.jjColocate", config_file);
-    defer if (gitstore_jj_raw) |v| gpa.free(v);
-    const jj_res = resolvePrecedence(gitstore_jj_raw, null, null, "true");
-    const jj_colocate = parseBool(jj_res.value);
+    const jj_val = try resolveCfgPair(
+        gpa,
+        &owned_strings,
+        config_snapshot,
+        "z3store.jjColocate",
+        "gitstore.jjColocate",
+        "true",
+        &used_legacy,
+    );
+    const jj_colocate = parseBool(jj_val);
 
     return .{
         .root = root,
@@ -242,9 +271,96 @@ pub fn load(gpa: Allocator, io: Io, env: *std.process.Environ.Map) LoadError!Con
         .complete_user = complete_user,
         .adopt_on_clone = adopt_on_clone,
         .jj_colocate = jj_colocate,
-        .used_legacy_ghq_keys = used_legacy,
+        .used_legacy = used_legacy,
         .owned_strings = owned_strings,
     };
+}
+
+/// Resolve a `z3store.<key>` (primary) / `gitstore.<key>` / `ghq.<key>`
+/// (legacy) git-config triple, falling back to `default_val`. Any legacy hit
+/// flips `used_legacy`. The returned slice is registered in `owned_strings`.
+fn resolveCfgTriple(
+    gpa: Allocator,
+    owned_strings: *std.ArrayList([]const u8),
+    config_snapshot: ?[]const u8,
+    z3_key: []const u8,
+    gitstore_key: []const u8,
+    ghq_key: []const u8,
+    default_val: []const u8,
+    used_legacy: *bool,
+) LoadError![]const u8 {
+    const z3_raw = snapshotValue(config_snapshot, z3_key);
+    const gitstore_raw = snapshotValue(config_snapshot, gitstore_key);
+    const ghq_raw = snapshotValue(config_snapshot, ghq_key);
+
+    if (nonEmpty(z3_raw)) |v| return ownStatic(owned_strings, gpa, v);
+    if (nonEmpty(gitstore_raw)) |v| {
+        used_legacy.* = true;
+        return ownStatic(owned_strings, gpa, v);
+    }
+    if (nonEmpty(ghq_raw)) |v| {
+        used_legacy.* = true;
+        return ownStatic(owned_strings, gpa, v);
+    }
+    return ownStatic(owned_strings, gpa, default_val);
+}
+
+/// Like `resolveCfgTriple` but with no `ghq.*` fallback tier.
+fn resolveCfgPair(
+    gpa: Allocator,
+    owned_strings: *std.ArrayList([]const u8),
+    config_snapshot: ?[]const u8,
+    z3_key: []const u8,
+    gitstore_key: []const u8,
+    default_val: []const u8,
+    used_legacy: *bool,
+) LoadError![]const u8 {
+    const z3_raw = snapshotValue(config_snapshot, z3_key);
+    const gitstore_raw = snapshotValue(config_snapshot, gitstore_key);
+
+    if (nonEmpty(z3_raw)) |v| return ownStatic(owned_strings, gpa, v);
+    if (nonEmpty(gitstore_raw)) |v| {
+        used_legacy.* = true;
+        return ownStatic(owned_strings, gpa, v);
+    }
+    return ownStatic(owned_strings, gpa, default_val);
+}
+
+/// Treat null and empty-string as "unset"; return the value otherwise.
+fn nonEmpty(v: ?[]const u8) ?[]const u8 {
+    if (v) |s| if (s.len != 0) return s;
+    return null;
+}
+
+pub const RootResolution = struct {
+    value: []const u8,
+    /// A legacy source (gitstore.*/ghq.* config or $GITSTORE_ROOT/$GHQ_ROOT)
+    /// produced the value.
+    legacy: bool,
+    /// No source matched; `value` is the baked-in default.
+    is_default: bool,
+};
+
+/// Pure six-source store-root resolver:
+///   z3store.root -> gitstore.root -> ghq.root
+///   -> $Z3STORE_ROOT -> $GITSTORE_ROOT -> $GHQ_ROOT -> default.
+/// Empty strings are treated as unset. The three legacy tiers set `legacy`.
+pub fn resolveStoreRootChain(
+    z3_cfg: ?[]const u8,
+    gitstore_cfg: ?[]const u8,
+    ghq_cfg: ?[]const u8,
+    env_z3: ?[]const u8,
+    env_gitstore: ?[]const u8,
+    env_ghq: ?[]const u8,
+    default_val: []const u8,
+) RootResolution {
+    if (nonEmpty(z3_cfg)) |v| return .{ .value = v, .legacy = false, .is_default = false };
+    if (nonEmpty(gitstore_cfg)) |v| return .{ .value = v, .legacy = true, .is_default = false };
+    if (nonEmpty(ghq_cfg)) |v| return .{ .value = v, .legacy = true, .is_default = false };
+    if (nonEmpty(env_z3)) |v| return .{ .value = v, .legacy = false, .is_default = false };
+    if (nonEmpty(env_gitstore)) |v| return .{ .value = v, .legacy = true, .is_default = false };
+    if (nonEmpty(env_ghq)) |v| return .{ .value = v, .legacy = true, .is_default = false };
+    return .{ .value = default_val, .legacy = false, .is_default = true };
 }
 
 /// Four-way resolver used only for `root` (which has two env fallbacks).
@@ -285,7 +401,32 @@ pub fn resolveRootForUrlWithConfigFile(
     base: Config,
     config_file: ?[]const u8,
 ) LoadError![]u8 {
-    // git config --get-urlmatch <key> <url>
+    // git config --get-urlmatch <key> <url> — z3store.root (primary) first.
+    {
+        const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "z3store.root", url } else undefined;
+        const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "z3store.root", url };
+        const argv: []const []const u8 = if (config_file != null) file_argv[0..] else global_argv[0..];
+        var result = try exec.exec(
+            gpa,
+            io,
+            argv,
+            null,
+        );
+        defer gpa.free(result.stderr);
+        if (result.succeeded()) {
+            const trimmed = exec.trimTrailingNewline(result.stdout);
+            if (trimmed.len != 0) {
+                if (trimmed.len == result.stdout.len) return result.stdout;
+                errdefer gpa.free(result.stdout);
+                const owned = try gpa.dupe(u8, trimmed);
+                gpa.free(result.stdout);
+                return owned;
+            }
+        }
+        gpa.free(result.stdout);
+    }
+
+    // Legacy gitstore.root urlmatch.
     {
         const file_argv = if (config_file) |path| [_][]const u8{ "git", "config", "--file", path, "--get-urlmatch", "gitstore.root", url } else undefined;
         const global_argv = [_][]const u8{ "git", "config", "--global", "--get-urlmatch", "gitstore.root", url };
@@ -301,6 +442,7 @@ pub fn resolveRootForUrlWithConfigFile(
             const trimmed = exec.trimTrailingNewline(result.stdout);
             if (trimmed.len != 0) {
                 if (trimmed.len == result.stdout.len) return result.stdout;
+                errdefer gpa.free(result.stdout);
                 const owned = try gpa.dupe(u8, trimmed);
                 gpa.free(result.stdout);
                 return owned;
@@ -324,6 +466,7 @@ pub fn resolveRootForUrlWithConfigFile(
             const trimmed = exec.trimTrailingNewline(result.stdout);
             if (trimmed.len != 0) {
                 if (trimmed.len == result.stdout.len) return result.stdout;
+                errdefer gpa.free(result.stdout);
                 const owned = try gpa.dupe(u8, trimmed);
                 gpa.free(result.stdout);
                 return owned;
@@ -401,6 +544,44 @@ test "config: resolvePrecedence treats all null as default" {
     const r = resolvePrecedence(null, null, null, "fallback");
     try testing.expectEqualStrings("fallback", r.value);
     try testing.expectEqual(Source.default, r.source);
+}
+
+test "config: resolveStoreRootChain z3 config beats gitstore beats ghq" {
+    const r = resolveStoreRootChain("/z3", "/gs", "/ghq", "/ez3", "/egs", "/eghq", "/def");
+    try testing.expectEqualStrings("/z3", r.value);
+    try testing.expect(!r.legacy);
+    try testing.expect(!r.is_default);
+}
+
+test "config: resolveStoreRootChain gitstore config is legacy" {
+    const r = resolveStoreRootChain(null, "/gs", "/ghq", "/ez3", "/egs", "/eghq", "/def");
+    try testing.expectEqualStrings("/gs", r.value);
+    try testing.expect(r.legacy);
+}
+
+test "config: resolveStoreRootChain ghq config is legacy" {
+    const r = resolveStoreRootChain(null, null, "/ghq", "/ez3", "/egs", "/eghq", "/def");
+    try testing.expectEqualStrings("/ghq", r.value);
+    try testing.expect(r.legacy);
+}
+
+test "config: resolveStoreRootChain $Z3STORE_ROOT beats $GITSTORE_ROOT beats $GHQ_ROOT" {
+    const r = resolveStoreRootChain(null, null, null, "/ez3", "/egs", "/eghq", "/def");
+    try testing.expectEqualStrings("/ez3", r.value);
+    try testing.expect(!r.legacy);
+    const r2 = resolveStoreRootChain(null, null, null, null, "/egs", "/eghq", "/def");
+    try testing.expectEqualStrings("/egs", r2.value);
+    try testing.expect(r2.legacy);
+    const r3 = resolveStoreRootChain(null, null, null, null, null, "/eghq", "/def");
+    try testing.expectEqualStrings("/eghq", r3.value);
+    try testing.expect(r3.legacy);
+}
+
+test "config: resolveStoreRootChain empty strings are unset, default when all empty" {
+    const r = resolveStoreRootChain("", "", "", "", "", "", "/def");
+    try testing.expectEqualStrings("/def", r.value);
+    try testing.expect(!r.legacy);
+    try testing.expect(r.is_default);
 }
 
 test "config: parseBool accepts true/1/yes/on case-insensitively" {

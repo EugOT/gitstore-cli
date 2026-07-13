@@ -1,7 +1,7 @@
 .{
-    .name = .gitstore_cli,
-    .version = "0.1.0",
-    .fingerprint = 0x5c0f51ec08453179,
+    .name = .z3store,
+    .version = "0.3.0",
+    .fingerprint = 0x6eef8a72e071f8b9,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

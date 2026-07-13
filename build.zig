@@ -12,8 +12,8 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&fmt.step);
 
     // Public library module: consumers depend on this and import it as
-    // `@import("gitstore")`.
-    const gitstore_mod = b.addModule("gitstore", .{
+    // `@import("z3store")`.
+    const z3store_mod = b.addModule("z3store", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "gitstore",
+        .name = "zt",
         .root_module = exe_mod,
     });
     b.installArtifact(exe);
@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run gitstore");
+    const run_step = b.step("run", "Run zt");
     run_step.dependOn(&run_cmd.step);
 
     // Unit tests: exec.zig (standalone, fast)
@@ -55,11 +55,29 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
+
+    // The integration suite includes e2e tests that spawn the real `zt`
+    // binary, so it must be built first. `dependOn(&exe.step)` guarantees the
+    // artifact exists before the test binary runs.
+    integration_tests.step.dependOn(&exe.step);
+
+    // Bake the zt binary path into `@import("build_options").zt_bin`.
+    // The emitted-bin path is a LazyPath that is only resolvable after `exe`'s
+    // make() runs, so it CANNOT be eagerly resolved with getPath2() during
+    // build-graph construction (that panics with "misconfigured build script").
+    // `addOptionPath` takes the LazyPath and resolves it lazily inside the
+    // Options step's own make() — writing the absolute path into the generated
+    // options module, where it surfaces as a plain `[]const u8` field. It also
+    // wires the produced dependency edge so the binary is built first.
+    const e2e_opts = b.addOptions();
+    e2e_opts.addOptionPath("zt_bin", exe.getEmittedBin());
+    integration_mod.addOptions("build_options", e2e_opts);
+
     const run_integration = b.addRunArtifact(integration_tests);
 
     // Public module smoke: catches regressions in the package surface that
-    // external consumers import as `@import("gitstore")`.
-    const lib_tests = b.addTest(.{ .root_module = gitstore_mod });
+    // external consumers import as `@import("z3store")`.
+    const lib_tests = b.addTest(.{ .root_module = z3store_mod });
     const run_lib = b.addRunArtifact(lib_tests);
 
     const test_step = b.step("test", "Run all tests");

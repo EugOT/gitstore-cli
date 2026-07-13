@@ -29,6 +29,20 @@ import {
 } from "./lib/zig.ts";
 
 const TIER = "release" as const;
+const MACHO_64_LE_MAGIC = 0xfeedfacf;
+const LC_SYMTAB = 0x2;
+const LC_UUID = 0x1b;
+const LC_CODE_SIGNATURE = 0x1d;
+const MACHO_64_HEADER_SIZE = 32;
+const LOAD_COMMAND_HEADER_SIZE = 8;
+const UUID_SIZE = 16;
+const SYMTAB_COMMAND_SIZE = 24;
+const LINKEDIT_DATA_COMMAND_SIZE = 16;
+const NLIST_64_SIZE = 16;
+const NLIST_TYPE_OFFSET = 4;
+const NLIST_VALUE_OFFSET = 8;
+const N_OSO = 0x66;
+const ZIG_CACHE_OBJECT_PREFIX = new TextEncoder().encode(".zig-cache/o/");
 
 async function finish(code: number, startedAt: number): Promise<never> {
 	const durationMs = Date.now() - startedAt;
@@ -52,6 +66,103 @@ function hasBuildStep(step: string): boolean {
 async function cleanArtifacts(root: string): Promise<void> {
 	await rm(resolve(root, ".zig-cache"), { recursive: true, force: true });
 	await rm(resolve(root, "zig-out"), { recursive: true, force: true });
+}
+
+function isHexByte(b: number): boolean {
+	return (
+		(b >= 0x30 && b <= 0x39) ||
+		(b >= 0x61 && b <= 0x66) ||
+		(b >= 0x41 && b <= 0x46)
+	);
+}
+
+function matchesAt(
+	bytes: Uint8Array,
+	offset: number,
+	needle: Uint8Array,
+): boolean {
+	if (offset + needle.byteLength > bytes.byteLength) return false;
+	for (let i = 0; i < needle.byteLength; i++) {
+		if (bytes[offset + i] !== needle[i]) return false;
+	}
+	return true;
+}
+
+function canonicalizeZigCacheObjectPaths(bytes: Uint8Array): void {
+	for (let i = 0; i < bytes.byteLength; i++) {
+		if (!matchesAt(bytes, i, ZIG_CACHE_OBJECT_PREFIX)) continue;
+		let j = i + ZIG_CACHE_OBJECT_PREFIX.byteLength;
+		const start = j;
+		while (j < bytes.byteLength && isHexByte(bytes[j])) j++;
+		if (j === start || j >= bytes.byteLength || bytes[j] !== 0x2f) continue;
+		for (let k = start; k < j; k++) bytes[k] = 0x30; // keep path length stable
+		i = j;
+	}
+}
+
+function canonicalizeMachOLoadCommands(bytes: Uint8Array): boolean {
+	if (bytes.byteLength < MACHO_64_HEADER_SIZE) return false;
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (view.getUint32(0, true) !== MACHO_64_LE_MAGIC) return false;
+
+	const ncmds = view.getUint32(16, true);
+	const sizeofcmds = view.getUint32(20, true);
+	const commandEnd = MACHO_64_HEADER_SIZE + sizeofcmds;
+	if (commandEnd > bytes.byteLength) return false;
+	let off = MACHO_64_HEADER_SIZE;
+	for (let i = 0; i < ncmds; i++) {
+		if (off + LOAD_COMMAND_HEADER_SIZE > commandEnd) return false;
+		const cmd = view.getUint32(off, true);
+		const cmdSize = view.getUint32(off + 4, true);
+		if (cmdSize < LOAD_COMMAND_HEADER_SIZE || off + cmdSize > commandEnd) {
+			return false;
+		}
+		if (cmd === LC_UUID) {
+			if (cmdSize < LOAD_COMMAND_HEADER_SIZE + UUID_SIZE) return false;
+			bytes.fill(
+				0,
+				off + LOAD_COMMAND_HEADER_SIZE,
+				off + LOAD_COMMAND_HEADER_SIZE + UUID_SIZE,
+			);
+		} else if (cmd === LC_SYMTAB) {
+			if (cmdSize < SYMTAB_COMMAND_SIZE) return false;
+			const symOff = view.getUint32(off + 8, true);
+			const nSyms = view.getUint32(off + 12, true);
+			const symBytes = nSyms * NLIST_64_SIZE;
+			if (symOff + symBytes > bytes.byteLength) return false;
+			for (let sym = 0; sym < nSyms; sym++) {
+				const entryOff = symOff + sym * NLIST_64_SIZE;
+				if (bytes[entryOff + NLIST_TYPE_OFFSET] !== N_OSO) continue;
+				bytes.fill(
+					0,
+					entryOff + NLIST_VALUE_OFFSET,
+					entryOff + NLIST_VALUE_OFFSET + 8,
+				);
+			}
+		} else if (cmd === LC_CODE_SIGNATURE) {
+			if (cmdSize < LINKEDIT_DATA_COMMAND_SIZE) return false;
+			const dataOff = view.getUint32(off + 8, true);
+			const dataSize = view.getUint32(off + 12, true);
+			if (dataOff + dataSize > bytes.byteLength) return false;
+			bytes.fill(0, dataOff, dataOff + dataSize);
+		}
+		off += cmdSize;
+	}
+	return off === commandEnd;
+}
+
+export function canonicalizeReleaseArtifactBytes(
+	bytes: Uint8Array,
+): Uint8Array {
+	const out = new Uint8Array(bytes);
+	if (!canonicalizeMachOLoadCommands(out)) return new Uint8Array(bytes);
+	// Darwin Mach-O links legitimately vary by LC_UUID and by embedded
+	// `.zig-cache/o/<hash>/...` object paths. The corresponding N_OSO
+	// timestamp and ad-hoc code-signature blob also vary with those bytes.
+	// Keep other linker data in the framed hash so release drift outside
+	// those fields remains visible.
+	canonicalizeZigCacheObjectPaths(out);
+	return out;
 }
 
 /**
@@ -94,7 +205,9 @@ export async function hashDir(dir: string): Promise<string> {
 	const NUL = new Uint8Array([0]);
 	const enc = new TextEncoder();
 	for (const f of files) {
-		const bytes = new Uint8Array(await Bun.file(f).arrayBuffer());
+		const bytes = canonicalizeReleaseArtifactBytes(
+			new Uint8Array(await Bun.file(f).arrayBuffer()),
+		);
 		// path \0 size \0 bytes  → length-prefixed framing per file.
 		// Use path.relative + forward-slash normalisation so the digest is
 		// stable across platforms (manual `startsWith("${dir}/")` slicing

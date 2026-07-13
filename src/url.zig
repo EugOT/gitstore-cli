@@ -1,11 +1,10 @@
-//! URL parsing for gitstore — matches ghq v1.8.0 shape handling.
+//! URL parsing for z3store — matches ghq v1.8.0 shape handling.
 //!
 //! Pure module: no I/O, no env, no threads. All slices in the returned
 //! `RepoSpec` are owned by the allocator passed to `parse()` and must be
 //! released via `RepoSpec.deinit()`.
 //!
-//! See `/Users/etretiakov/.claude/plans/libgitstore-v2.md` for the URL
-//! shapes this module handles and their canonical storage layout.
+//! This module handles supported URL shapes and their canonical storage layout.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -72,7 +71,7 @@ pub const RepoSpec = struct {
     /// The transport scheme is preserved:
     ///   * `https`/`http` → `"<scheme>://[userinfo@]<git-host>[:port]/<owner>/<name>.git"`
     ///   * `git`          → `"git://[userinfo@]<git-host>[:port]/<owner>/<name>.git"`
-    ///   * `ssh`          → scp form when possible; `ssh://` form when a port must be preserved
+    ///   * `ssh`          → preserve userless `ssh://`; otherwise scp form when possible
     ///   * `file`         → a dupe of `orig_url` (no host to rewrite)
     ///
     /// Caller owns the returned slice.
@@ -127,7 +126,18 @@ fn cloneSshUrl(
     owner: []const u8,
     name: []const u8,
 ) CloneUrlError![]u8 {
-    const user = if (auth.userinfo.len > 0) auth.userinfo else "git";
+    if (auth.userinfo.len == 0) {
+        if (auth.port.len > 0) {
+            return std.fmt.allocPrint(gpa, "ssh://{s}:{s}/{s}/{s}.git", .{
+                host, auth.port, owner, name,
+            });
+        }
+        return std.fmt.allocPrint(gpa, "ssh://{s}/{s}/{s}.git", .{
+            host, owner, name,
+        });
+    }
+
+    const user = auth.userinfo;
     // scp form (`user@host:path`) cannot represent a port, and its single
     // userinfo field is ambiguous once it contains a ':'. Fall back to the
     // hierarchical `ssh://` form whenever either is present.
@@ -193,7 +203,7 @@ pub fn cloneHost(web_host: []const u8) []const u8 {
     return web_host;
 }
 
-/// Parse any of the shapes documented in libgitstore-v2.md into a
+/// Parse any supported z3store repository reference shape into a
 /// `RepoSpec`. The returned struct owns its strings via `gpa`.
 ///
 /// Case is preserved (no lowercasing). A trailing `/` on the input is
@@ -824,6 +834,24 @@ test "url: cloneUrl ssh:// URL emits scp-form with override" {
     const u = try spec.cloneUrl(gpa);
     defer gpa.free(u);
     try testing.expectEqualStrings("git@git.sourcecraft.dev:owner/repo.git", u);
+}
+
+test "url: cloneUrl preserves userless ssh URL form" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "ssh://example.internal/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("ssh://example.internal/owner/repo.git", u);
+}
+
+test "url: cloneUrl userless ssh URL still rewrites host override" {
+    const gpa = testing.allocator;
+    var spec = try parse(gpa, "ssh://sourcecraft.dev/owner/repo", .{});
+    defer spec.deinit(gpa);
+    const u = try spec.cloneUrl(gpa);
+    defer gpa.free(u);
+    try testing.expectEqualStrings("ssh://git.sourcecraft.dev/owner/repo.git", u);
 }
 
 test "url: cloneUrl ssh:// URL preserves userinfo and explicit port with override" {

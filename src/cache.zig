@@ -1,6 +1,6 @@
 //! Per-root repository metadata cache.
 //!
-//! Stores a JSON index at `<gitstore_root>/.gitstore/cache/index.json`.
+//! Stores a JSON index at `<gitstore_root>/.z3store/cache/index.json`.
 //! Writes are atomic (temp-file + fsync + rename). The diff helper is pure and
 //! deterministic so list-walker can test it with `Io.failing`.
 //!
@@ -107,7 +107,7 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-/// Open (or initialize empty) the on-disk cache for a given gitstore root.
+/// Open (or initialize empty) the on-disk cache for a given store root.
 /// Never panics; a missing file returns an empty map. A corrupt file returns
 /// an empty map (callers will rebuild).
 ///
@@ -125,8 +125,15 @@ pub fn load(
     defer gpa.free(index_path);
 
     const bytes = Dir.cwd().readFileAlloc(io, index_path, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return map,
-        else => return map, // any other read error: return empty; callers rebuild
+        error.FileNotFound => blk: {
+            const legacy_index_path = try legacyIndexPath(gpa, gitstore_root);
+            defer gpa.free(legacy_index_path);
+            break :blk Dir.cwd().readFileAlloc(io, legacy_index_path, gpa, .unlimited) catch |legacy_err| switch (legacy_err) {
+                error.FileNotFound => return map,
+                else => return legacy_err,
+            };
+        },
+        else => return err,
     };
     defer gpa.free(bytes);
 
@@ -179,7 +186,7 @@ pub fn load(
 }
 
 /// Serialize the cache and write it atomically. The procedure:
-///   1. Ensure `<gitstore_root>/.gitstore/cache/` exists.
+///   1. Ensure `<gitstore_root>/.z3store/cache/` exists.
 ///   2. Write to `index.json.tmp`.
 ///   3. `rename()` over `index.json`.
 ///
@@ -256,13 +263,22 @@ fn cacheDir(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
     while (trimmed.len > 1 and trimmed[trimmed.len - 1] == '/') {
         trimmed = trimmed[0 .. trimmed.len - 1];
     }
-    return std.fmt.allocPrint(gpa, "{s}/.gitstore/cache", .{trimmed});
+    // a stale legacy `.gitstore/cache` left behind is harmless.
+    return std.fmt.allocPrint(gpa, "{s}/.z3store/cache", .{trimmed});
 }
 
 fn indexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
     const dir = try cacheDir(gpa, gitstore_root);
     defer gpa.free(dir);
     return std.fmt.allocPrint(gpa, "{s}/index.json", .{dir});
+}
+
+fn legacyIndexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
+    var trimmed = gitstore_root;
+    while (trimmed.len > 1 and trimmed[trimmed.len - 1] == '/') {
+        trimmed = trimmed[0 .. trimmed.len - 1];
+    }
+    return std.fmt.allocPrint(gpa, "{s}/.gitstore/cache/index.json", .{trimmed});
 }
 
 // =========================================================
@@ -385,7 +401,7 @@ test "cache: save + load roundtrip preserves entries" {
     try save(gpa, io, root, &src);
 
     // Assert the final file exists (rename target).
-    const final_path = "/tmp/gitstore_cache_roundtrip_test/.gitstore/cache/index.json";
+    const final_path = "/tmp/gitstore_cache_roundtrip_test/.z3store/cache/index.json";
     _ = try Dir.cwd().statFile(io, final_path, .{});
     // Temp file must be gone after rename.
     try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, final_path ++ ".tmp", .{}));
@@ -405,15 +421,71 @@ test "cache: save + load roundtrip preserves entries" {
     try testing.expect(b.last_fetched_unix == null);
 }
 
+test "cache: load falls back to legacy gitstore cache index" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const root = "/tmp/gitstore_cache_legacy_test";
+    Dir.cwd().deleteTree(io, root) catch {};
+    defer Dir.cwd().deleteTree(io, root) catch {};
+    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_legacy_test/.gitstore/cache");
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/gitstore_cache_legacy_test/.gitstore/cache/index.json",
+        .data =
+        \\{"version":1,"entries":[{"rel_path":"github.com/a/b","url":"https://github.com/a/b","head_sha":"abc123","last_fetched_unix":1700000000}]}
+        ,
+    });
+
+    var loaded = try load(gpa, io, root);
+    defer freeMap(gpa, &loaded);
+
+    try testing.expectEqual(@as(u32, 1), loaded.count());
+    const entry = loaded.get("github.com/a/b") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("https://github.com/a/b", entry.url.?);
+    try testing.expectEqualStrings("abc123", entry.head_sha.?);
+    try testing.expectEqual(@as(i64, 1_700_000_000), entry.last_fetched_unix.?);
+}
+
+test "cache: load prefers z3store cache index over stale legacy index" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const root = "/tmp/gitstore_cache_prefer_z3store_test";
+    Dir.cwd().deleteTree(io, root) catch {};
+    defer Dir.cwd().deleteTree(io, root) catch {};
+    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_prefer_z3store_test/.z3store/cache");
+    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_prefer_z3store_test/.gitstore/cache");
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/gitstore_cache_prefer_z3store_test/.z3store/cache/index.json",
+        .data =
+        \\{"version":1,"entries":[{"rel_path":"github.com/current/repo","url":"https://github.com/current/repo","head_sha":"z3abc","last_fetched_unix":1700000001}]}
+        ,
+    });
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/gitstore_cache_prefer_z3store_test/.gitstore/cache/index.json",
+        .data =
+        \\{"version":1,"entries":[{"rel_path":"github.com/stale/repo","url":"https://github.com/stale/repo","head_sha":"oldabc","last_fetched_unix":1}]}
+        ,
+    });
+
+    var loaded = try load(gpa, io, root);
+    defer freeMap(gpa, &loaded);
+
+    try testing.expectEqual(@as(u32, 1), loaded.count());
+    try testing.expect(loaded.get("github.com/stale/repo") == null);
+    const entry = loaded.get("github.com/current/repo") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("https://github.com/current/repo", entry.url.?);
+    try testing.expectEqualStrings("z3abc", entry.head_sha.?);
+    try testing.expectEqual(@as(i64, 1_700_000_001), entry.last_fetched_unix.?);
+}
+
 test "cache: load on corrupt json returns empty map" {
     const gpa = testing.allocator;
     const io = testing.io;
     const root = "/tmp/gitstore_cache_corrupt_test";
     Dir.cwd().deleteTree(io, root) catch {};
     defer Dir.cwd().deleteTree(io, root) catch {};
-    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_corrupt_test/.gitstore/cache");
+    try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_corrupt_test/.z3store/cache");
     try Dir.cwd().writeFile(io, .{
-        .sub_path = "/tmp/gitstore_cache_corrupt_test/.gitstore/cache/index.json",
+        .sub_path = "/tmp/gitstore_cache_corrupt_test/.z3store/cache/index.json",
         .data = "{not valid json",
     });
 
