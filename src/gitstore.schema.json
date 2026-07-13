@@ -1,0 +1,115 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/EugOT/gitstore-cli/schema/gitstore.schema.json",
+  "title": "gitstore.toml",
+  "type": "object",
+  "required": [
+    "version",
+    "codestore",
+    "gitstore",
+    "toolstore",
+    "cachestore"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "codestore": {
+      "$ref": "#/definitions/store"
+    },
+    "gitstore": {
+      "$ref": "#/definitions/store"
+    },
+    "toolstore": {
+      "$ref": "#/definitions/store"
+    },
+    "cachestore": {
+      "$ref": "#/definitions/store"
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "package_managers": {
+          "type": "object",
+          "properties": {
+            "node": {
+              "enum": [
+                "vite-plus-bun"
+              ],
+              "description": "Node projects are managed by vite-plus using Bun by default."
+            },
+            "node_exceptions": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "pnpm"
+                ]
+              },
+              "description": "Rare explicit Node package-manager exceptions."
+            },
+            "python": {
+              "enum": [
+                "pixi"
+              ],
+              "description": "Python projects are managed only by pixi."
+            },
+            "r": {
+              "enum": [
+                "pixi"
+              ],
+              "description": "R projects are managed only by pixi."
+            },
+            "default": {
+              "enum": [
+                "mise"
+              ],
+              "description": "Default manager for other tool/runtime state."
+            }
+          },
+          "description": "Allowed package-manager policy: Node through vite-plus/Bun with rare pnpm exceptions, R/Python through pixi, and all other tools through mise."
+        },
+        "workflows": {
+          "type": "object",
+          "properties": {
+            "supported": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "snakemake",
+                  "make",
+                  "cmake",
+                  "helm",
+                  "kubernetes"
+                ]
+              },
+              "description": "Workflow and infrastructure systems that may declare generated state."
+            },
+            "gitops": {
+              "enum": [
+                true
+              ],
+              "description": "Workflow and infrastructure desired state must remain declarative and GitOps-oriented."
+            }
+          },
+          "description": "Supported workflow systems with GitOps defaults."
+        }
+      },
+      "description": "Strict default policy for generated tool and workflow state. Values are intentionally narrow and may only use the enumerated defaults unless a future schema version expands them."
+    }
+  },
+  "definitions": {
+    "store": {
+      "type": "object",
+      "required": [
+        "root"
+      ],
+      "properties": {
+        "root": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
