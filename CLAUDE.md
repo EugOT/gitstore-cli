@@ -91,3 +91,39 @@ ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=<path/to/gitstore-cli> chezmoi apply
 
 @doc/ARCHITECTURE.md
 @doc/TIGER_STYLE_ZIG.md
+
+## Cursor Cloud specific instructions
+
+Durable notes for cloud agents. The startup update script already
+installs the toolchain (mise + Zig 0.16.0, Bun, and `jj`) and runs
+`bun install`; do not re-document dependency installation here. Standard
+build/test/lint commands live in `README.md` — use those.
+
+- **Toolchain resolution.** `zig` (0.16.0, pinned in `.mise.toml`) and
+  `jj` are provided by `mise`; `bun` lives in `~/.bun/bin`. `mise` is
+  activated from `~/.bashrc`, so `zig`, `jj`, and `bun` are on `PATH`
+  in a login shell. In a bare/non-login shell they may be absent — run
+  `eval "$(mise activate bash)"`, or invoke Zig explicitly as
+  `mise x zig@0.16.0 -- zig ...` (the `scripts/verify-*.ts` gates already
+  resolve Zig this way; never trust a bare-PATH `zig`).
+- **`jj` (jujutsu) is required for the test suite.** The integration
+  tests in `src/tests.zig` spawn both `git` and `jj git init --colocate`.
+  `git` is preinstalled; `jj` is installed by the update script. Without
+  `jj`, several e2e tests fail rather than skip.
+- **Reading `zig build test` output.** The suite deliberately exercises
+  error/rollback paths, so it prints many `error:`/`FAIL:`/`warn:` lines
+  and a trailing `failed command: .../test ...` line on stderr. These are
+  expected test output, not a build failure. Trust the `Build Summary:
+  N/N steps succeeded; …` line and the process exit code (0 = pass).
+- **`ghq` is an optional runtime dependency, not part of dev setup.**
+  The `zt` subcommands `verify --all` and `get` shell out to the external
+  `ghq` binary (`ghq root`); it is not installed, so those paths error
+  with `FileNotFound`/`ProcessFailed`. The newer subcommands (`create`,
+  `list`, `root`, `status`, and single-path `verify <path>`) fall back to
+  `$HOME/ghq` and work without `ghq`. Prefer those when exercising the CLI.
+- **Store-root resolution.** `zt` resolves its root via git config
+  `z3store.root` → `$Z3STORE_ROOT` → `$GITSTORE_ROOT` → `$GHQ_ROOT` →
+  `~/ghq`. Using the legacy `$GITSTORE_ROOT`/`$GHQ_ROOT` vars prints a
+  non-fatal "prefer z3store.* / Z3STORE_ROOT" warning.
+- **Runtime artifacts.** The hooks/gates write to `.claude/logs/*.jsonl`
+  at runtime; leave these untracked (do not commit them).
