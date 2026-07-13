@@ -16,6 +16,7 @@ pub const config = @import("config.zig");
 pub const list = @import("list.zig");
 pub const cache = @import("cache.zig");
 pub const clone = @import("clone.zig");
+pub const stores = @import("stores.zig");
 pub const exec = @import("exec.zig");
 pub const log = @import("log.zig");
 pub const hooks = @import("hooks.zig");

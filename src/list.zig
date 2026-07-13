@@ -321,9 +321,14 @@ fn looksLikeHost(s: []const u8) bool {
 
 /// Render one line per entry, newline-terminated. Caller owns the buffer.
 pub fn renderPlain(gpa: Allocator, entries: []const RepoEntry, full_path: bool) ![]u8 {
+    return renderPlainFiltered(gpa, entries, full_path, false);
+}
+
+pub fn renderPlainFiltered(gpa: Allocator, entries: []const RepoEntry, full_path: bool, unmanaged_only: bool) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     for (entries) |e| {
+        if (unmanaged_only and e.is_adopted) continue;
         const line = if (full_path) e.abs_path else e.rel_path;
         try aw.writer.writeAll(line);
         try aw.writer.writeByte('\n');
@@ -333,6 +338,10 @@ pub fn renderPlain(gpa: Allocator, entries: []const RepoEntry, full_path: bool) 
 
 /// Render the entries as a pretty-printed JSON array. Caller owns the buffer.
 pub fn renderJson(gpa: Allocator, entries: []const RepoEntry) ![]u8 {
+    return renderJsonFiltered(gpa, entries, false);
+}
+
+pub fn renderJsonFiltered(gpa: Allocator, entries: []const RepoEntry, unmanaged_only: bool) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
 
@@ -342,6 +351,7 @@ pub fn renderJson(gpa: Allocator, entries: []const RepoEntry) ![]u8 {
     };
     try s.beginArray();
     for (entries) |e| {
+        if (unmanaged_only and e.is_adopted) continue;
         try s.beginObject();
         try s.objectField("rel_path");
         try s.write(e.rel_path);

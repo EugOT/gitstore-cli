@@ -10,6 +10,7 @@ const url_mod = @import("url.zig");
 const config_mod = @import("config.zig");
 const clone_mod = @import("clone.zig");
 const list_mod = @import("list.zig");
+const stores_mod = @import("stores.zig");
 
 const usage_text =
     \\Usage: gitstore <command> [options]
@@ -17,9 +18,11 @@ const usage_text =
     \\Commands:
     \\  get [-u] [-P N] [--no-adopt] [--shallow] [-b BRANCH] <url>...
     \\                    Clone one or more repos via libgitstore
-    \\  list [--full-path] [--json] [--with-head] [<pattern>]
+    \\  list [--full-path] [--json] [--with-head] [--unmanaged] [<pattern>]
     \\                    List adopted/unadopted repos under ghq root
-    \\  root [--all]      Print configured ghq/gitstore root
+    \\  root [codestore|gitstore|toolstore|cachestore]
+    \\                    Print configured store root
+    \\  schema export     Print gitstore.toml JSON Schema
     \\  rm [--dry-run] <repo>
     \\                    Remove a repo (detaches adopted pointer first)
     \\  create [--vcs git|jj] <host/owner/name>
@@ -52,6 +55,10 @@ const usage_text =
 fn getGitstoreRoot(gpa: Allocator, environ_map: *const std.process.Environ.Map) ![]u8 {
     const home = environ_map.get("HOME") orelse return error.InvalidUserId;
     return std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home});
+}
+
+fn getStoreConfig(gpa: Allocator, io: Io, environ_map: *const std.process.Environ.Map) !stores_mod.StoreConfig {
+    return stores_mod.load(gpa, io, environ_map);
 }
 
 fn getGhqRoot(gpa: Allocator, io: Io) ![]u8 {
@@ -102,23 +109,37 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "init")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
+        var stores = try getStoreConfig(gpa, io, init.environ_map);
+        defer stores.deinit(gpa);
 
         // init with a path: create git+jj repo and adopt in one shot
         const path_arg = args_iter.next();
         if (path_arg) |p| {
-            const ghq_root = try getGhqRoot(gpa, io);
-            defer gpa.free(ghq_root);
-            try gitstore.initRepo(gpa, io, p, ghq_root, gitstore_root);
+            try gitstore.initRepo(gpa, io, p, stores.codestore_root, stores.gitstore_root);
         } else {
-            // No path: just ensure gitstore root directory exists
-            try gitstore.init(io, gitstore_root);
+            const created_config = try stores_mod.ensureInitialized(gpa, io, stores);
             var buf: [4096]u8 = undefined;
             var w = File.stdout().writerStreaming(io, &buf);
-            try w.interface.print("gitstore initialized at {s}\n", .{gitstore_root});
+            try w.interface.print("codestore: {s}\n", .{stores.codestore_root});
+            try w.interface.print("gitstore: {s}\n", .{stores.gitstore_root});
+            try w.interface.print("toolstore: {s}\n", .{stores.toolstore_root});
+            try w.interface.print("cachestore: {s}\n", .{stores.cachestore_root});
+            try w.interface.print("{s}: {s}\n", .{ if (created_config) "created config" else "using config", stores.config_path });
             try w.flush();
         }
+        return 0;
+    }
+
+    if (std.mem.eql(u8, command, "schema")) {
+        const sub = args_iter.next() orelse {
+            try printErr(io, "error: schema requires export\n");
+            return 2;
+        };
+        if (!std.mem.eql(u8, sub, "export")) {
+            try printErr(io, "error: schema requires export\n");
+            return 2;
+        }
+        try printOut(io, stores_mod.schema_json);
         return 0;
     }
 
@@ -141,12 +162,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "adopt")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
+        var stores = try getStoreConfig(gpa, io, init.environ_map);
+        defer stores.deinit(gpa);
 
-        try gitstore.init(io, gitstore_root);
+        try gitstore.init(io, stores.gitstore_root);
 
         var dry_run = false;
         var all = false;
@@ -155,7 +174,7 @@ pub fn main(init: std.process.Init) !u8 {
         while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--dry-run")) {
                 dry_run = true;
-            } else if (std.mem.eql(u8, arg, "--all")) {
+            } else if (std.mem.eql(u8, arg, "--all") or std.mem.eql(u8, arg, "--unmanaged")) {
                 all = true;
             } else if (arg[0] != '-') {
                 path = arg;
@@ -163,21 +182,19 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         if (all) {
-            try gitstore.adoptAll(gpa, io, ghq_root, gitstore_root, dry_run);
+            try gitstore.adoptAll(gpa, io, stores.codestore_root, stores.gitstore_root, dry_run);
         } else if (path) |p| {
-            try gitstore.adopt(gpa, io, p, ghq_root, gitstore_root, dry_run);
+            try gitstore.adopt(gpa, io, p, stores.codestore_root, stores.gitstore_root, dry_run);
         } else {
-            try printErr(io, "error: adopt requires <path> or --all\n");
+            try printErr(io, "error: adopt requires <path>, --all, or --unmanaged\n");
             return 2;
         }
         return 0;
     }
 
     if (std.mem.eql(u8, command, "verify")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
+        var stores = try getStoreConfig(gpa, io, init.environ_map);
+        defer stores.deinit(gpa);
 
         var all = false;
         var path: ?[]const u8 = null;
@@ -191,7 +208,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         if (all) {
-            try gitstore.verifyAll(gpa, io, ghq_root, gitstore_root);
+            try gitstore.verifyAll(gpa, io, stores.codestore_root, stores.gitstore_root);
         } else if (path) |p| {
             const ok = try gitstore.verify(gpa, io, p);
             if (!ok) {
@@ -205,10 +222,8 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "detach")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
+        var stores = try getStoreConfig(gpa, io, init.environ_map);
+        defer stores.deinit(gpa);
 
         var dry_run = false;
         var all = false;
@@ -227,9 +242,9 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         if (all) {
-            try gitstore.detachAll(gpa, io, ghq_root, gitstore_root, dry_run, keep_backup);
+            try gitstore.detachAll(gpa, io, stores.codestore_root, stores.gitstore_root, dry_run, keep_backup);
         } else if (path) |p| {
-            try gitstore.detach(gpa, io, p, ghq_root, gitstore_root, dry_run, keep_backup);
+            try gitstore.detach(gpa, io, p, stores.codestore_root, stores.gitstore_root, dry_run, keep_backup);
         } else {
             try printErr(io, "error: detach requires <path> or --all\n");
             return 2;
@@ -238,10 +253,8 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "status")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
+        var stores = try getStoreConfig(gpa, io, init.environ_map);
+        defer stores.deinit(gpa);
 
         var json_mode = false;
         while (args_iter.next()) |arg| {
@@ -250,15 +263,13 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
-        try gitstore.status(gpa, io, ghq_root, gitstore_root, json_mode);
+        try gitstore.status(gpa, io, stores.codestore_root, stores.gitstore_root, json_mode);
         return 0;
     }
 
     if (std.mem.eql(u8, command, "sync")) {
-        const gitstore_root = try getGitstoreRoot(gpa, init.environ_map);
-        defer gpa.free(gitstore_root);
-        const ghq_root = try getGhqRoot(gpa, io);
-        defer gpa.free(ghq_root);
+        var stores = try getStoreConfig(gpa, io, init.environ_map);
+        defer stores.deinit(gpa);
 
         var dry_run = false;
         var remote: ?[]const u8 = null;
@@ -271,7 +282,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         if (remote) |r| {
-            try gitstore.sync(gpa, io, ghq_root, gitstore_root, r, dry_run);
+            try gitstore.sync(gpa, io, stores.codestore_root, stores.gitstore_root, r, dry_run);
         } else {
             try printErr(io, "error: sync requires <remote>, e.g. 'gdrive:ghq'\n");
             return 2;
@@ -381,10 +392,9 @@ fn cmdGet(
         );
     }
 
-    // Resolve gitstore root (for adoption side effect).
-    const gitstore_root = try getGitstoreRoot(gpa, environ_map);
-    defer gpa.free(gitstore_root);
-    try gitstore.init(io, gitstore_root);
+    var stores = try getStoreConfig(gpa, io, environ_map);
+    defer stores.deinit(gpa);
+    try gitstore.init(io, stores.gitstore_root);
 
     // Parse URLs into specs.
     var specs: std.ArrayList(url_mod.RepoSpec) = .empty;
@@ -413,8 +423,8 @@ fn cmdGet(
         gpa,
         io,
         specs.items,
-        cfg.root,
-        gitstore_root,
+        stores.codestore_root,
+        stores.gitstore_root,
         opts,
     ) catch |err| {
         var buf: [512]u8 = undefined;
@@ -460,6 +470,7 @@ fn cmdList(
     var full_path = false;
     var json_mode = false;
     var with_head = false;
+    var unmanaged_only = false;
     var pattern: ?[]const u8 = null;
 
     while (args_iter.next()) |arg| {
@@ -469,10 +480,12 @@ fn cmdList(
             json_mode = true;
         } else if (std.mem.eql(u8, arg, "--with-head")) {
             with_head = true;
+        } else if (std.mem.eql(u8, arg, "--unmanaged")) {
+            unmanaged_only = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printOut(
                 io,
-                "Usage: gitstore list [--full-path] [--json] [--with-head] [<pattern>]",
+                "Usage: gitstore list [--full-path] [--json] [--with-head] [--unmanaged] [<pattern>]",
             );
             return 0;
         } else if (arg.len == 0 or arg[0] == '-') {
@@ -483,12 +496,10 @@ fn cmdList(
         }
     }
 
-    const gitstore_root = try getGitstoreRoot(gpa, environ_map);
-    defer gpa.free(gitstore_root);
-    const ghq_root = try resolveGhqRootOrHome(gpa, io, environ_map);
-    defer gpa.free(ghq_root);
+    var stores = try getStoreConfig(gpa, io, environ_map);
+    defer stores.deinit(gpa);
 
-    const entries = try list_mod.walk(gpa, io, ghq_root, gitstore_root, .{
+    const entries = try list_mod.walk(gpa, io, stores.codestore_root, stores.gitstore_root, .{
         .pattern = pattern,
         .include_worktrees = true,
         .include_head = with_head,
@@ -496,9 +507,9 @@ fn cmdList(
     defer list_mod.freeEntries(gpa, entries);
 
     const text = if (json_mode)
-        try list_mod.renderJson(gpa, entries)
+        try list_mod.renderJsonFiltered(gpa, entries, unmanaged_only)
     else
-        try list_mod.renderPlain(gpa, entries, full_path);
+        try list_mod.renderPlainFiltered(gpa, entries, full_path, unmanaged_only);
     defer gpa.free(text);
 
     var buf: [8192]u8 = undefined;
@@ -519,30 +530,25 @@ fn cmdRoot(
     environ_map: *std.process.Environ.Map,
     args_iter: *std.process.Args.Iterator,
 ) !u8 {
-    // `--all` is accepted for ghq parity but behaves as the single-root
-    // case in v1; per-URL overrides are future work.
+    var store_name: stores_mod.StoreName = .codestore;
     while (args_iter.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--all")) {
-            // Multi-root enumeration is a v1 subset — no-op for now.
-            continue;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try printOut(io, "Usage: gitstore root [--all]");
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printOut(io, "Usage: gitstore root [codestore|gitstore|toolstore|cachestore]");
             return 0;
+        } else if (stores_mod.parseStoreName(arg)) |name| {
+            store_name = name;
         } else {
-            try printErr(io, "error: unknown flag for root\n");
+            try printErr(io, "error: unknown store for root\n");
             return 2;
         }
     }
 
-    var cfg = config_mod.load(gpa, io, environ_map) catch |err| {
-        try printErr(io, "error: failed to load config\n");
-        return err;
-    };
-    defer cfg.deinit(gpa);
+    var stores = try getStoreConfig(gpa, io, environ_map);
+    defer stores.deinit(gpa);
 
     var buf: [4096]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &buf);
-    try w.interface.print("{s}\n", .{cfg.root});
+    try w.interface.print("{s}\n", .{stores_mod.rootFor(stores, store_name)});
     try w.flush();
     return 0;
 }
