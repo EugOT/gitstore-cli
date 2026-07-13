@@ -364,6 +364,203 @@ test "repoStoragePath returns null for non-absolute path" {
     try testing.expect(gitstore.repoStoragePath("relative/path", "/any") == null);
 }
 
+test "resolveGhRepo ignores parent git repo outside ghq root" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    try env.gitInitAt(env.base);
+    var add_remote = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "remote", "add", "origin", "https://github.com/wrong/parent.git" },
+        env.base,
+    );
+    defer add_remote.deinit(gpa);
+    if (!add_remote.succeeded()) return error.ProcessFailed;
+
+    const repo_path = try std.fmt.allocPrint(gpa, "{s}/github.com/right/repo", .{env.ghq_root});
+    defer gpa.free(repo_path);
+    try Dir.cwd().createDirPath(io, repo_path);
+
+    const resolved = (try gitstore.resolveGhRepo(gpa, io, repo_path, env.ghq_root)).?;
+    defer gpa.free(resolved);
+    try testing.expectEqualStrings("right/repo", resolved);
+}
+
+test "resolveGhRepo uses git origin for normal repo outside ghq root" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo_path = try std.fmt.allocPrint(gpa, "{s}/outside-repo", .{env.base});
+    defer gpa.free(repo_path);
+    try Dir.cwd().createDirPath(io, repo_path);
+    try env.gitInitAt(repo_path);
+    var add_remote = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "remote", "add", "origin", "git@github.com:EugOT/z3store.git" },
+        repo_path,
+    );
+    defer add_remote.deinit(gpa);
+    if (!add_remote.succeeded()) return error.ProcessFailed;
+
+    const resolved = (try gitstore.resolveGhRepo(gpa, io, repo_path, env.ghq_root)).?;
+    defer gpa.free(resolved);
+    try testing.expectEqualStrings("EugOT/z3store", resolved);
+}
+
+test "resolveGhRepo falls back to ghq path for local file origin" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo_path = try env.createHostRepo("github.com", "Fallback", "local-remote");
+    defer gpa.free(repo_path);
+    const local_origin = try std.fmt.allocPrint(gpa, "file://{s}/local-origin.git", .{env.base});
+    defer gpa.free(local_origin);
+    var add_remote = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "remote", "add", "origin", local_origin },
+        repo_path,
+    );
+    defer add_remote.deinit(gpa);
+    try testing.expect(add_remote.succeeded());
+
+    const resolved = (try gitstore.resolveGhRepo(gpa, io, repo_path, env.ghq_root)).?;
+    defer gpa.free(resolved);
+    try testing.expectEqualStrings("Fallback/local-remote", resolved);
+}
+
+test "ghRepoFromRemoteUrl rejects local file remotes" {
+    const gpa = testing.allocator;
+    try testing.expect((try gitstore.ghRepoFromRemoteUrl(gpa, "file:///tmp/repos/local")) == null);
+}
+
+test "ghRepoFromGhqPath strips optional .git suffix from repo directory" {
+    const gpa = testing.allocator;
+    const resolved = (try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/EugOT/z3store.git/subdir",
+        "/Users/test/ghq",
+    )).?;
+    defer gpa.free(resolved);
+    try testing.expectEqualStrings("EugOT/z3store", resolved);
+}
+
+test "gh: formatGhRepo omits default github.com host" {
+    const gpa = testing.allocator;
+    const repo = try gitstore.formatGhRepo(gpa, "github.com", "Owner", "Repo");
+    defer gpa.free(repo);
+    try testing.expectEqualStrings("Owner/Repo", repo);
+}
+
+test "gh: formatGhRepo preserves enterprise host" {
+    const gpa = testing.allocator;
+    const repo = try gitstore.formatGhRepo(gpa, "github.corp.example", "Owner", "Repo");
+    defer gpa.free(repo);
+    try testing.expectEqualStrings("github.corp.example/Owner/Repo", repo);
+}
+
+test "gh: formatGhRepo rejects empty and unsafe components" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidGhRepoComponent, gitstore.formatGhRepo(gpa, "", "Owner", "Repo"));
+    try testing.expectError(
+        error.InvalidGhRepoComponent,
+        gitstore.formatGhRepo(gpa, "github.com", "Bad Owner", "Repo"),
+    );
+    try testing.expectError(
+        error.InvalidGhRepoComponent,
+        gitstore.formatGhRepo(gpa, "github.com", "Owner", "Bad\nRepo"),
+    );
+    try testing.expectError(
+        error.InvalidGhRepoComponent,
+        gitstore.formatGhRepo(gpa, "github.com", "Bad/Owner", "Repo"),
+    );
+    try testing.expectError(
+        error.InvalidGhRepoComponent,
+        gitstore.formatGhRepo(gpa, "github.com", "Owner", "Bad\\Repo"),
+    );
+}
+
+test "gh: parses remote URL into GH_REPO" {
+    const gpa = testing.allocator;
+    const repo = (try gitstore.ghRepoFromRemoteUrl(gpa, "git@github.com:EugOT/z3store.git")).?;
+    defer gpa.free(repo);
+    try testing.expectEqualStrings("EugOT/z3store", repo);
+}
+
+test "gh: derives GH_REPO from ghq path without .git" {
+    const gpa = testing.allocator;
+    const repo = (try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/EugOT/z3store/subdir",
+        "/Users/test/ghq",
+    )).?;
+    defer gpa.free(repo);
+    try testing.expectEqualStrings("EugOT/z3store", repo);
+}
+
+test "gh: rejects dot segments in ghq path" {
+    const gpa = testing.allocator;
+    try testing.expect((try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/EugOT/z3store/../other",
+        "/Users/test/ghq",
+    )) == null);
+}
+
+test "gh: rejects unsafe components in ghq path" {
+    const gpa = testing.allocator;
+    try testing.expect((try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/Bad Owner/z3store",
+        "/Users/test/ghq",
+    )) == null);
+    try testing.expect((try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/ghq/github.com/EugOT/bad\\repo",
+        "/Users/test/ghq",
+    )) == null);
+}
+
+test "gh: returns null for path outside ghq root" {
+    const gpa = testing.allocator;
+    try testing.expect((try gitstore.ghRepoFromGhqPath(
+        gpa,
+        "/Users/test/src/github.com/EugOT/z3store",
+        "/Users/test/ghq",
+    )) == null);
+}
+
+test "gh: resolveGhRepo prefers git origin remote" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createHostRepo("github.com", "Fallback", "path-repo");
+    defer gpa.free(repo);
+
+    var remote = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "remote", "add", "origin", "git@github.com:EugOT/z3store.git" },
+        repo,
+    );
+    defer remote.deinit(gpa);
+    try testing.expect(remote.succeeded());
+
+    const resolved = (try gitstore.resolveGhRepo(gpa, io, repo, env.ghq_root)).?;
+    defer gpa.free(resolved);
+    try testing.expectEqualStrings("EugOT/z3store", resolved);
+}
+
 // =========================================================
 // rewriteJjGitTarget unit tests
 // =========================================================
@@ -2534,6 +2731,47 @@ fn controlledEnv(
     return map;
 }
 
+const ControlledEnvFixture = struct {
+    const Self = ControlledEnvFixture;
+
+    gpa: Allocator,
+    io: Io,
+    home: []u8,
+    git_config: []u8,
+    env_map: std.process.Environ.Map,
+
+    fn deinit(self: *Self) void {
+        self.env_map.deinit();
+        bestEffortDeleteFile(self.io, self.git_config);
+        self.gpa.free(self.git_config);
+        bestEffortDeleteTree(self.io, self.home);
+        self.gpa.free(self.home);
+        self.* = undefined;
+    }
+};
+
+fn setupControlledEnvFixture(gpa: Allocator, io: Io, namespace: []const u8) !ControlledEnvFixture {
+    const home = try uniqueTempDir(gpa, io, namespace);
+    errdefer {
+        bestEffortDeleteTree(io, home);
+        gpa.free(home);
+    }
+    const git_config = try uniqueTempFile(gpa, io, namespace, ".gitconfig");
+    errdefer {
+        bestEffortDeleteFile(io, git_config);
+        gpa.free(git_config);
+    }
+    var env_map = try controlledEnv(gpa, home, git_config);
+    errdefer env_map.deinit();
+    return .{
+        .gpa = gpa,
+        .io = io,
+        .home = home,
+        .git_config = git_config,
+        .env_map = env_map,
+    };
+}
+
 /// Spawn the built zt binary with `argv_tail` and a controlled env.
 fn runZtControlled(
     gpa: Allocator,
@@ -2850,7 +3088,7 @@ test "e2e hook with no shell flag errors, exit 2" {
         .argv_tail = &.{"hook"},
         .expect = .{ .code = 2 },
         .stream = .stderr,
-        .needle = "error: hook requires --zsh, --bash, or --nu",
+        .needle = "error: hook requires --zsh, --bash, --nu, --gh-zsh, --gh-bash, or --gh-nu",
     });
 }
 
@@ -2859,7 +3097,7 @@ test "e2e hook with conflicting shells errors, exit 2" {
         .argv_tail = &.{ "hook", "--zsh", "--bash" },
         .expect = .{ .code = 2 },
         .stream = .stderr,
-        .needle = "error: hook accepts only one of --zsh/--bash/--nu",
+        .needle = "error: hook accepts only one shell flag",
     });
 }
 
@@ -2871,6 +3109,191 @@ test "e2e hook --zsh --help surfaces help to stdout, exit 0" {
         .stream = .stdout,
         .needle = "zt hook",
     });
+}
+
+test "e2e hook --gh shells print opt-in gh wrappers" {
+    const cases = [_]struct {
+        flag: []const u8,
+        needle: []const u8,
+    }{
+        .{ .flag = "--gh-zsh", .needle = "z3store-gh-hook.zsh" },
+        .{ .flag = "--gh-zsh", .needle = "command zt gh-repo" },
+        .{ .flag = "--gh-bash", .needle = "z3store-gh-hook.bash" },
+        .{ .flag = "--gh-bash", .needle = "command zt gh-repo" },
+        .{ .flag = "--gh-nu", .needle = "with-env { GH_REPO:" },
+        .{ .flag = "--gh-nu", .needle = "^zt gh-repo" },
+    };
+    for (cases) |item| {
+        try runE2eCase(testing.allocator, testing.io, .{
+            .argv_tail = &.{ "hook", item.flag },
+            .expect = .{ .code = 0 },
+            .stream = .stdout,
+            .needle = item.needle,
+        });
+    }
+}
+
+test "e2e gh-repo resolves synced ghq path without .git" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "/tmp/zt_e2e_gh");
+    defer fixture.deinit();
+    const repo_subdir = try std.fmt.allocPrint(gpa, "{s}/ghq/github.com/EugOT/z3store/src", .{fixture.home});
+    defer gpa.free(repo_subdir);
+    try Dir.cwd().createDirPath(io, repo_subdir);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.zt_bin, "gh-repo", repo_subdir },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+    try testing.expectEqualStrings("EugOT/z3store\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+}
+
+test "e2e gh-repo resolves configured z3store root" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "/tmp/zt_e2e_gh_config");
+    defer fixture.deinit();
+    const configured_root = try std.fmt.allocPrint(gpa, "{s}/configured-root", .{fixture.home});
+    defer gpa.free(configured_root);
+    try gitSetFile(gpa, io, fixture.git_config, "z3store.root", configured_root);
+    const repo_subdir = try std.fmt.allocPrint(gpa, "{s}/github.com/EugOT/configured/src", .{configured_root});
+    defer gpa.free(repo_subdir);
+    try Dir.cwd().createDirPath(io, repo_subdir);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.zt_bin, "gh-repo", repo_subdir },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+    try testing.expectEqualStrings("EugOT/configured\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+}
+
+test "e2e gh-repo resolves ghq path when git metadata probe fails" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "/tmp/zt_e2e_gh_no_git");
+    defer fixture.deinit();
+    const repo_subdir = try std.fmt.allocPrint(gpa, "{s}/ghq/github.com/EugOT/z3store/src", .{fixture.home});
+    defer gpa.free(repo_subdir);
+    try Dir.cwd().createDirPath(io, repo_subdir);
+    const fake_bin = try std.fmt.allocPrint(gpa, "{s}/bin", .{fixture.home});
+    defer gpa.free(fake_bin);
+    try Dir.cwd().createDirPath(io, fake_bin);
+    const fake_git = try std.fmt.allocPrint(gpa, "{s}/git", .{fake_bin});
+    defer gpa.free(fake_git);
+    const fake_git_marker = try std.fmt.allocPrint(gpa, "{s}/fake-git-probe", .{fixture.home});
+    defer gpa.free(fake_git_marker);
+    const inherited_path = fixture.env_map.get("PATH") orelse "";
+    const fake_git_script = try std.fmt.allocPrint(
+        gpa,
+        \\#!/bin/sh
+        \\if [ "$1" = "config" ]; then
+        \\  PATH="{s}" exec git "$@"
+        \\fi
+        \\printf '%s\n' "$*" >> '{s}'
+        \\exit 42
+        \\
+    ,
+        .{ inherited_path, fake_git_marker },
+    );
+    defer gpa.free(fake_git_script);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = fake_git,
+        .data = fake_git_script,
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    const fake_path = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ fake_bin, inherited_path });
+    defer gpa.free(fake_path);
+    try fixture.env_map.put("PATH", fake_path);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.zt_bin, "gh-repo", repo_subdir },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+    try testing.expectEqualStrings("EugOT/z3store\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+
+    const marker = try Dir.cwd().readFileAlloc(io, fake_git_marker, gpa, .unlimited);
+    defer gpa.free(marker);
+    try testing.expect(std.mem.indexOf(u8, marker, "-C") != null);
+    try testing.expect(std.mem.indexOf(u8, marker, "rev-parse --show-toplevel") != null);
+}
+
+test "e2e gh-repo outside ghq exits 1 with derive error" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "/tmp/zt_e2e_gh_outside");
+    defer fixture.deinit();
+    const repo_path = try std.fmt.allocPrint(gpa, "{s}/outside/repo", .{fixture.home});
+    defer gpa.free(repo_path);
+    try Dir.cwd().createDirPath(io, repo_path);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.zt_bin, "gh-repo", repo_path },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 1), result.term.exited);
+    try testing.expectEqualStrings("", result.stdout);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "cannot derive GH_REPO") != null);
+}
+
+test "e2e gh-repo --export shell-quotes derived repo" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var fixture = try setupControlledEnvFixture(gpa, io, "/tmp/zt_e2e_gh_export");
+    defer fixture.deinit();
+    const repo_path = try std.fmt.allocPrint(gpa, "{s}/ghq/github.com/EugOT/re'po", .{fixture.home});
+    defer gpa.free(repo_path);
+    try Dir.cwd().createDirPath(io, repo_path);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.zt_bin, "gh-repo", "--export", repo_path },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+    try testing.expectEqualStrings("export GH_REPO='EugOT/re'\\''po'\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 // --- filter (exit-1 anomaly) ---

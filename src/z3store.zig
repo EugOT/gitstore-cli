@@ -8,6 +8,7 @@ const ex = @import("exec.zig");
 const hooks = @import("hooks.zig");
 const oplog = @import("log.zig");
 const list_mod = @import("list.zig");
+const url_mod = @import("url.zig");
 
 pub const Error = error{
     ProcessFailed,
@@ -208,6 +209,176 @@ pub fn repoStoragePath(repo_path: []const u8, ghq_root: []const u8) ?[]const u8 
     if (repoRelativePath(repo_path, ghq_root)) |rel| return rel;
     if (repo_path.len > 1 and repo_path[0] == '/') return repo_path[1..];
     return null;
+}
+
+/// Format a GitHub CLI GH_REPO value from host/owner/name parts.
+///
+/// GitHub CLI accepts `[HOST/]OWNER/REPO`; omit the default public host so the
+/// common case matches `owner/repo`, but preserve Enterprise/custom hosts.
+/// Caller owns the returned slice and must free it with `gpa`.
+pub const FormatGhRepoError = error{
+    OutOfMemory,
+    InvalidGhRepoComponent,
+};
+
+pub fn formatGhRepo(
+    gpa: Allocator,
+    host: []const u8,
+    owner: []const u8,
+    name: []const u8,
+) FormatGhRepoError![]u8 {
+    if (!isValidGhRepoComponent(host) or
+        !isValidGhRepoComponent(owner) or
+        !isValidGhRepoComponent(name))
+    {
+        return error.InvalidGhRepoComponent;
+    }
+    if (std.ascii.eqlIgnoreCase(host, "github.com")) {
+        return std.fmt.allocPrint(gpa, "{s}/{s}", .{ owner, name });
+    }
+    return std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ host, owner, name });
+}
+
+fn isValidGhRepoComponent(component: []const u8) bool {
+    if (component.len == 0) return false;
+    for (component) |byte| {
+        if (byte == '/' or byte == '\\' or std.ascii.isWhitespace(byte) or std.ascii.isControl(byte)) return false;
+    }
+    return true;
+}
+
+/// Parse a git remote URL into GitHub CLI's GH_REPO format.
+/// Unsupported or malformed remotes return null instead of failing command
+/// dispatch; allocation failures still propagate.
+/// When non-null, caller owns the returned slice and must free it with `gpa`.
+pub fn ghRepoFromRemoteUrl(gpa: Allocator, remote_url: []const u8) !?[]u8 {
+    var spec = url_mod.parse(gpa, remote_url, .{}) catch |err| switch (err) {
+        error.EmptyInput,
+        error.InvalidFormat,
+        error.MissingUser,
+        error.DoubleSlash,
+        error.InvalidHost,
+        => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer spec.deinit(gpa);
+    if (spec.scheme == .file or spec.host.len == 0) return null;
+    return formatGhRepo(gpa, spec.host, spec.owner, spec.name) catch |err| switch (err) {
+        error.InvalidGhRepoComponent => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Derive GH_REPO from an absolute path under the configured ghq/z3store root.
+/// Subdirectories inside a repo are accepted; only the first host/owner/name
+/// components are used.
+/// When non-null, caller owns the returned slice and must free it with `gpa`.
+pub fn ghRepoFromGhqPath(gpa: Allocator, abs_path: []const u8, ghq_root: []const u8) !?[]u8 {
+    const rel = repoRelativePath(abs_path, ghq_root) orelse return null;
+    var rel_segments = std.mem.splitScalar(u8, rel, '/');
+    while (rel_segments.next()) |seg| {
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return null;
+    }
+
+    var parts = std.mem.splitScalar(u8, rel, '/');
+    const host = parts.next() orelse return null;
+    const owner = parts.next() orelse return null;
+    const name = parts.next() orelse return null;
+    if (host.len == 0 or owner.len == 0 or name.len == 0) return null;
+    const repo_name = if (std.mem.endsWith(u8, name, ".git"))
+        name[0 .. name.len - ".git".len]
+    else
+        name;
+    if (repo_name.len == 0) return null;
+    return formatGhRepo(gpa, host, owner, repo_name) catch |err| switch (err) {
+        error.InvalidGhRepoComponent => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+fn realPathFileOrMissing(io: Io, path: []const u8, buf: []u8) !?[]const u8 {
+    const len = Dir.cwd().realPathFile(io, path, buf) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    return buf[0..len];
+}
+
+fn pathUnderRootCanonical(io: Io, path: []const u8, root: []const u8) !bool {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const canon_path = (try realPathFileOrMissing(io, path, &path_buf)) orelse return false;
+    const canon_root = (try realPathFileOrMissing(io, root, &root_buf)) orelse return false;
+    if (canon_root.len == 1 and canon_root[0] == '/') {
+        return canon_path.len > 1 and canon_path[0] == '/';
+    }
+    return std.mem.startsWith(u8, canon_path, canon_root) and
+        canon_path.len > canon_root.len and
+        canon_path[canon_root.len] == '/';
+}
+
+fn ghRepoFromCanonicalGhqPath(gpa: Allocator, io: Io, abs_path: []const u8, ghq_root: []const u8) !?[]u8 {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const canon_path = (try realPathFileOrMissing(io, abs_path, &path_buf)) orelse return null;
+    const canon_root = (try realPathFileOrMissing(io, ghq_root, &root_buf)) orelse return null;
+    return ghRepoFromGhqPath(gpa, canon_path, canon_root);
+}
+
+/// Resolve GH_REPO for GitHub CLI. Prefer real git metadata when available,
+/// then fall back to the ghq path shape. The fallback is what makes
+/// rclone/GDrive-synced working trees without a `.git` file still usable with
+/// `GH_REPO=$(zt gh-repo) gh ...`.
+/// When non-null, caller owns the returned slice and must free it with `gpa`.
+pub fn resolveGhRepo(
+    gpa: Allocator,
+    io: Io,
+    abs_path: []const u8,
+    ghq_root: []const u8,
+) !?[]u8 {
+    const path_under_ghq = try pathUnderRootCanonical(io, abs_path, ghq_root);
+    var git_top = ex.exec(
+        gpa,
+        io,
+        &.{ "git", "-C", abs_path, "rev-parse", "--show-toplevel" },
+        null,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            if (!path_under_ghq) return null;
+            return ghRepoFromCanonicalGhqPath(gpa, io, abs_path, ghq_root);
+        },
+    };
+    defer git_top.deinit(gpa);
+    const top_under_ghq = if (git_top.succeeded())
+        try pathUnderRootCanonical(
+            io,
+            ex.trimTrailingNewline(git_top.stdout),
+            ghq_root,
+        )
+    else
+        false;
+    if (git_top.succeeded() and (!path_under_ghq or top_under_ghq)) {
+        var remote = ex.exec(
+            gpa,
+            io,
+            &.{ "git", "-C", abs_path, "remote", "get-url", "origin" },
+            null,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                if (!path_under_ghq) return null;
+                return ghRepoFromCanonicalGhqPath(gpa, io, abs_path, ghq_root);
+            },
+        };
+        defer remote.deinit(gpa);
+        if (remote.succeeded()) {
+            const trimmed = ex.trimTrailingNewline(remote.stdout);
+            if (try ghRepoFromRemoteUrl(gpa, trimmed)) |repo| return repo;
+        }
+    }
+    if (!path_under_ghq) return null;
+    return ghRepoFromCanonicalGhqPath(gpa, io, abs_path, ghq_root);
 }
 
 /// Check if a repo is already adopted: .git is a pointer file with gitdir target inside gitstore_root.
