@@ -95,16 +95,29 @@ ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=<path/to/gitstore-cli> chezmoi apply
 ## Cursor Cloud specific instructions
 
 Durable notes for cloud agents. The startup update script already
-installs the toolchain (mise + Zig 0.16.0, Bun, and `jj`) and runs
-`bun install`; do not re-document dependency installation here. Standard
-build/test/lint commands live in `README.md` — use those.
+installs the toolchain (mise + Zig 0.16.0 + `jj`, and Vite+/`vp`) and
+runs `vp install`; do not re-document dependency installation here.
+Standard build/test/lint commands live in `README.md`.
 
-- **Toolchain resolution.** `zig` (0.16.0, pinned in `.mise.toml`) and
-  `jj` are provided by `mise`; `bun` lives in `~/.bun/bin`. `mise` is
-  activated from `~/.bashrc`, so `zig`, `jj`, and `bun` are on `PATH`
-  in a login shell. In a bare/non-login shell they may be absent — run
-  `eval "$(mise activate bash)"`, or invoke Zig explicitly as
-  `mise x zig@0.16.0 -- zig ...` (the `scripts/verify-*.ts` gates already
+- **JS/TS is managed exclusively through Vite+ (`vp`).** Do NOT install
+  or run Bun directly (no `curl … bun.sh`, no bare `bun install`). The
+  `vp` CLI (`~/.vite-plus`, activated from `~/.bashrc`) manages the Node
+  runtime and package manager; because the repo has a `bun.lock`, `vp`
+  selects and provisions its own Bun under
+  `~/.vite-plus/package_manager/bun/`. There is intentionally no bare
+  `bun` on `PATH`.
+  - Install deps: `vp install`.
+  - Run the gate/eval scripts (defined in `package.json`) via `vp run`,
+    which executes them under vp's managed Bun, e.g.
+    `vp run verify-fast`, `vp run verify-commit`, `vp run verify-pr`,
+    `vp run eval:check`, `vp run check-public-api`. (`vpr` is shorthand
+    for `vp run`.) Invoking `bun scripts/*.ts` directly will fail — no
+    bare bun exists.
+- **Zig toolchain resolution.** `zig` (0.16.0, pinned in `.mise.toml`)
+  and `jj` are provided by `mise`, activated from `~/.bashrc`, so both
+  are on `PATH` in a login shell. In a bare/non-login shell they may be
+  absent — run `eval "$(mise activate bash)"`, or invoke Zig explicitly
+  as `mise x zig@0.16.0 -- zig ...` (the `scripts/verify-*.ts` gates
   resolve Zig this way; never trust a bare-PATH `zig`).
 - **`jj` (jujutsu) is required for the test suite.** The integration
   tests in `src/tests.zig` spawn both `git` and `jj git init --colocate`.
