@@ -1,10 +1,10 @@
-# CLAUDE.md — `gitstore-cli`
+# CLAUDE.md — `z3store`
 
 > **Canonical ownership.** This repo-local `CLAUDE.md` and the entire
 > `.claude/` tree are **scaffolded artifacts** of the `zig-qm-toolkit`
 > chezmoi template (sourced from `EugOT/dotfiles`,
 > `~/.local/share/chezmoi/.chezmoitemplates/zig-qm-toolkit/`). The
-> *project-local* copy is authoritative for `gitstore-cli`-specific
+> *project-local* copy is authoritative for `z3store`-specific
 > overrides; the *chezmoi template* is authoritative for invariants. To
 > avoid silent divergence on a future `chezmoi apply`:
 >
@@ -12,14 +12,15 @@
 >    with `ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=<repo-path> chezmoi apply`.
 > 2. Edit project-local overrides here; the toolkit scaffold script
 >    skips files marked `# scaffold-skip:` in their first 3 lines.
-> 3. The dotfiles `.chezmoiignore` excludes `gitstore-cli/CLAUDE.md`
->    and `gitstore-cli/.claude/` from the unscoped `chezmoi apply`
+> 3. The dotfiles `.chezmoiignore` excludes `z3store/CLAUDE.md`
+>    and `z3store/.claude/` from the unscoped `chezmoi apply`
 >    path; running it without `ZIG_QM_PROJECT` will not touch this
 >    repo.
 
 ## Why
 
-Agentic quality management for **gitstore-cli**, a Zig 0.16 project.
+Agentic quality management for **z3store**, a Zig 0.16 project that builds
+the `zt` executable.
 Four-tier gate topology (per-turn → per-commit → per-PR → per-release)
 enforced by hooks, skills, and subagents. Inherited from the
 `zig-qm-toolkit` chezmoi template; do not edit invariants in place —
@@ -84,9 +85,9 @@ Toolkit version is recorded in `.zig-qm/.toolkit-version` after every
 scaffold; bump it when re-applying. Re-scaffold idempotently with:
 
 ```bash
-ZIG_QM_PROJECT=<path/to/gitstore-cli> chezmoi apply
+ZIG_QM_PROJECT=<path/to/z3store> chezmoi apply
 # or, to overwrite existing toolkit-managed files:
-ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=<path/to/gitstore-cli> chezmoi apply
+ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=<path/to/z3store> chezmoi apply
 ```
 
 @doc/ARCHITECTURE.md
