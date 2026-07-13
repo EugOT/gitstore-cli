@@ -129,15 +129,16 @@ Standard build/test/lint commands live in `README.md`.
   and a trailing `failed command: .../test ...` line on stderr. These are
   expected test output, not a build failure. Trust the `Build Summary:
   N/N steps succeeded; …` line and the process exit code (0 = pass).
-- **`ghq` is an optional runtime dependency, not part of dev setup.**
-  The `zt` subcommands `verify --all` and `get` shell out to the external
-  `ghq` binary (`ghq root`); it is not installed, so those paths error
-  with `FileNotFound`/`ProcessFailed`. The newer subcommands (`create`,
-  `list`, `root`, `status`, and single-path `verify <path>`) fall back to
-  `$HOME/ghq` and work without `ghq`. Prefer those when exercising the CLI.
-- **Store-root resolution.** `zt` resolves its root via git config
-  `z3store.root` → `$Z3STORE_ROOT` → `$GITSTORE_ROOT` → `$GHQ_ROOT` →
-  `~/ghq`. Using the legacy `$GITSTORE_ROOT`/`$GHQ_ROOT` vars prints a
-  non-fatal "prefer z3store.* / Z3STORE_ROOT" warning.
+- **No `ghq` binary dependency.** `zt` is a `ghq` replacement and does
+  not shell out to `ghq`; the external tool is not required at build,
+  test, or run time. (The `ghq.root`/`$GHQ_ROOT` entries below are a
+  git-config key and env var for back-compat, not the `ghq` program.)
+- **Store-root resolution.** `zt` resolves its working-tree root from
+  config/env only: git-config `z3store.root` → `gitstore.root` →
+  `ghq.root`, then `$Z3STORE_ROOT` → `$GITSTORE_ROOT` → `$GHQ_ROOT`,
+  falling back to `~/ghq`. The detached backing store (where `.git`/`.jj`
+  live) resolves on its own chain (see `src/config.zig`). Legacy
+  `gitstore.*`/`ghq.*` sources still work but print a non-fatal "prefer
+  z3store.* / Z3STORE_ROOT" warning.
 - **Runtime artifacts.** The hooks/gates write to `.claude/logs/*.jsonl`
   at runtime; leave these untracked (do not commit them).
