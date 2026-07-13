@@ -85,7 +85,7 @@ async function main(): Promise<void> {
 	// and cannot be exec'd via Bun.spawnSync (CodeRabbit finding).
 	if (Bun.which("ziglint") !== null) {
 		console.log("== ziglint (EugOT/ziglint expected) ==");
-		const ziglint = spawnSync(["ziglint", ...fmtInputs]);
+		const ziglint = spawnSync(["ziglint", ...zigFiles]);
 		process.stdout.write(ziglint.stdout);
 		if (ziglint.code !== 0) {
 			printFail("ziglint", ziglint);

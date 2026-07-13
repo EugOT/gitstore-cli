@@ -128,7 +128,12 @@ pub fn load(
         error.FileNotFound => blk: {
             const legacy_index_path = try legacyIndexPath(gpa, gitstore_root);
             defer gpa.free(legacy_index_path);
-            break :blk Dir.cwd().readFileAlloc(io, legacy_index_path, gpa, .unlimited) catch |legacy_err| switch (legacy_err) {
+            break :blk Dir.cwd().readFileAlloc(
+                io,
+                legacy_index_path,
+                gpa,
+                .unlimited,
+            ) catch |legacy_err| switch (legacy_err) {
                 error.FileNotFound => return map,
                 else => return legacy_err,
             };
@@ -248,13 +253,20 @@ pub fn save(
         .sub_path = tmp_path,
         .data = aw.written(),
     }) catch |err| {
-        Dir.cwd().deleteFile(io, tmp_path) catch {};
+        removeFileBestEffort(io, tmp_path);
         return err;
     };
 
     Dir.rename(Dir.cwd(), tmp_path, Dir.cwd(), final_path, io) catch |err| {
-        Dir.cwd().deleteFile(io, tmp_path) catch {};
+        removeFileBestEffort(io, tmp_path);
         return err;
+    };
+}
+
+fn removeFileBestEffort(io: Io, path: []const u8) void {
+    Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => std.log.warn("failed to remove cache file {s}: {s}", .{ path, @errorName(err) }),
     };
 }
 
@@ -287,9 +299,15 @@ fn legacyIndexPath(gpa: Allocator, gitstore_root: []const u8) ![]u8 {
 
 const testing = std.testing;
 
+fn removeTreeBestEffort(io: Io, path: []const u8) void {
+    Dir.cwd().deleteTree(io, path) catch |err| {
+        std.log.warn("failed to remove test path {s}: {s}", .{ path, @errorName(err) });
+    };
+}
+
 test "cache: diffIndex detects added entries" {
     const gpa = testing.allocator;
-    const prev = [_]CacheEntry{};
+    const prev: [0]CacheEntry = .{};
     const curr = [_]CacheEntry{
         .{ .rel_path = "github.com/a/b" },
         .{ .rel_path = "github.com/a/c" },
@@ -373,8 +391,8 @@ test "cache: save + load roundtrip preserves entries" {
     const gpa = testing.allocator;
     const io = testing.io;
     const root = "/tmp/gitstore_cache_roundtrip_test";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
+    removeTreeBestEffort(io, root);
+    defer removeTreeBestEffort(io, root);
     try Dir.cwd().createDirPath(io, root);
 
     var src: std.StringHashMap(CacheEntry) = .init(gpa);
@@ -425,14 +443,14 @@ test "cache: load falls back to legacy gitstore cache index" {
     const gpa = testing.allocator;
     const io = testing.io;
     const root = "/tmp/gitstore_cache_legacy_test";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
+    removeTreeBestEffort(io, root);
+    defer removeTreeBestEffort(io, root);
     try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_legacy_test/.gitstore/cache");
     try Dir.cwd().writeFile(io, .{
         .sub_path = "/tmp/gitstore_cache_legacy_test/.gitstore/cache/index.json",
-        .data =
-        \\{"version":1,"entries":[{"rel_path":"github.com/a/b","url":"https://github.com/a/b","head_sha":"abc123","last_fetched_unix":1700000000}]}
-        ,
+        .data = "{\"version\":1,\"entries\":[{\"rel_path\":\"github.com/a/b\"," ++
+            "\"url\":\"https://github.com/a/b\",\"head_sha\":\"abc123\"," ++
+            "\"last_fetched_unix\":1700000000}]}",
     });
 
     var loaded = try load(gpa, io, root);
@@ -449,21 +467,21 @@ test "cache: load prefers z3store cache index over stale legacy index" {
     const gpa = testing.allocator;
     const io = testing.io;
     const root = "/tmp/gitstore_cache_prefer_z3store_test";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
+    removeTreeBestEffort(io, root);
+    defer removeTreeBestEffort(io, root);
     try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_prefer_z3store_test/.z3store/cache");
     try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_prefer_z3store_test/.gitstore/cache");
     try Dir.cwd().writeFile(io, .{
         .sub_path = "/tmp/gitstore_cache_prefer_z3store_test/.z3store/cache/index.json",
-        .data =
-        \\{"version":1,"entries":[{"rel_path":"github.com/current/repo","url":"https://github.com/current/repo","head_sha":"z3abc","last_fetched_unix":1700000001}]}
-        ,
+        .data = "{\"version\":1,\"entries\":[{\"rel_path\":\"github.com/current/repo\"," ++
+            "\"url\":\"https://github.com/current/repo\",\"head_sha\":\"z3abc\"," ++
+            "\"last_fetched_unix\":1700000001}]}",
     });
     try Dir.cwd().writeFile(io, .{
         .sub_path = "/tmp/gitstore_cache_prefer_z3store_test/.gitstore/cache/index.json",
-        .data =
-        \\{"version":1,"entries":[{"rel_path":"github.com/stale/repo","url":"https://github.com/stale/repo","head_sha":"oldabc","last_fetched_unix":1}]}
-        ,
+        .data = "{\"version\":1,\"entries\":[{\"rel_path\":\"github.com/stale/repo\"," ++
+            "\"url\":\"https://github.com/stale/repo\",\"head_sha\":\"oldabc\"," ++
+            "\"last_fetched_unix\":1}]}",
     });
 
     var loaded = try load(gpa, io, root);
@@ -481,8 +499,8 @@ test "cache: load on corrupt json returns empty map" {
     const gpa = testing.allocator;
     const io = testing.io;
     const root = "/tmp/gitstore_cache_corrupt_test";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
+    removeTreeBestEffort(io, root);
+    defer removeTreeBestEffort(io, root);
     try Dir.cwd().createDirPath(io, "/tmp/gitstore_cache_corrupt_test/.z3store/cache");
     try Dir.cwd().writeFile(io, .{
         .sub_path = "/tmp/gitstore_cache_corrupt_test/.z3store/cache/index.json",
@@ -498,8 +516,8 @@ test "cache: save overwrites previous index atomically" {
     const gpa = testing.allocator;
     const io = testing.io;
     const root = "/tmp/gitstore_cache_overwrite_test";
-    Dir.cwd().deleteTree(io, root) catch {};
-    defer Dir.cwd().deleteTree(io, root) catch {};
+    removeTreeBestEffort(io, root);
+    defer removeTreeBestEffort(io, root);
     try Dir.cwd().createDirPath(io, root);
 
     var m1: std.StringHashMap(CacheEntry) = .init(gpa);
