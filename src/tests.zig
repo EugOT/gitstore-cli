@@ -110,6 +110,64 @@ fn bestEffortDeleteFile(io: Io, path: []const u8) void {
     };
 }
 
+const GitStateSnapshot = struct {
+    index: []u8,
+    config: []u8,
+    refs: []u8,
+
+    fn capture(gpa: Allocator, io: Io, repo: []const u8) !GitStateSnapshot {
+        var git_dir_result = try ex.exec(gpa, io, &.{ "git", "rev-parse", "--absolute-git-dir" }, repo);
+        defer git_dir_result.deinit(gpa);
+        if (!git_dir_result.succeeded()) return error.ProcessFailed;
+        const git_dir = std.mem.trim(u8, git_dir_result.stdout, "\r\n");
+
+        const index_path = try std.fmt.allocPrint(gpa, "{s}/index", .{git_dir});
+        defer gpa.free(index_path);
+        const config_path = try std.fmt.allocPrint(gpa, "{s}/config", .{git_dir});
+        defer gpa.free(config_path);
+
+        const index = try Dir.cwd().readFileAlloc(io, index_path, gpa, .unlimited);
+        errdefer gpa.free(index);
+        const config_bytes = try Dir.cwd().readFileAlloc(io, config_path, gpa, .unlimited);
+        errdefer gpa.free(config_bytes);
+        var refs = try ex.exec(gpa, io, &.{ "git", "show-ref", "--head" }, repo);
+        defer gpa.free(refs.stderr);
+        if (!refs.succeeded()) {
+            gpa.free(refs.stdout);
+            return error.ProcessFailed;
+        }
+
+        return .{ .index = index, .config = config_bytes, .refs = refs.stdout };
+    }
+
+    fn deinit(self: *GitStateSnapshot, gpa: Allocator) void {
+        gpa.free(self.index);
+        gpa.free(self.config);
+        gpa.free(self.refs);
+        self.* = undefined;
+    }
+
+    fn expectEqual(self: GitStateSnapshot, other: GitStateSnapshot) !void {
+        try testing.expectEqualSlices(u8, self.index, other.index);
+        try testing.expectEqualSlices(u8, self.config, other.config);
+        try testing.expectEqualSlices(u8, self.refs, other.refs);
+    }
+};
+
+fn addTrackedFixture(gpa: Allocator, io: Io, repo: []const u8) !void {
+    const tracked = try std.fmt.allocPrint(gpa, "{s}/tracked.txt", .{repo});
+    defer gpa.free(tracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = tracked, .data = "tracked\n" });
+
+    var add = try ex.exec(gpa, io, &.{ "git", "add", "tracked.txt" }, repo);
+    defer add.deinit(gpa);
+    if (!add.succeeded()) return error.ProcessFailed;
+
+    var commit = try ex.exec(gpa, io, &.{ "git", "commit", "--no-verify", "-m", "tracked fixture" }, repo);
+    defer commit.deinit(gpa);
+    if (!commit.succeeded()) return error.ProcessFailed;
+}
+
 const TestEnv = struct {
     base: []const u8,
     ghq_root: []const u8,
@@ -608,6 +666,33 @@ test "rewriteJjGitTarget propagates write failure when file missing" {
     try testing.expectError(error.FileNotFound, gitstore.rewriteJjGitTarget(gpa, io, jj_dir, "/some/git"));
 }
 
+test "rewriteJjGitTarget rejects an internal symlink without external writes" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const jj_dir = try uniqueTempDir(gpa, io, "/tmp/gitstore_test_jj_symlink_target");
+    defer {
+        bestEffortDeleteTree(io, jj_dir);
+        gpa.free(jj_dir);
+    }
+    const store_dir = try std.fmt.allocPrint(gpa, "{s}/repo/store", .{jj_dir});
+    defer gpa.free(store_dir);
+    try Dir.cwd().createDirPath(io, store_dir);
+    const external = try std.fmt.allocPrint(gpa, "{s}/external-sentinel", .{jj_dir});
+    defer gpa.free(external);
+    try Dir.cwd().writeFile(io, .{ .sub_path = external, .data = "unchanged\n" });
+    const git_target = try std.fmt.allocPrint(gpa, "{s}/git_target", .{store_dir});
+    defer gpa.free(git_target);
+    try Dir.symLinkAbsolute(io, external, git_target, .{});
+
+    try testing.expectError(
+        error.SourceMetadataSymlink,
+        gitstore.rewriteJjGitTarget(gpa, io, jj_dir, "/attacker-controlled/git"),
+    );
+    const content = try Dir.cwd().readFileAlloc(io, external, gpa, .unlimited);
+    defer gpa.free(content);
+    try testing.expectEqualStrings("unchanged\n", content);
+}
+
 // =========================================================
 // init tests
 // =========================================================
@@ -667,6 +752,581 @@ test "e2e adopt git-only repo" {
         gpa.free(git_r.stderr);
     }
     try testing.expect(git_r.succeeded());
+}
+
+test "adopt with jj colocation disabled preserves dirty git state" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "gitonly-no-jj");
+    defer gpa.free(repo);
+
+    const tracked = try std.fmt.allocPrint(gpa, "{s}/tracked.txt", .{repo});
+    defer gpa.free(tracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = tracked, .data = "base\n" });
+
+    var git_add = try ex.exec(gpa, io, &.{ "git", "add", "tracked.txt" }, repo);
+    defer {
+        gpa.free(git_add.stdout);
+        gpa.free(git_add.stderr);
+    }
+    try testing.expect(git_add.succeeded());
+
+    var git_commit = try ex.exec(gpa, io, &.{ "git", "commit", "--no-verify", "-m", "fixture" }, repo);
+    defer {
+        gpa.free(git_commit.stdout);
+        gpa.free(git_commit.stderr);
+    }
+    try testing.expect(git_commit.succeeded());
+
+    try Dir.cwd().writeFile(io, .{ .sub_path = tracked, .data = "staged\n" });
+    var git_stage = try ex.exec(gpa, io, &.{ "git", "add", "tracked.txt" }, repo);
+    defer {
+        gpa.free(git_stage.stdout);
+        gpa.free(git_stage.stderr);
+    }
+    try testing.expect(git_stage.succeeded());
+    try Dir.cwd().writeFile(io, .{ .sub_path = tracked, .data = "unstaged\n" });
+
+    const untracked = try std.fmt.allocPrint(gpa, "{s}/untracked.txt", .{repo});
+    defer gpa.free(untracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = untracked, .data = "preserve me\n" });
+
+    var before = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer {
+        gpa.free(before.stdout);
+        gpa.free(before.stderr);
+    }
+    try testing.expect(before.succeeded());
+    var before_git = try GitStateSnapshot.capture(gpa, io, repo);
+    defer before_git.deinit(gpa);
+
+    try gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+        .jj_colocate = false,
+    });
+
+    var after = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer {
+        gpa.free(after.stdout);
+        gpa.free(after.stderr);
+    }
+    try testing.expect(after.succeeded());
+    try testing.expectEqualStrings(before.stdout, after.stdout);
+    var after_git = try GitStateSnapshot.capture(gpa, io, repo);
+    defer after_git.deinit(gpa);
+    try before_git.expectEqual(after_git);
+
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_path, .{}));
+    const recovery = try std.fmt.allocPrint(gpa, "{s}/.git.zt-adopt-backup", .{repo});
+    defer gpa.free(recovery);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, recovery, .{}));
+}
+
+test "e2e adopt honors z3store jjColocate false" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+    var fixture = try setupControlledEnvFixture(gpa, io, "/tmp/zt_e2e_adopt_no_jj");
+    defer fixture.deinit();
+
+    const repo = try env.createRepo("testorg", "configured-no-jj");
+    defer gpa.free(repo);
+    const untracked = try std.fmt.allocPrint(gpa, "{s}/untracked.txt", .{repo});
+    defer gpa.free(untracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = untracked, .data = "preserve me\n" });
+
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = fixture.git_config,
+        .data = "[z3store]\n\tjjColocate = false\n",
+    });
+    try fixture.env_map.put("Z3STORE_ROOT", env.ghq_root);
+    try fixture.env_map.put("Z3STORE_BACKING_STORE_ROOT", env.gitstore_root);
+
+    var loaded = try config.load(gpa, io, &fixture.env_map);
+    defer loaded.deinit(gpa);
+    try testing.expectEqual(false, loaded.jj_colocate);
+
+    const dry_run = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.zt_bin, "adopt", "--dry-run", repo },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(dry_run.stdout);
+    defer gpa.free(dry_run.stderr);
+    try testing.expect(dry_run.term == .exited);
+    try testing.expectEqual(@as(u8, 0), dry_run.term.exited);
+    try testing.expect(std.mem.indexOf(u8, dry_run.stdout, "leave git-only (jj colocation disabled)") != null);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+
+    var before = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer {
+        gpa.free(before.stdout);
+        gpa.free(before.stderr);
+    }
+    try testing.expect(before.succeeded());
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ build_options.zt_bin, "adopt", repo },
+        .environ_map = &fixture.env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    try testing.expect(result.term == .exited);
+    try testing.expectEqual(@as(u8, 0), result.term.exited);
+
+    var after = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer {
+        gpa.free(after.stdout);
+        gpa.free(after.stderr);
+    }
+    try testing.expect(after.succeeded());
+    try testing.expectEqualStrings(before.stdout, after.stdout);
+
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_path, .{}));
+}
+
+test "adopt with jj colocation enabled rejects dirty git state before mutation" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "dirty-jj-refusal");
+    defer gpa.free(repo);
+    const untracked = try std.fmt.allocPrint(gpa, "{s}/untracked.txt", .{repo});
+    defer gpa.free(untracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = untracked, .data = "preserve me\n" });
+
+    var before = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer {
+        gpa.free(before.stdout);
+        gpa.free(before.stderr);
+    }
+    try testing.expect(before.succeeded());
+
+    try testing.expectError(
+        error.RepositoryDirty,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{}),
+    );
+
+    var after = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer {
+        gpa.free(after.stdout);
+        gpa.free(after.stderr);
+    }
+    try testing.expect(after.succeeded());
+    try testing.expectEqualStrings(before.stdout, after.stdout);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_path, .{}));
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(store_git);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, store_git, .{}));
+}
+
+test "adopt dirty gate cannot hide untracked files through repo config" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "hidden-untracked-jj-refusal");
+    defer gpa.free(repo);
+    try addTrackedFixture(gpa, io, repo);
+
+    var hide = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "config", "status.showUntrackedFiles", "no" },
+        repo,
+    );
+    defer hide.deinit(gpa);
+    try testing.expect(hide.succeeded());
+
+    const untracked = try std.fmt.allocPrint(gpa, "{s}/hidden-untracked.txt", .{repo});
+    defer gpa.free(untracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = untracked, .data = "must remain untracked\n" });
+
+    var hidden = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer hidden.deinit(gpa);
+    try testing.expect(hidden.succeeded());
+    try testing.expectEqual(@as(usize, 0), hidden.stdout.len);
+
+    var before = try GitStateSnapshot.capture(gpa, io, repo);
+    defer before.deinit(gpa);
+
+    try testing.expectError(
+        error.RepositoryDirty,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{}),
+    );
+
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    var after = try GitStateSnapshot.capture(gpa, io, repo);
+    defer after.deinit(gpa);
+    try before.expectEqual(after);
+    _ = try Dir.cwd().statFile(io, untracked, .{});
+}
+
+test "adopt rejects source git metadata symlinks without mutation" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "git-source-symlink");
+    defer gpa.free(repo);
+    const git_src = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
+    defer gpa.free(git_src);
+    const external_git = try std.fmt.allocPrint(gpa, "{s}/external-git", .{env.base});
+    defer gpa.free(external_git);
+    try Dir.rename(Dir.cwd(), git_src, Dir.cwd(), external_git, io);
+    try Dir.symLinkAbsolute(io, external_git, git_src, .{ .is_directory = true });
+
+    try testing.expectError(
+        error.SourceMetadataSymlink,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const link_len = try Dir.readLinkAbsolute(io, git_src, &link_buf);
+    try testing.expectEqualStrings(external_git, link_buf[0..link_len]);
+    _ = try Dir.cwd().statFile(io, external_git, .{});
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(store_git);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, store_git, .{}));
+}
+
+test "adopt rejects a symlinked git info directory without external writes" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "git-info-symlink");
+    defer gpa.free(repo);
+    const info_dir = try std.fmt.allocPrint(gpa, "{s}/.git/info", .{repo});
+    defer gpa.free(info_dir);
+    try Dir.cwd().deleteTree(io, info_dir);
+    const external_info = try std.fmt.allocPrint(gpa, "{s}/external-git-info", .{env.base});
+    defer gpa.free(external_info);
+    try Dir.cwd().createDirPath(io, external_info);
+    const external_exclude = try std.fmt.allocPrint(gpa, "{s}/exclude", .{external_info});
+    defer gpa.free(external_exclude);
+    try Dir.cwd().writeFile(io, .{ .sub_path = external_exclude, .data = "external-sentinel\n" });
+    try Dir.symLinkAbsolute(io, external_info, info_dir, .{ .is_directory = true });
+
+    try testing.expectError(
+        error.SourceMetadataSymlink,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{}),
+    );
+    const content = try Dir.cwd().readFileAlloc(io, external_exclude, gpa, .unlimited);
+    defer gpa.free(content);
+    try testing.expectEqualStrings("external-sentinel\n", content);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const link_len = try Dir.readLinkAbsolute(io, info_dir, &link_buf);
+    try testing.expectEqualStrings(external_info, link_buf[0..link_len]);
+}
+
+test "adopt rejects source jj metadata symlinks without external writes" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "jj-source-symlink");
+    defer gpa.free(repo);
+    const external_jj = try std.fmt.allocPrint(gpa, "{s}/external-jj", .{env.base});
+    defer gpa.free(external_jj);
+    try Dir.cwd().createDirPath(io, external_jj);
+    const marker = try std.fmt.allocPrint(gpa, "{s}/marker", .{external_jj});
+    defer gpa.free(marker);
+    try Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = "unchanged\n" });
+    const jj_src = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_src);
+    try Dir.symLinkAbsolute(io, external_jj, jj_src, .{ .is_directory = true });
+
+    try testing.expectError(
+        error.SourceMetadataSymlink,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+
+    const marker_content = try Dir.cwd().readFileAlloc(io, marker, gpa, .unlimited);
+    defer gpa.free(marker_content);
+    try testing.expectEqualStrings("unchanged\n", marker_content);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+}
+
+test "adopt preserves a pre-existing git store target on refusal" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "existing-store-git");
+    defer gpa.free(repo);
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(store_git);
+    try Dir.cwd().createDirPath(io, store_git);
+    const sentinel = try std.fmt.allocPrint(gpa, "{s}/sentinel", .{store_git});
+    defer gpa.free(sentinel);
+    try Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "owned-before-adopt\n" });
+
+    try testing.expectError(
+        error.AlreadyAdopted,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+
+    const content = try Dir.cwd().readFileAlloc(io, sentinel, gpa, .unlimited);
+    defer gpa.free(content);
+    try testing.expectEqualStrings("owned-before-adopt\n", content);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+}
+
+test "adopt preserves a pre-existing jj store target on refusal" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "existing-store-jj");
+    defer gpa.free(repo);
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const store_jj = try std.fmt.allocPrint(gpa, "{s}/{s}/jj", .{ env.gitstore_root, rel });
+    defer gpa.free(store_jj);
+    try Dir.cwd().createDirPath(io, store_jj);
+    const sentinel = try std.fmt.allocPrint(gpa, "{s}/sentinel", .{store_jj});
+    defer gpa.free(sentinel);
+    try Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "owned-before-adopt\n" });
+
+    try testing.expectError(
+        error.AlreadyAdopted,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+
+    const content = try Dir.cwd().readFileAlloc(io, sentinel, gpa, .unlimited);
+    defer gpa.free(content);
+    try testing.expectEqualStrings("owned-before-adopt\n", content);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+}
+
+test "adopt respects an exclusive per-repository adoption lock" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "adoption-lock");
+    defer gpa.free(repo);
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const lock = try std.fmt.allocPrint(gpa, "{s}/{s}/.zt-adopt.lock", .{ env.gitstore_root, rel });
+    defer gpa.free(lock);
+    try Dir.cwd().createDirPath(io, lock);
+    const sentinel = try std.fmt.allocPrint(gpa, "{s}/owner", .{lock});
+    defer gpa.free(sentinel);
+    try Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "other invocation\n" });
+
+    try testing.expectError(
+        error.AdoptionInProgress,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+    const content = try Dir.cwd().readFileAlloc(io, sentinel, gpa, .unlimited);
+    defer gpa.free(content);
+    try testing.expectEqualStrings("other invocation\n", content);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+}
+
+test "adopt refuses a symlinked jj store target without external writes" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "symlinked-store-jj");
+    defer gpa.free(repo);
+    const jj_src = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_src);
+    try Dir.cwd().createDirPath(io, jj_src);
+    const source_payload = try std.fmt.allocPrint(gpa, "{s}/payload", .{jj_src});
+    defer gpa.free(source_payload);
+    try Dir.cwd().writeFile(io, .{ .sub_path = source_payload, .data = "must-not-copy\n" });
+
+    const external = try std.fmt.allocPrint(gpa, "{s}/external-store-target", .{env.base});
+    defer gpa.free(external);
+    try Dir.cwd().createDirPath(io, external);
+    const marker = try std.fmt.allocPrint(gpa, "{s}/marker", .{external});
+    defer gpa.free(marker);
+    try Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = "unchanged\n" });
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const repo_store = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ env.gitstore_root, rel });
+    defer gpa.free(repo_store);
+    try Dir.cwd().createDirPath(io, repo_store);
+    const store_jj = try std.fmt.allocPrint(gpa, "{s}/jj", .{repo_store});
+    defer gpa.free(store_jj);
+    try Dir.symLinkAbsolute(io, external, store_jj, .{ .is_directory = true });
+
+    try testing.expectError(
+        error.AlreadyAdopted,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+
+    const marker_content = try Dir.cwd().readFileAlloc(io, marker, gpa, .unlimited);
+    defer gpa.free(marker_content);
+    try testing.expectEqualStrings("unchanged\n", marker_content);
+    const external_payload = try std.fmt.allocPrint(gpa, "{s}/payload", .{external});
+    defer gpa.free(external_payload);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, external_payload, .{}));
+    try testing.expect(try gitIsDir(gpa, io, repo));
+}
+
+test "adopt refuses pre-existing recovery backup" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "recovery-backup-collision");
+    defer gpa.free(repo);
+    const recovery = try std.fmt.allocPrint(gpa, "{s}/.git.zt-adopt-backup", .{repo});
+    defer gpa.free(recovery);
+    try Dir.cwd().createDirPath(io, recovery);
+
+    try testing.expectError(
+        error.PathAlreadyExists,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    _ = try Dir.cwd().statFile(io, recovery, .{});
+}
+
+test "adopt refuses a dangling recovery symlink without replacing it" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "dangling-recovery-collision");
+    defer gpa.free(repo);
+    const recovery = try std.fmt.allocPrint(gpa, "{s}/.git.zt-adopt-backup", .{repo});
+    defer gpa.free(recovery);
+    const missing_target = try std.fmt.allocPrint(gpa, "{s}/missing-recovery-target", .{env.base});
+    defer gpa.free(missing_target);
+    try Dir.symLinkAbsolute(io, missing_target, recovery, .{ .is_directory = true });
+
+    try testing.expectError(
+        error.PathAlreadyExists,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const link_len = try Dir.readLinkAbsolute(io, recovery, &link_buf);
+    try testing.expectEqualStrings(missing_target, link_buf[0..link_len]);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+}
+
+test "verify reports retained recovery backup as broken adoption" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "retained-recovery-verification");
+    defer gpa.free(repo);
+    try gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+        .jj_colocate = false,
+    });
+
+    const recovery = try std.fmt.allocPrint(gpa, "{s}/.git.zt-adopt-backup", .{repo});
+    defer gpa.free(recovery);
+    try Dir.cwd().createDirPath(io, recovery);
+    try testing.expect(!(try gitstore.verify(gpa, io, repo)));
+}
+
+test "verify reports recovery files and dangling symlinks as broken adoption" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const file_repo = try env.createRepo("testorg", "retained-recovery-file");
+    defer gpa.free(file_repo);
+    try gitstore.adoptWithOptions(gpa, io, file_repo, env.ghq_root, env.gitstore_root, .{
+        .jj_colocate = false,
+    });
+    const recovery_file = try std.fmt.allocPrint(gpa, "{s}/.git.zt-adopt-backup", .{file_repo});
+    defer gpa.free(recovery_file);
+    try Dir.cwd().writeFile(io, .{ .sub_path = recovery_file, .data = "retained\n" });
+    try testing.expect(!(try gitstore.verify(gpa, io, file_repo)));
+
+    const link_repo = try env.createRepo("testorg", "retained-recovery-link");
+    defer gpa.free(link_repo);
+    try gitstore.adoptWithOptions(gpa, io, link_repo, env.ghq_root, env.gitstore_root, .{
+        .jj_colocate = false,
+    });
+    const recovery_link = try std.fmt.allocPrint(gpa, "{s}/.git.zt-adopt-backup", .{link_repo});
+    defer gpa.free(recovery_link);
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{env.base});
+    defer gpa.free(missing);
+    try Dir.symLinkAbsolute(io, missing, recovery_link, .{ .is_directory = true });
+    try testing.expect(!(try gitstore.verify(gpa, io, link_repo)));
+}
+
+test "adopt fails closed when linked worktrees cannot be enumerated" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "worktree-enumeration-failure");
+    defer gpa.free(repo);
+    const config_path = try std.fmt.allocPrint(gpa, "{s}/.git/config", .{repo});
+    defer gpa.free(config_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "[broken\n" });
+
+    try testing.expectError(
+        error.ProcessFailed,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(store_git);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, store_git, .{}));
 }
 
 test "e2e adopt rolls back partial gitstore copy when cp fails" {
@@ -752,11 +1412,62 @@ test "e2e adopt rolls back git pointer when jj rewrite fails" {
     try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_dest, .{}));
 }
 
+test "e2e adopt preserves pre-existing jj metadata when its copy fails" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "adopt-jj-copy-failure");
+    defer gpa.free(repo);
+    const jj_src = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_src);
+    try Dir.cwd().createDirPath(io, jj_src);
+
+    const preserved = try std.fmt.allocPrint(gpa, "{s}/00-preserved", .{jj_src});
+    defer gpa.free(preserved);
+    const preserved_bytes = "pre-existing-jj\x00metadata\n";
+    try Dir.cwd().writeFile(io, .{ .sub_path = preserved, .data = preserved_bytes });
+
+    const unreadable = try std.fmt.allocPrint(gpa, "{s}/zz-unreadable", .{jj_src});
+    defer gpa.free(unreadable);
+    try Dir.cwd().writeFile(io, .{ .sub_path = unreadable, .data = "blocked\n" });
+    try Dir.cwd().setFilePermissions(io, unreadable, .fromMode(0), .{});
+    defer Dir.cwd().setFilePermissions(io, unreadable, .default_file, .{}) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => std.debug.panic("failed to restore test file permissions: {s}", .{@errorName(err)}),
+    };
+    if (Dir.cwd().openFile(io, unreadable, .{})) |opened| {
+        var file = opened;
+        file.close(io);
+        return error.SkipZigTest;
+    } else |err| switch (err) {
+        error.AccessDenied => {},
+        else => return err,
+    }
+
+    try testing.expectError(
+        error.ProcessFailed,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+    const preserved_after = try Dir.cwd().readFileAlloc(io, preserved, gpa, .unlimited);
+    defer gpa.free(preserved_after);
+    try testing.expectEqualSlices(u8, preserved_bytes, preserved_after);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const jj_dest = try std.fmt.allocPrint(gpa, "{s}/{s}/jj", .{ env.gitstore_root, rel });
+    defer gpa.free(jj_dest);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_dest, .{}));
+}
+
 // =========================================================
-// E2E: adopt when jj binary is missing (regression #22)
+// E2E: adopt when jj binary is missing
 // =========================================================
 
-test "e2e adopt git-only repo completes when jj binary is missing" {
+test "e2e adopt restores git-only repo when required jj binary is missing" {
     const io = testing.io;
     const gpa = testing.allocator;
 
@@ -765,30 +1476,41 @@ test "e2e adopt git-only repo completes when jj binary is missing" {
 
     const repo = try env.createRepo("testorg", "nojj");
     defer gpa.free(repo);
+    try addTrackedFixture(gpa, io, repo);
+
+    var before = try GitStateSnapshot.capture(gpa, io, repo);
+    defer before.deinit(gpa);
 
     // Simulate an uninstalled jj deterministically: an absolute path that
     // cannot exist makes the spawn itself fail with error.FileNotFound.
     // Injected as a parameter (not shared global state), so the override is
     // local to this test and safe under concurrent adopts.
-    // Regression EugOT/gitstore-cli#22: a missing jj binary (spawn
-    // error.FileNotFound) must be as non-fatal as jj exiting non-zero —
-    // git-level adoption is already complete when the jj step runs.
-    try gitstore.adoptWithJjBinary(
-        gpa,
-        io,
-        repo,
-        env.ghq_root,
-        env.gitstore_root,
-        false,
-        "/nonexistent/gitstore-test-missing-jj",
+    try testing.expectError(
+        error.FileNotFound,
+        gitstore.adoptWithJjBinary(
+            gpa,
+            io,
+            repo,
+            env.ghq_root,
+            env.gitstore_root,
+            false,
+            "/nonexistent/gitstore-test-missing-jj",
+        ),
     );
 
-    // Git-level adoption completed: .git is a pointer file.
-    const git_path = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
-    defer gpa.free(git_path);
-    const content = try Dir.cwd().readFileAlloc(io, git_path, gpa, .unlimited);
-    defer gpa.free(content);
-    try testing.expect(std.mem.startsWith(u8, content, "gitdir: "));
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_path, .{}));
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(store_git);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, store_git, .{}));
+
+    var after = try GitStateSnapshot.capture(gpa, io, repo);
+    defer after.deinit(gpa);
+    try before.expectEqual(after);
 
     // The jj spawn failure is recorded in the operations log.
     const log_file = try std.fmt.allocPrint(gpa, "{s}/operations.log", .{env.gitstore_root});
@@ -797,6 +1519,167 @@ test "e2e adopt git-only repo completes when jj binary is missing" {
     defer gpa.free(log_content);
     try testing.expect(std.mem.indexOf(u8, log_content, "\"action\":\"init_jj\"") != null);
     try testing.expect(std.mem.indexOf(u8, log_content, "error: jj spawn failed") != null);
+}
+
+test "e2e adopt restores git-only repo when required jj exits nonzero" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "jj-nonzero");
+    defer gpa.free(repo);
+    try addTrackedFixture(gpa, io, repo);
+
+    var before = try GitStateSnapshot.capture(gpa, io, repo);
+    defer before.deinit(gpa);
+
+    try testing.expectError(
+        error.ProcessFailed,
+        gitstore.adoptWithJjBinary(
+            gpa,
+            io,
+            repo,
+            env.ghq_root,
+            env.gitstore_root,
+            false,
+            "/usr/bin/false",
+        ),
+    );
+
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_path, .{}));
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(store_git);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, store_git, .{}));
+
+    var after = try GitStateSnapshot.capture(gpa, io, repo);
+    defer after.deinit(gpa);
+    try before.expectEqual(after);
+}
+
+test "e2e adopt rolls back when jj exits zero without creating metadata" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "jj-success-without-metadata");
+    defer gpa.free(repo);
+    try addTrackedFixture(gpa, io, repo);
+
+    var before = try GitStateSnapshot.capture(gpa, io, repo);
+    defer before.deinit(gpa);
+
+    try testing.expectError(
+        error.ProcessFailed,
+        gitstore.adoptWithJjBinary(
+            gpa,
+            io,
+            repo,
+            env.ghq_root,
+            env.gitstore_root,
+            false,
+            "/usr/bin/true",
+        ),
+    );
+
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    var after = try GitStateSnapshot.capture(gpa, io, repo);
+    defer after.deinit(gpa);
+    try before.expectEqual(after);
+}
+
+test "e2e adopt rolls back arbitrary jj spawn errors" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "jj-spawn-error");
+    defer gpa.free(repo);
+    try addTrackedFixture(gpa, io, repo);
+
+    const non_executable = try std.fmt.allocPrint(gpa, "{s}/not-executable", .{env.base});
+    defer gpa.free(non_executable);
+    try Dir.cwd().writeFile(io, .{ .sub_path = non_executable, .data = "not executable\n" });
+
+    var before = try GitStateSnapshot.capture(gpa, io, repo);
+    defer before.deinit(gpa);
+
+    try testing.expectError(
+        error.AccessDenied,
+        gitstore.adoptWithJjBinary(
+            gpa,
+            io,
+            repo,
+            env.ghq_root,
+            env.gitstore_root,
+            false,
+            non_executable,
+        ),
+    );
+
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    var after = try GitStateSnapshot.capture(gpa, io, repo);
+    defer after.deinit(gpa);
+    try before.expectEqual(after);
+}
+
+test "e2e adopt restores pristine git state when jj mutates then fails" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "jj-mutates-then-fails");
+    defer gpa.free(repo);
+    try addTrackedFixture(gpa, io, repo);
+
+    const fake_jj = try std.fmt.allocPrint(gpa, "{s}/mutating-jj", .{env.base});
+    defer gpa.free(fake_jj);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = fake_jj,
+        .data =
+        \\#!/bin/sh
+        \\mkdir .jj
+        \\git config z3store.test-mutated true
+        \\git update-ref refs/heads/zt-mutated HEAD
+        \\git read-tree --empty
+        \\exit 1
+        \\
+        ,
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    var before = try GitStateSnapshot.capture(gpa, io, repo);
+    defer before.deinit(gpa);
+
+    try testing.expectError(
+        error.ProcessFailed,
+        gitstore.adoptWithJjBinary(
+            gpa,
+            io,
+            repo,
+            env.ghq_root,
+            env.gitstore_root,
+            false,
+            fake_jj,
+        ),
+    );
+
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    var after = try GitStateSnapshot.capture(gpa, io, repo);
+    defer after.deinit(gpa);
+    try before.expectEqual(after);
+
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_path, .{}));
 }
 
 // =========================================================
@@ -851,6 +1734,33 @@ test "e2e adopt git+jj colocated repo" {
     const gt_content = try Dir.cwd().readFileAlloc(io, git_target_path, gpa, .unlimited);
     defer gpa.free(gt_content);
     try testing.expect(gt_content[0] == '/'); // absolute path
+}
+
+test "e2e adopt keeps a clean git-only repository clean after jj colocation" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "clean-auto-jj");
+    defer gpa.free(repo);
+    try addTrackedFixture(gpa, io, repo);
+
+    var before = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "--untracked-files=all" }, repo);
+    defer before.deinit(gpa);
+    try testing.expect(before.succeeded());
+    try testing.expectEqual(@as(usize, 0), before.stdout.len);
+
+    try gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{});
+
+    var after = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "--untracked-files=all" }, repo);
+    defer after.deinit(gpa);
+    try testing.expect(after.succeeded());
+    try testing.expectEqualStrings("", after.stdout);
+
+    var ignored = try ex.exec(gpa, io, &.{ "git", "check-ignore", "-q", "--", ".jj" }, repo);
+    defer ignored.deinit(gpa);
+    try testing.expect(ignored.succeeded());
 }
 
 // =========================================================
@@ -1298,7 +2208,59 @@ test "e2e adopt repo with linked worktree rewrites pointer" {
     gpa.free(wt_add.stderr);
     try testing.expect(wt_add.term == .exited and wt_add.term.exited == 0);
 
-    try gitstore.adopt(gpa, io, repo, env.ghq_root, env.gitstore_root, false);
+    const linked_tracked = try std.fmt.allocPrint(gpa, "{s}/linked.txt", .{wt_dir});
+    defer gpa.free(linked_tracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = linked_tracked, .data = "base\n" });
+    var linked_add = try ex.exec(gpa, io, &.{ "git", "add", "linked.txt" }, wt_dir);
+    defer linked_add.deinit(gpa);
+    try testing.expect(linked_add.succeeded());
+    var linked_commit = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "commit", "--no-verify", "-m", "linked fixture" },
+        wt_dir,
+    );
+    defer linked_commit.deinit(gpa);
+    try testing.expect(linked_commit.succeeded());
+
+    try Dir.cwd().writeFile(io, .{ .sub_path = linked_tracked, .data = "staged\n" });
+    var linked_stage = try ex.exec(gpa, io, &.{ "git", "add", "linked.txt" }, wt_dir);
+    defer linked_stage.deinit(gpa);
+    try testing.expect(linked_stage.succeeded());
+    try Dir.cwd().writeFile(io, .{ .sub_path = linked_tracked, .data = "unstaged\n" });
+    const linked_untracked = try std.fmt.allocPrint(gpa, "{s}/untracked.txt", .{wt_dir});
+    defer gpa.free(linked_untracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = linked_untracked, .data = "preserve me\n" });
+
+    var linked_status_before = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "-c", "status.showUntrackedFiles=all", "status", "--porcelain=v1", "-z", "--untracked-files=all" },
+        wt_dir,
+    );
+    defer linked_status_before.deinit(gpa);
+    try testing.expect(linked_status_before.succeeded());
+    var linked_index_path_before = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "rev-parse", "--path-format=absolute", "--git-path", "index" },
+        wt_dir,
+    );
+    defer linked_index_path_before.deinit(gpa);
+    try testing.expect(linked_index_path_before.succeeded());
+    const linked_index_before = try Dir.cwd().readFileAlloc(
+        io,
+        std.mem.trim(u8, linked_index_path_before.stdout, "\r\n"),
+        gpa,
+        .unlimited,
+    );
+    defer gpa.free(linked_index_before);
+    var main_before = try GitStateSnapshot.capture(gpa, io, repo);
+    defer main_before.deinit(gpa);
+
+    try gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+        .jj_colocate = false,
+    });
 
     // Main is adopted: .git is a pointer
     const git_pointer = try std.fmt.allocPrint(gpa, "{s}/.git", .{repo});
@@ -1315,6 +2277,10 @@ test "e2e adopt repo with linked worktree rewrites pointer" {
     try testing.expect(std.mem.indexOf(u8, wt_content, env.gitstore_root) != null);
     try testing.expect(std.mem.indexOf(u8, wt_content, "/worktrees/") != null);
 
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_path, .{}));
+
     // Both main and linked worktree still work
     const g_main = try ex.exec(gpa, io, &.{ "git", "-C", repo, "rev-parse", "--git-dir" }, null);
     defer {
@@ -1329,6 +2295,94 @@ test "e2e adopt repo with linked worktree rewrites pointer" {
         gpa.free(g_wt.stderr);
     }
     try testing.expect(g_wt.succeeded());
+
+    var linked_status_after = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "-c", "status.showUntrackedFiles=all", "status", "--porcelain=v1", "-z", "--untracked-files=all" },
+        wt_dir,
+    );
+    defer linked_status_after.deinit(gpa);
+    try testing.expect(linked_status_after.succeeded());
+    try testing.expectEqualSlices(u8, linked_status_before.stdout, linked_status_after.stdout);
+
+    var linked_index_path_after = try ex.exec(
+        gpa,
+        io,
+        &.{ "git", "rev-parse", "--path-format=absolute", "--git-path", "index" },
+        wt_dir,
+    );
+    defer linked_index_path_after.deinit(gpa);
+    try testing.expect(linked_index_path_after.succeeded());
+    const linked_index_after = try Dir.cwd().readFileAlloc(
+        io,
+        std.mem.trim(u8, linked_index_path_after.stdout, "\r\n"),
+        gpa,
+        .unlimited,
+    );
+    defer gpa.free(linked_index_after);
+    try testing.expectEqualSlices(u8, linked_index_before, linked_index_after);
+
+    var main_after = try GitStateSnapshot.capture(gpa, io, repo);
+    defer main_after.deinit(gpa);
+    try main_before.expectEqual(main_after);
+    _ = try Dir.cwd().statFile(io, linked_untracked, .{});
+}
+
+test "adopt rejects a symlinked linked-worktree pointer without external writes" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createRepo("testorg", "linked-pointer-symlink");
+    defer gpa.free(repo);
+    const jj_src = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_src);
+    try Dir.cwd().createDirPath(io, jj_src);
+    const jj_sentinel = try std.fmt.allocPrint(gpa, "{s}/preserved", .{jj_src});
+    defer gpa.free(jj_sentinel);
+    const jj_sentinel_bytes = "pre-existing-jj\x00linked-pointer\n";
+    try Dir.cwd().writeFile(io, .{ .sub_path = jj_sentinel, .data = jj_sentinel_bytes });
+    const wt_dir = try std.fmt.allocPrint(gpa, "{s}/wt-hostile-pointer", .{env.base});
+    defer gpa.free(wt_dir);
+    const wt_add = try ex.exec(gpa, io, &.{ "git", "worktree", "add", "-b", "hostile-pointer", wt_dir }, repo);
+    defer {
+        gpa.free(wt_add.stdout);
+        gpa.free(wt_add.stderr);
+    }
+    try testing.expect(wt_add.succeeded());
+
+    const wt_git = try std.fmt.allocPrint(gpa, "{s}/.git", .{wt_dir});
+    defer gpa.free(wt_git);
+    try Dir.cwd().deleteFile(io, wt_git);
+    const external = try std.fmt.allocPrint(gpa, "{s}/external-pointer-sentinel", .{env.base});
+    defer gpa.free(external);
+    try Dir.cwd().writeFile(io, .{ .sub_path = external, .data = "unchanged\n" });
+    try Dir.symLinkAbsolute(io, external, wt_git, .{});
+
+    try testing.expectError(
+        error.SourceMetadataSymlink,
+        gitstore.adoptWithOptions(gpa, io, repo, env.ghq_root, env.gitstore_root, .{
+            .jj_colocate = false,
+        }),
+    );
+    const content = try Dir.cwd().readFileAlloc(io, external, gpa, .unlimited);
+    defer gpa.free(content);
+    try testing.expectEqualStrings("unchanged\n", content);
+    const jj_content = try Dir.cwd().readFileAlloc(io, jj_sentinel, gpa, .unlimited);
+    defer gpa.free(jj_content);
+    try testing.expectEqualSlices(u8, jj_sentinel_bytes, jj_content);
+    try testing.expect(try gitIsDir(gpa, io, repo));
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const link_len = try Dir.readLinkAbsolute(io, wt_git, &link_buf);
+    try testing.expectEqualStrings(external, link_buf[0..link_len]);
+
+    const rel = gitstore.repoStoragePath(repo, env.ghq_root).?;
+    const store_git = try std.fmt.allocPrint(gpa, "{s}/{s}/git", .{ env.gitstore_root, rel });
+    defer gpa.free(store_git);
+    var retained = try Dir.openDirAbsolute(io, store_git, .{});
+    retained.close(io);
 }
 
 // =========================================================
@@ -1635,6 +2689,43 @@ test "G6-1 adoptAll adopts fresh repos and skips pre-adopted" {
     try testing.expect(gitstore.isAdopted(io, r1, env.gitstore_root, gpa));
     try testing.expect(gitstore.isAdopted(io, r2, env.gitstore_root, gpa));
     try testing.expect(gitstore.isAdopted(io, r3, env.gitstore_root, gpa));
+}
+
+test "G6-1b adoptAll with jj disabled preserves dirty git-only repos" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var env = try TestEnv.setup(gpa, io);
+    defer env.teardown();
+
+    const repo = try env.createHostRepo("github.com", "o", "dirty-batch");
+    defer gpa.free(repo);
+    const untracked = try std.fmt.allocPrint(gpa, "{s}/untracked.txt", .{repo});
+    defer gpa.free(untracked);
+    try Dir.cwd().writeFile(io, .{ .sub_path = untracked, .data = "preserve me\n" });
+
+    var before = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer {
+        gpa.free(before.stdout);
+        gpa.free(before.stderr);
+    }
+    try testing.expect(before.succeeded());
+
+    try gitstore.adoptAllWithOptions(gpa, io, env.ghq_root, env.gitstore_root, .{
+        .jj_colocate = false,
+    });
+
+    var after = try ex.exec(gpa, io, &.{ "git", "status", "--porcelain=v1", "-z" }, repo);
+    defer {
+        gpa.free(after.stdout);
+        gpa.free(after.stderr);
+    }
+    try testing.expect(after.succeeded());
+    try testing.expectEqualStrings(before.stdout, after.stdout);
+    try testing.expect(try gitIsPointer(gpa, io, repo));
+
+    const jj_path = try std.fmt.allocPrint(gpa, "{s}/.jj", .{repo});
+    defer gpa.free(jj_path);
+    try testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, jj_path, .{}));
 }
 
 test "G6-2 adoptAll re-run is all-skip with no pointer corruption" {

@@ -136,6 +136,12 @@ const sub_help_adopt =
     \\   --all                        Recurse over the entire ghq root
     \\   --help, -h                   Show this help
     \\
+    \\SAFETY:
+    \\   New jj metadata is required by default. Adoption fails closed if the
+    \\   repo is dirty, jj cannot start, jj exits non-zero, or .jj is absent.
+    \\   To preserve a git-only repo without creating .jj, configure:
+    \\     git config --global z3store.jjColocate false
+    \\
 ;
 
 const sub_help_verify =
@@ -648,9 +654,15 @@ pub fn main(init: std.process.Init) !u8 {
         try gitstore.init(io, cfg.backing_store_root);
 
         if (all) {
-            try gitstore.adoptAll(gpa, io, cfg.root, cfg.backing_store_root, dry_run);
+            try gitstore.adoptAllWithOptions(gpa, io, cfg.root, cfg.backing_store_root, .{
+                .dry_run = dry_run,
+                .jj_colocate = cfg.jj_colocate,
+            });
         } else if (path) |p| {
-            try gitstore.adopt(gpa, io, p, cfg.root, cfg.backing_store_root, dry_run);
+            try gitstore.adoptWithOptions(gpa, io, p, cfg.root, cfg.backing_store_root, .{
+                .dry_run = dry_run,
+                .jj_colocate = cfg.jj_colocate,
+            });
             // git+lore repo: git was adopted normally; note that the Lore
             // metadata stays put (z3store never touches `.lore/`).
             if (!dry_run and lore.detectLoreWorkspace(io, p)) {
