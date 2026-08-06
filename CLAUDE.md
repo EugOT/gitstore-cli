@@ -142,3 +142,30 @@ Standard build/test/lint commands live in `README.md`.
   z3store.* / Z3STORE_ROOT" warning.
 - **Runtime artifacts.** The hooks/gates write to `.claude/logs/*.jsonl`
   at runtime; leave these untracked (do not commit them).
+
+### vNext / estate planning context (Linear team TEO)
+
+Planning is tracked in the private Linear team **Eugedotnet** (key `TEO`);
+refer to issues by title, not bare id. This affects the environment:
+
+- **Project language policy (operator).** Python, Ruby, Perl, and Bash are
+  excluded from the *project* (every lane — code, research, scripts,
+  shims). Allowed: Julia (stats/probabilistic/graph/tensor), Rust
+  (core/control), Odin or Zig (bounded native workers), Nu
+  (scripting/orchestration). The existing TS/Bun quality-gate scaffold is
+  estate-only and runs through `vp`. Shell is used only for VM/harness
+  bootstrap, not project code.
+- **Nushell is installed** (`mise` aqua backend) for the estate `zt`↔Nu
+  pipe-hygiene work and Nu orchestration. Update-script line:
+  `mise use -g "aqua:nushell/nushell@0.114.1"`. (`nu` resolves in a login
+  shell alongside `zig`, `jj`, `git`, and `vp`.)
+- **vNext is planning-only.** Do NOT install or implement the vNext stack
+  (Rust core, PostgreSQL 18 + pgvector, DuckDB projections, RustFS,
+  Kubernetes) during charting — it is out of scope until the specs land.
+  `doc/ARCHITECTURE.md` and `README.md` describe the zig-qm scaffold, not
+  the vNext product.
+- **Estate live base is `origin/dev`** (not `main` or an archive HEAD);
+  z3store PRs are parked as drafts on `dev`.
+- **Wayfinder handoffs / prior research** (`wayfinder/`, `research/`) live
+  in the operator's local estate, not this GitHub repo — do not expect
+  them here.
