@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/EugOT/gitstore-cli/schema/gitstore.schema.json",
-  "title": "gitstore.toml",
+  "$id": "https://github.com/EugOT/z3store/schema/z3store.schema.json",
+  "title": "z3store.toml",
   "type": "object",
   "required": [
     "version",
@@ -19,7 +19,8 @@
       "$ref": "#/definitions/store"
     },
     "gitstore": {
-      "$ref": "#/definitions/store"
+      "$ref": "#/definitions/store",
+      "description": "Git-backed store tier holding detached Git/JJ databases. Named for git itself, not for the z3store product."
     },
     "toolstore": {
       "$ref": "#/definitions/store"

@@ -1,8 +1,15 @@
-//! Canonical gitstore store configuration.
+//! Canonical z3store multi-store configuration.
 //!
 //! This module implements the first executable slice of the multi-store plan:
 //! resolve codestore/gitstore/toolstore/cachestore roots, create a safe
-//! codestore-local `gitstore.toml`, and expose strict package/workflow defaults.
+//! codestore-local `z3store.toml`, and expose strict package/workflow defaults.
+//!
+//! Naming: `z3store` is the product. `gitstore` survives only as the name of
+//! the git-backed store tier (detached Git/JJ databases), mirroring
+//! `config.zig`'s `backing_store_root`. Environment and config keys follow the
+//! repo-wide convention established in `config.zig`: `Z3STORE_*` / `z3store.*`
+//! are primary and the `GITSTORE_*` / `gitstore.*` forms remain legacy
+//! fallbacks.
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,6 +33,9 @@ pub const StoreConfig = struct {
     }
 };
 
+/// The four store tiers. `gitstore` names the git-backed tier holding detached
+/// Git/JJ databases — it describes git itself, not the product, and stays
+/// aligned with `config.zig`'s `backing_store_root`.
 pub const StoreName = enum {
     codestore,
     gitstore,
@@ -70,14 +80,16 @@ pub fn load(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) LoadErr
 
     const home = env.get("HOME") orelse return error.InvalidUserId;
     const xdg_config = env.get("XDG_CONFIG_HOME") orelse try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/.config", .{home}));
-    const bootstrap_path = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/gitstore/gitstore.toml", .{xdg_config}));
+    const bootstrap_path = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/z3store/z3store.toml", .{xdg_config}));
 
     var bootstrap = try ParsedConfig.read(gpa, io, bootstrap_path);
     defer bootstrap.deinit(gpa);
 
     const legacy_root = firstNonEmpty(&.{
         env.get("CODESTORE_ROOT"),
+        env.get("Z3STORE_CODESTORE_ROOT"),
         env.get("GITSTORE_CODESTORE_ROOT"),
+        env.get("Z3STORE_ROOT"),
         env.get("GITSTORE_ROOT"),
         env.get("GHQ_ROOT"),
     });
@@ -88,19 +100,19 @@ pub fn load(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) LoadErr
         default_codestore,
     }).?));
 
-    const codestore_config_path = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/gitstore.toml", .{codestore_root}));
+    const codestore_config_path = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/z3store.toml", .{codestore_root}));
     var codestore_config = try ParsedConfig.read(gpa, io, codestore_config_path);
     defer codestore_config.deinit(gpa);
 
     const active = if (codestore_config.exists) &codestore_config else &bootstrap;
-    const default_gitstore = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/.local/share/gitstore", .{home}));
+    const default_gitstore = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/.local/share/z3store", .{home}));
     const default_toolstore = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/.local/share/toolstore", .{home}));
-    const default_cachestore = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/.cache/gitstore", .{home}));
+    const default_cachestore = try appendOwned(&owned, gpa, try std.fmt.allocPrint(gpa, "{s}/.cache/z3store", .{home}));
 
     const gitstore_root = try appendOwned(&owned, gpa, try gpa.dupe(u8, firstNonEmpty(&.{
         active.get("gitstore.root"),
-        env.get("GITSTORE_VERSION_ROOT"),
-        env.get("GITSTORE_STORE_ROOT"),
+        env.get("Z3STORE_BACKING_STORE_ROOT"),
+        env.get("GITSTORE_BACKING_STORE_ROOT"),
         default_gitstore,
     }).?));
     const toolstore_root = try appendOwned(&owned, gpa, try gpa.dupe(u8, firstNonEmpty(&.{
@@ -183,7 +195,7 @@ pub fn defaultToml(gpa: Allocator, cfg: StoreConfig) ![]u8 {
     , .{ cfg.codestore_root, cfg.gitstore_root, cfg.toolstore_root, cfg.cachestore_root });
 }
 
-pub const schema_json = @embedFile("gitstore.schema.json");
+pub const schema_json = @embedFile("z3store.schema.json");
 
 fn firstNonEmpty(values: []const ?[]const u8) ?[]const u8 {
     for (values) |maybe| {
@@ -249,7 +261,7 @@ const ParsedConfig = struct {
     }
 };
 
-/// Parse the deliberately small `gitstore.toml` bootstrap subset used before a
+/// Parse the deliberately small `z3store.toml` bootstrap subset used before a
 /// full schema validator is available. Supported input is simple `[section]`
 /// headers plus `root = "value"` assignments. Dotted section names are
 /// preserved verbatim when composing `section.root` map entries. This parser
