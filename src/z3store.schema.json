@@ -3,6 +3,7 @@
   "$id": "https://github.com/EugOT/z3store/schema/z3store.schema.json",
   "title": "z3store.toml",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "version",
     "codestore",
@@ -30,9 +31,11 @@
     },
     "policy": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "package_managers": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "node": {
               "enum": [
@@ -72,6 +75,7 @@
         },
         "workflows": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "supported": {
               "type": "array",
@@ -102,6 +106,7 @@
   "definitions": {
     "store": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "root"
       ],
