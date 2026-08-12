@@ -92,3 +92,80 @@ ZIG_QM_OVERWRITE=1 ZIG_QM_PROJECT=<path/to/z3store> chezmoi apply
 
 @doc/ARCHITECTURE.md
 @doc/TIGER_STYLE_ZIG.md
+
+## Cursor Cloud specific instructions
+
+Durable notes for cloud agents. The startup update script already
+installs the toolchain (mise + Zig 0.16.0 + `jj`, and Vite+/`vp`) and
+runs `vp install`; do not re-document dependency installation here.
+Standard build/test/lint commands live in `README.md`.
+
+- **JS/TS is managed exclusively through Vite+ (`vp`).** Do NOT install
+  or run Bun directly (no `curl … bun.sh`, no bare `bun install`). The
+  `vp` CLI (`~/.vite-plus`, activated from `~/.bashrc`) manages the Node
+  runtime and package manager; because the repo has a `bun.lock`, `vp`
+  selects and provisions its own Bun under
+  `~/.vite-plus/package_manager/bun/`. There is intentionally no bare
+  `bun` on `PATH`.
+  - Install deps: `vp install`.
+  - Run the gate/eval scripts (defined in `package.json`) via `vp run`,
+    which executes them under vp's managed Bun, e.g.
+    `vp run verify-fast`, `vp run verify-commit`, `vp run verify-pr`,
+    `vp run eval:check`, `vp run check-public-api`. (`vpr` is shorthand
+    for `vp run`.) Invoking `bun scripts/*.ts` directly will fail — no
+    bare bun exists.
+- **Zig toolchain resolution.** `zig` (0.16.0, pinned in `.mise.toml`)
+  and `jj` are provided by `mise`, activated from `~/.bashrc`, so both
+  are on `PATH` in a login shell. In a bare/non-login shell they may be
+  absent — run `eval "$(mise activate bash)"`, or invoke Zig explicitly
+  as `mise x zig@0.16.0 -- zig ...` (the `scripts/verify-*.ts` gates
+  resolve Zig this way; never trust a bare-PATH `zig`).
+- **`jj` (jujutsu) is required for the test suite.** The integration
+  tests in `src/tests.zig` spawn both `git` and `jj git init --colocate`.
+  `git` is preinstalled; `jj` is installed by the update script. Without
+  `jj`, several e2e tests fail rather than skip.
+- **Reading `zig build test` output.** The suite deliberately exercises
+  error/rollback paths, so it prints many `error:`/`FAIL:`/`warn:` lines
+  and a trailing `failed command: .../test ...` line on stderr. These are
+  expected test output, not a build failure. Trust the `Build Summary:
+  N/N steps succeeded; …` line and the process exit code (0 = pass).
+- **No `ghq` binary dependency.** `zt` is a `ghq` replacement and does
+  not shell out to `ghq`; the external tool is not required at build,
+  test, or run time. (The `ghq.root`/`$GHQ_ROOT` entries below are a
+  git-config key and env var for back-compat, not the `ghq` program.)
+- **Store-root resolution.** `zt` resolves its working-tree root from
+  config/env only: git-config `z3store.root` → `gitstore.root` →
+  `ghq.root`, then `$Z3STORE_ROOT` → `$GITSTORE_ROOT` → `$GHQ_ROOT`,
+  falling back to `~/ghq`. The detached backing store (where `.git`/`.jj`
+  live) resolves on its own chain (see `src/config.zig`). Legacy
+  `gitstore.*`/`ghq.*` sources still work but print a non-fatal "prefer
+  z3store.* / Z3STORE_ROOT" warning.
+- **Runtime artifacts.** The hooks/gates write to `.claude/logs/*.jsonl`
+  at runtime; leave these untracked (do not commit them).
+
+### vNext / estate planning context (Linear team TEO)
+
+Planning is tracked in the private Linear team **Eugedotnet** (key `TEO`);
+refer to issues by title, not bare id. This affects the environment:
+
+- **Project language policy (operator).** Python, Ruby, Perl, and Bash are
+  excluded from the *project* (every lane — code, research, scripts,
+  shims). Allowed: Julia (stats/probabilistic/graph/tensor), Rust
+  (core/control), Odin or Zig (bounded native workers), Nu
+  (scripting/orchestration). The existing TS/Bun quality-gate scaffold is
+  estate-only and runs through `vp`. Shell is used only for VM/harness
+  bootstrap, not project code.
+- **Nushell is installed** (`mise` aqua backend) for the estate `zt`↔Nu
+  pipe-hygiene work and Nu orchestration. Update-script line:
+  `mise use -g "aqua:nushell/nushell@0.114.1"`. (`nu` resolves in a login
+  shell alongside `zig`, `jj`, `git`, and `vp`.)
+- **vNext is planning-only.** Do NOT install or implement the vNext stack
+  (Rust core, PostgreSQL 18 + pgvector, DuckDB projections, RustFS,
+  Kubernetes) during charting — it is out of scope until the specs land.
+  `doc/ARCHITECTURE.md` and `README.md` describe the zig-qm scaffold, not
+  the vNext product.
+- **Estate live base is `origin/dev`** (not `main` or an archive HEAD);
+  z3store PRs are parked as drafts on `dev`.
+- **Wayfinder handoffs / prior research** (`wayfinder/`, `research/`) live
+  in the operator's local estate, not this GitHub repo — do not expect
+  them here.
