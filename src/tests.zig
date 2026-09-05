@@ -770,7 +770,7 @@ test "e2e adopt git-only repo completes when jj binary is missing" {
     // cannot exist makes the spawn itself fail with error.FileNotFound.
     // Injected as a parameter (not shared global state), so the override is
     // local to this test and safe under concurrent adopts.
-    // Regression EugOT/gitstore-cli#22: a missing jj binary (spawn
+    // Regression Eugene3dotdev/z3store#22: a missing jj binary (spawn
     // error.FileNotFound) must be as non-fatal as jj exiting non-zero —
     // git-level adoption is already complete when the jj step runs.
     try gitstore.adoptWithJjBinary(

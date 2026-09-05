@@ -75,12 +75,12 @@ work and is not decided here.
 | Store tier `gitstore` and `[gitstore]` section in `z3store.toml` | Keep (named for git) | `src/stores.zig`, `src/z3store.schema.json` |
 | Legacy-config warning text | Keep | `src/main.zig` `printLegacyConfigHint` |
 | Migration guide `docs/MIGRATION-ghq-to-gitstore.md` | Keep (history; linked from `zt --help`) | `docs/` |
-| Test fixtures using `EugOT` as an arbitrary owner and `/tmp/gitstore_*` paths | Keep | `src/tests.zig`, `src/*.zig` test blocks |
+| Test fixtures using `EugOT` as an arbitrary owner and `/tmp/gitstore_*` paths | Keep in `src/tests.zig` (allowlisted). The one fixture in `src/lib.zig` moved to `Eugene3dotdev` instead, because `lib.zig` is the live public module and allowlisting it would hide real residue | `src/tests.zig`, `src/*.zig` test blocks |
 | Dated records: ADR 0003, `doc/DVC_INTEGRATION.md`, `workflows/*.workflow.ts` | Keep as written | allowlisted by the check |
 | Internal identifiers `gitstore_root`, `const gitstore = @import(...)` and error text naming the store root | Keep (not public identity; a rename is a separate refactor) | `src/z3store.zig`, `src/main.zig` |
 | Project name `gitstore-cli` in live docs, prompts, hook output, lockfile | Remove | see the check's hit list |
 | Owner URLs `github.com/EugOT/...` and slugs `EugOT/{gitstore-cli,z3store,ziglint}` in help text, schema `$id`, verifier output, skills | Remove | see the check's hit list |
-| `EugOT/dotfiles` (chezmoi source) | Keep | not resolvable under either owner, so not provably stale |
+| `EugOT/dotfiles` (chezmoi source slug) | Keep the bare slug; the URL form `github.com/EugOT/dotfiles` is still forbidden | not resolvable under either owner, so the slug is not provably stale and the URL is broken either way |
 
 ### Recurrence check
 

@@ -40,6 +40,13 @@ test("leaves the compatibility layer and ambiguous slugs alone", () => {
 	expect(scanText("src/config.zig", text)).toEqual([]);
 });
 
+test("the dotfiles slug is allowed only in bare form", () => {
+	expect(scanText("CLAUDE.md", "sourced from `EugOT/dotfiles`")).toEqual([]);
+	const hits = scanText("CLAUDE.md", "https://github.com/EugOT/dotfiles");
+	expect(hits).toHaveLength(1);
+	expect(hits[0]?.reason).toContain("retired owner URL");
+});
+
 test("allowlist matches directories by prefix and files exactly", () => {
 	expect(isAllowed("doc/adr/0003-darwin-fuzz-degradation.md")).toBe(true);
 	expect(isAllowed("doc/adr")).toBe(false);
