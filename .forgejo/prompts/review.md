@@ -1,4 +1,4 @@
-You are reviewing a pull request for the `gitstore-cli` Zig 0.16 project,
+You are reviewing a pull request for the `z3store` Zig 0.16 project,
 which is scaffolded from the `zig-qm-toolkit` template.
 
 ## Context boundary

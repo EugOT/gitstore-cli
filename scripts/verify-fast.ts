@@ -10,7 +10,7 @@ import {
  * verify-fast.ts — Tier 1 (<2s).
  *
  * Runs on every saved edit. Format + AST check only, plus optional ziglint
- * when the EugOT/ziglint binary is on PATH. Fast enough to be wired into
+ * when the Eugene3dotdev/ziglint binary is on PATH. Fast enough to be wired into
  * PostToolUse:Edit|Write hooks without interrupting flow.
  *
  * Exit codes:
@@ -84,7 +84,7 @@ async function main(): Promise<void> {
 	// Bun.which performs a real PATH lookup; `command` is a shell builtin
 	// and cannot be exec'd via Bun.spawnSync (CodeRabbit finding).
 	if (Bun.which("ziglint") !== null) {
-		console.log("== ziglint (EugOT/ziglint expected) ==");
+		console.log("== ziglint (Eugene3dotdev/ziglint expected) ==");
 		const ziglint = spawnSync(["ziglint", ...zigFiles]);
 		process.stdout.write(ziglint.stdout);
 		if (ziglint.code !== 0) {
@@ -92,7 +92,9 @@ async function main(): Promise<void> {
 			await finish(ziglint.code ?? 1, startedAt);
 		}
 	} else {
-		console.log("(ziglint not found; install EugOT/ziglint for the lint gate)");
+		console.log(
+			"(ziglint not found; install Eugene3dotdev/ziglint for the lint gate)",
+		);
 	}
 
 	console.log("verify-fast: OK");

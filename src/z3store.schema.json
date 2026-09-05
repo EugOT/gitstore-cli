@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/EugOT/z3store/schema/z3store.schema.json",
+  "$id": "https://github.com/Eugene3dotdev/z3store/schema/z3store.schema.json",
   "title": "z3store.toml",
   "type": "object",
   "additionalProperties": false,

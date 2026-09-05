@@ -1,4 +1,4 @@
-# Coverage Baseline — gitstore-cli
+# Coverage Baseline — z3store
 
 This file records the line-coverage baseline measured by the kcov harness
 (`scripts/kcov-coverage.ts`) so coverage progress is auditable as the

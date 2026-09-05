@@ -1,7 +1,7 @@
 //! zig-api-surface — walk src/lib.zig (or any given .zig file) and emit a
 //! JSON inventory of every top-level `pub fn`, `pub const`, `pub var` decl.
 //!
-//! Adapted from EugOT/gitstore-cli's scripts/zig-api-surface.zig (MIT).
+//! Adapted from Eugene3dotdev/z3store's scripts/zig-api-surface.zig (MIT).
 //! The logic is intentionally the same: a tiny AST walker over root decls.
 //!
 //! Intended use:

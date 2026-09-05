@@ -51,7 +51,7 @@ const usage_text =
     \\Global options:
     \\  --help, -h        Show this help message
     \\
-    \\See also: docs/MIGRATION-ghq-to-gitstore.md, https://github.com/EugOT/z3store
+    \\See also: docs/MIGRATION-ghq-to-gitstore.md, https://github.com/Eugene3dotdev/z3store
     \\
 ;
 
