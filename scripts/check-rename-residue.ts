@@ -3,7 +3,7 @@
  * Exit codes:
  *   0 — clean
  *   1 — one or more hits, printed as `path:line: text  (reason)`
- *   2 — could not enumerate tracked files
+ *   2 — could not enumerate or read tracked files
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
