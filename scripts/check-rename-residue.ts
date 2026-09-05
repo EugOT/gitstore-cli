@@ -1,11 +1,5 @@
 #!/usr/bin/env bun
 /**
- * check-rename-residue.ts — fail when retired project identity returns.
- *
- * Scans every git-tracked file for the retired project name and the
- * retired owner URLs (ADR 0005). Bare `gitstore` is allowed: it is a live
- * git-config key, env-var prefix, legacy store path, and store-tier name.
- *
  * Exit codes:
  *   0 — clean
  *   1 — one or more hits, printed as `path:line: text  (reason)`
@@ -33,7 +27,6 @@ export const rules: readonly Rule[] = [
 	},
 ];
 
-/** Paths that may keep the retired names. A trailing `/` allows a directory. */
 export const allowlist: Readonly<Record<string, string>> = {
 	"doc/adr/": "dated decision records keep the names in use when written",
 	"doc/DVC_INTEGRATION.md": "pre-rename design snapshot",
@@ -63,6 +56,15 @@ export function scanText(path: string, text: string): Hit[] {
 	return hits;
 }
 
+function readTrackedFile(absPath: string): Uint8Array | null {
+	try {
+		return readFileSync(absPath);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw err;
+	}
+}
+
 function looksBinary(bytes: Uint8Array): boolean {
 	const probe = bytes.subarray(0, 8192);
 	return probe.includes(0);
@@ -83,13 +85,8 @@ export function scanRepo(root = repoRoot()): { hits: Hit[]; scanned: number } {
 	let scanned = 0;
 	for (const path of files) {
 		if (isAllowed(path)) continue;
-		let bytes: Uint8Array;
-		try {
-			bytes = readFileSync(resolve(root, path));
-		} catch {
-			continue; // tracked but absent from the working tree
-		}
-		if (looksBinary(bytes)) continue;
+		const bytes = readTrackedFile(resolve(root, path));
+		if (bytes === null || looksBinary(bytes)) continue;
 		scanned++;
 		hits.push(...scanText(path, new TextDecoder().decode(bytes)));
 	}

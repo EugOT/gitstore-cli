@@ -1,11 +1,6 @@
 #!/usr/bin/env bun
 /**
- * verify-commit.ts — Tier 2 (~30s).
- *
- * Runs before every commit. Fast gate first, then the rename-residue
- * check (ADR 0005), then the full Debug test suite with a 30s per-test
- * cap, and — when `src/lib.zig` exists — the public-API surface check
- * (tolerating the first-run "no baseline" path as a pass).
+ * verify-commit.ts — Tier 2 (~30s). Runs before every commit.
  *
  * Exit codes:
  *   0 — pass

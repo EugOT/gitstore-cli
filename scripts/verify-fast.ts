@@ -9,9 +9,9 @@ import {
 /**
  * verify-fast.ts — Tier 1 (<2s).
  *
- * Runs on every saved edit. Format + AST check only, plus optional ziglint
- * when the Eugene3dotdev/ziglint binary is on PATH. Fast enough to be wired into
- * PostToolUse:Edit|Write hooks without interrupting flow.
+ * Runs on every saved edit. Format + AST check only, plus optional ziglint.
+ * Fast enough to be wired into PostToolUse:Edit|Write hooks without
+ * interrupting flow.
  *
  * Exit codes:
  *   0 — pass (or no Zig inputs to check)

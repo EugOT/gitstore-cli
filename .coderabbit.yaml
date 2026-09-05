@@ -1,5 +1,4 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# Repo-specific CodeRabbit configuration for Eugene3dotdev/z3store.
 # Keep this file short: prompts and review rules are technical debt too.
 
 inheritance: true
