@@ -146,7 +146,7 @@ done
 
 ## ziglint
 
-Use `github.com/EugOT/ziglint` as the authoritative linter fork (Zig 0.16).
+Use `github.com/Eugene3dotdev/ziglint` as the authoritative linter fork (Zig 0.16).
 Do not substitute `mattware`/`nektro` forks. It is one gate beside `zig
 fmt`, `zig ast-check`, tests, fuzzing, and architecture fitness checks.
 

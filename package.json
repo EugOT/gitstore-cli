@@ -24,6 +24,7 @@
 		"coverage:orbstack": "bun scripts/kcov-orbstack.ts --print",
 		"coverage:check": "bun scripts/check-coverage.ts --require-measured",
 		"check-public-api": "bun scripts/check-public-api.ts",
+		"check-rename-residue": "bun scripts/check-rename-residue.ts",
 		"check-public-api:write": "bun scripts/check-public-api.ts --write"
 	},
 	"devDependencies": {

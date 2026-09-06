@@ -47,10 +47,10 @@ pub const rewriteJjGitTargetRelative = gs.rewriteJjGitTargetRelative;
 
 test "lib: public url parser smoke" {
     const gpa = std.testing.allocator;
-    var spec = try url.parse(gpa, "github.com/EugOT/z3store", .{});
+    var spec = try url.parse(gpa, "github.com/Eugene3dotdev/z3store", .{});
     defer spec.deinit(gpa);
 
     try std.testing.expectEqualStrings("github.com", spec.host);
-    try std.testing.expectEqualStrings("EugOT", spec.owner);
+    try std.testing.expectEqualStrings("Eugene3dotdev", spec.owner);
     try std.testing.expectEqualStrings("z3store", spec.name);
 }

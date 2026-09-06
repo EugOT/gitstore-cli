@@ -1,11 +1,6 @@
 #!/usr/bin/env bun
 /**
- * verify-commit.ts — Tier 2 (~30s).
- *
- * Runs before every commit. Fast gate first, then the full Debug test
- * suite with a 30s per-test cap, and — when `src/lib.zig` exists — the
- * public-API surface check (tolerating the first-run "no baseline" path
- * as a pass).
+ * verify-commit.ts — Tier 2 (~30s). Runs before every commit.
  *
  * Exit codes:
  *   0 — pass
@@ -40,6 +35,18 @@ async function main(): Promise<void> {
 		stdin: "ignore",
 	});
 	if (fast.exitCode !== 0) await finish(fast.exitCode ?? 1, startedAt);
+
+	console.log("== check-rename-residue ==");
+	const residue = Bun.spawnSync(
+		[process.execPath, "scripts/check-rename-residue.ts"],
+		{
+			cwd: root,
+			stdout: "inherit",
+			stderr: "inherit",
+			stdin: "ignore",
+		},
+	);
+	if (residue.exitCode !== 0) await finish(residue.exitCode ?? 1, startedAt);
 
 	console.log("== zig build test (Debug, --test-timeout 60s) ==");
 	const test = zig([

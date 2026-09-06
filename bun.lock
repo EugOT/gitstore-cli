@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "gitstore-cli",
+      "name": "z3store",
       "devDependencies": {
         "bun-types": "^1.3.0",
       },

@@ -1,6 +1,6 @@
 {
 	"$schema": "https://json-schema.org/draft/2020-12/schema",
-	"$id": "https://github.com/EugOT/gitstore-cli/blob/main/doc/schemas/dora.schema.json",
+	"$id": "https://github.com/Eugene3dotdev/z3store/blob/main/doc/schemas/dora.schema.json",
 	"title": "DORA metrics",
 	"description": "Shape of .agent/dora.json. See doc/adr/0004-dora-metrics-tracking.md for rationale.",
 	"type": "object",

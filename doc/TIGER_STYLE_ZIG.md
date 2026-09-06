@@ -271,7 +271,7 @@ pub fn parseConfig(alloc: std.mem.Allocator, text: []const u8) ConfigError!Confi
 - Every `fetch`ed dependency is `--save`d with a pinned hash. No
   unpinned `git+https://` URLs.
 - Expose named steps: `fmt`, `test`, `test-unit`, `test-lib`,
-  `test-integration`, `fuzz`, `docs`. The live adopter (`gitstore-cli`)
+  `test-integration`, `fuzz`, `docs`. The live adopter (`z3store`)
   already follows this contract.
 
 ## 9. Fuzz discipline

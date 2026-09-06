@@ -4,7 +4,7 @@ Provenance: authored from scratch for this repo. There is no upstream
 `exact_zig-release-checklist` shared skill, so this file is not
 "harvested from a shared skill". The semantics below are sourced from
 the validated local `scripts/verify-release.sh` flow in
-`gitstore-cli` (clean rebuild, reproducibility hash, deep fuzz gated
+`z3store` (clean rebuild, reproducibility hash, deep fuzz gated
 by `zig_supports_fuzz`, SBOM, optional cosign signing). Treat this
 checklist as the canonical Tier 4 definition until a shared
 release-checklist skill exists upstream.
